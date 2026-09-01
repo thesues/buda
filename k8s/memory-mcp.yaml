@@ -108,17 +108,20 @@ spec:
             # Mount, then ingest; the HTTP listener only binds once ingest
             # finishes, so this budget has to cover the whole thing.
             #
-            # Sized from measurement, and the local number is NOT the guide: the
-            # same corpus took ~3m20s against a loopback cluster and was still
-            # going at 12 min here. Ingest is ~5164 chunks each writing BM25
-            # postings, an IVF vector, a graph node and an edge — tens of
-            # thousands of small KV writes, where the local run pays no network
-            # and no RF=3. A budget that is too small is the worst failure mode
-            # available: the kubelet kills a nearly-finished ingest and the
-            # restart begins again from zero, forever.
+            # Measured in-cluster: 5164 chunks in 168 s (30.7 chunk/s).
+            #
+            # It was ~45 min before the BM25 postings were batched — that version
+            # paid one round trip per unique term, and CJK unigrams give a
+            # Chinese chunk several hundred of them. Batching made the network
+            # stop being the limit, so this is now bounded by real work.
+            #
+            # 10 min is ~3.5x the measured time: enough for a cold cluster or a
+            # bigger corpus, while still failing in a useful timeframe. Too
+            # small remains the worse error — the kubelet would kill an almost
+            # finished ingest and the restart starts from zero.
             httpGet: { path: /stats, port: 5100 }
             periodSeconds: 15
-            failureThreshold: 160     # 40 min
+            failureThreshold: 40      # 10 min
           readinessProbe:
             httpGet: { path: /stats, port: 5100 }
             periodSeconds: 15
