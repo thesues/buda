@@ -1,0 +1,90 @@
+# Load the serving models into autumn fs/. One shot, run once per cluster rebuild.
+#
+#   kubectl -n autumn delete job upload-models --ignore-not-found
+#   kubectl -n autumn apply -f k8s/upload-models.yaml
+#   kubectl -n autumn logs -f job/upload-models
+#
+# Fill IMAGE_FREETOKEN. Replaces an earlier per-model manifest that could not
+# have worked: it asked for a 200Gi emptyDir on the autumn-node pool, which has
+# 37.7 GB of ephemeral storage. Only the GPU node has room (973 GB), so the job
+# runs there — for its disk, not its GPU.
+#
+# ⚠️ PRESPLIT FIRST. Splitting a partition that already holds keys mostly fails
+# on has_overlap, and the way back is delete + major compact + retry. `fs` is
+# presplit to 6 partitions; change that BEFORE running this.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: upload-models, namespace: autumn }
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: OnFailure
+      enableServiceLinks: false
+      # The GPU node, and NOT for the GPU: it is the only node with room. The
+      # autumn-node pool has 37.7 GB of ephemeral storage — a 130 GiB download
+      # cannot land there at all, which the earlier "200Gi emptyDir on
+      # autumn-node" would have discovered the hard way.
+      nodeSelector: { kubernetes.io/hostname: "192.168.3.2" }
+      containers:
+        - name: upload
+          image: IMAGE_FREETOKEN
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -uo pipefail
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              AF="autumnfs --manager $M --credential-file /etc/autumn/cred/fs.cred"
+              # oniond's shell driver needs jq; the image's .deb extraction skips
+              # its dependency graph, so install it here until the image carries it.
+              command -v jq >/dev/null || { apt-get update -qq && apt-get install -y -qq jq; }
+              echo "manager=$M  bucket=${BUCKET:-unset}  jq=$(command -v jq || echo MISSING)"
+
+              $AF mkdir models 2>/dev/null || true
+
+              fetch_and_push() {
+                local repo="$1" dest="$2" name="${1##*/}"
+                echo; echo "=============== $repo -> fs/$dest ==============="
+                rm -rf /scratch/dl; mkdir -p /scratch/dl
+                local src=""
+                if timeout 120 oniond list model 2>/dev/null | sed 's/^[| ]*//; s/[| ]*$//' | grep -qx "$name"; then
+                  echo ">>> oniond download $name"
+                  oniond download model "$name" --dir /scratch/dl && src=/scratch/dl/$name
+                fi
+                if [ -z "$src" ] || [ ! -d "$src" ]; then
+                  echo ">>> not in bucket (or download failed) -> HF mirror"
+                  python3 -m pip install --no-cache-dir -q "huggingface_hub[cli]" 2>/dev/null
+                  HF_ENDPOINT=https://hf-mirror.com hf download "$repo" \
+                    --local-dir /scratch/dl/hf --max-workers 8 || return 1
+                  src=/scratch/dl/hf
+                fi
+                echo ">>> downloaded $(du -sh $src | cut -f1)"
+                $AF mkdir "$dest" 2>/dev/null || true
+                cd "$src"
+                local n=0 total; total=$(find . -type f | wc -l)
+                find . -type f | sed 's|^\./||' | sort | while read -r f; do
+                  n=$((n+1))
+                  case "$f" in */*) $AF mkdir "$dest/${f%/*}" 2>/dev/null || true ;; esac
+                  printf '[%d/%d] %-52s ' "$n" "$total" "$f"
+                  $AF put "$f" "$dest/$f" >/dev/null 2>&1 && echo ok || echo FAIL
+                done
+                cd /; rm -rf /scratch/dl
+                echo ">>> $dest 完成: $($AF ls "$dest" | wc -l) 个顶层条目"
+              }
+
+              fetch_and_push nvidia/MiniMax-M2.5-NVFP4        models/minimax-m25
+              fetch_and_push deepseek-ai/DeepSeek-V4-Flash-0731 models/dsv4-flash
+              echo; echo "=== models/ ==="; $AF ls models
+          env:
+            - { name: BUCKET, value: "ai-infra" }
+            - { name: PIP_INDEX_URL, value: "https://mirrors.aliyun.com/pypi/simple/" }
+          volumeMounts:
+            - { name: scratch, mountPath: /scratch }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+          resources:
+            requests: { cpu: "4", memory: 8Gi, ephemeral-storage: 200Gi }
+            limits:   { cpu: "8", memory: 16Gi, ephemeral-storage: 400Gi }
+      volumes:
+        - { name: scratch, emptyDir: { sizeLimit: 400Gi } }
+        - name: cred
+          secret: { secretName: autumn-credential }
