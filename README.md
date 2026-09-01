@@ -75,8 +75,51 @@ exists** — build autumn-rs first, then this. Getting that order wrong fails at
 - `fs/` presplit before any data was written. Splitting a populated partition
   mostly fails on `has_overlap`.
 
+## Building
+
+Built by a Volcengine CP pipeline (workspace `dongmao-lerobot`), from this repo,
+Dockerfile `docker/Dockerfile.freetoken`, context the repo root.
+
+```
+--build-arg BASE_REGISTRY=hub-cache-cn-beijing.cr.volces.com/
+--build-arg APT_MIRROR=https://mirrors.aliyun.com
+--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+--build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn
+--build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+--build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/
+--build-arg AUTUMN_IMAGE=<cr>/autumn-rs:<autumn-commit-sha>
+```
+
+Two of those are not optional and not obvious:
+
+`PIP_INDEX_URL` — the default index resolves pypi.org but pulls wheels from
+files.pythonhosted.org, which stalls from the CN build pool: the build hangs with
+no output rather than failing. Note `freetoken` itself does **not** use this arg
+— it has its own `FREETOKEN_INDEX_URL`, because not every mirror carries it (the
+ivolces mirror answers `from versions: none` for that one package, which is how
+this was found).
+
+`AUTUMN_IMAGE` — see the lockstep note above. Unlike the other args this one is a
+correctness constraint, not a speed one.
+
+## Deploying
+
+```bash
+kubectl -n autumn apply -f k8s/memory-mcp.yaml          # small, exercises the
+                                                        # same fuse-sidecar shape
+kubectl -n autumn apply -f k8s/upload-model-minimax.yaml
+kubectl -n autumn apply -f k8s/freetoken.yaml
+```
+
+Fill the `IMAGE_*` placeholders first. Deploy `memory-mcp` before the serving
+pod if you can: it uses the same sidecar pattern, the same mountPropagation
+pairing and the same credential mounts, but needs no GPU and no 130 GiB
+download — so a mistake in the pod shape surfaces cheaply.
+
 ## Status
 
-Not yet deployed. The image tags in the manifests are placeholders; the
-model has not been uploaded. See the git log for what has been verified against
-the live cluster (the FUSE `O_DIRECT` path has been).
+Not deployed yet. Image tags are placeholders and the model is not uploaded.
+What *has* been verified against the live cluster: `O_DIRECT` reads work on an
+autumn-fuse mount at both 4 KiB and 8 MiB, which is the load path this whole
+design rests on — FreeToken probes `O_DIRECT` once and otherwise falls back to a
+`MAP_SHARED` mmap that a FUSE `direct_io` file refuses outright.
