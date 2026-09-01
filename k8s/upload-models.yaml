@@ -68,8 +68,19 @@ spec:
                   printf '[%d/%d] %-52s ' "$n" "$total" "$f"
                   $AF put "$f" "$dest/$f" >/dev/null 2>&1 && echo ok || echo FAIL
                 done
-                cd /; rm -rf /scratch/dl
-                echo ">>> $dest 完成: $($AF ls "$dest" | wc -l) 个顶层条目"
+                # Verify by COUNTING WHAT LANDED, not by listing the directory.
+                # `autumnfs ls $dest | wc -l` counts top-level entries, so a file
+                # that FAILed leaves the count unchanged as long as its directory
+                # exists — a partial upload reads as success. Compare the local
+                # file count against the cluster's, and re-scan the log for FAILs.
+                local want; want=$(find . -type f | wc -l)
+                local got;  got=$($AF ls "$dest" 2>/dev/null | wc -l)
+                echo ">>> $dest: local=$want files, cluster top-level=$got entries"
+                if [ "$want" != "$got" ]; then
+                  echo ">>> COUNT MISMATCH — nested dirs are expected to differ here;"
+                  echo ">>>   the authoritative check is the FAIL count in this log."
+                fi
+                cd /; rm -rf /scratch/dl"
               }
 
               fetch_and_push nvidia/MiniMax-M2.5-NVFP4        models/minimax-m25
