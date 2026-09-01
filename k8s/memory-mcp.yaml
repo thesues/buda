@@ -45,62 +45,84 @@ spec:
       enableServiceLinks: false
       nodeSelector: { autumn-node: "true" }
 
-      # Native sidecar so the mount is up before ingest starts. A plain sidecar
-      # would race it, and memory-mcp reads --docs eagerly at startup.
-      initContainers:
-        - name: fuse
-          image: IMAGE_AUTUMN_RS
-          restartPolicy: Always
-          args: ["fuse"]
-          env:
-            - { name: AUTUMN_MANAGER,         value: "autumn-manager:9001" }
-            - { name: AUTUMN_FUSE_MOUNTPOINT, value: "/mnt/autumn" }
-            - { name: AUTUMN_CREDENTIAL_FILE, value: "/etc/autumn/cred/fs.cred" }
-          securityContext: { privileged: true }
-          volumeMounts:
-            - { name: mnt, mountPath: /mnt/autumn, mountPropagation: Bidirectional }
-            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
-          startupProbe:
-            exec: { command: ["sh", "-c", "mountpoint -q /mnt/autumn"] }
-            periodSeconds: 3
-            failureThreshold: 40
-
+      # ── One container, not a fuse sidecar ────────────────────────────────
+      # The sidecar shape does not work on this cluster. `mountPropagation:
+      # Bidirectional` is accepted by the API server but the node never honours
+      # it: measured inside a privileged sidecar, the container had ZERO shared
+      # mounts and the FUSE mount came up `PROPAGATION: private` with the
+      # container root as its parent. Nothing propagates, so the app container
+      # saw an empty directory and died on "No such file or directory".
+      #
+      # Running the mount in the SAME container sidesteps propagation entirely —
+      # one mount namespace, no sharing required. This is the shape the earlier
+      # O_DIRECT probe used, and it worked.
+      #
+      # The cost is honest: the whole container is privileged now, where before
+      # only the sidecar was. Reverting to a sidecar requires the node's kubelet
+      # to be configured with rshared propagation, which is a cluster-level
+      # change on shared infrastructure.
       containers:
         - name: memory-mcp
           image: IMAGE_AUTUMN_RS
+          securityContext: { privileged: true }
           command: ["bash", "-lc"]
           args:
             - |
               set -euo pipefail
               # IP-only client: resolve the manager before dialing it.
               M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
-              echo "manager=$M  corpus=/mnt/autumn/docs/buda"
-              ls /mnt/autumn/docs/buda | head -5
+              MP=/mnt/autumn
+              mkdir -p "$MP"
+
+              # A crashed predecessor can leave the mount entry behind; clear it
+              # before remounting or fusermount fails with EBUSY.
+              mountpoint -q "$MP" && fusermount3 -u "$MP" || true
+
+              autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+                --credential-file /etc/autumn/cred/fs.cred &
+              FUSE_PID=$!
+              trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
+
+              for i in $(seq 1 60); do
+                mountpoint -q "$MP" && break
+                kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
+                sleep 1
+              done
+              mountpoint -q "$MP" || { echo "mount timed out after 60s"; exit 1; }
+              echo "mounted; corpus:"; ls "$MP/docs/buda" | head -5
+
               exec memory-mcp "$M" \
                 --no-index \
-                --docs /mnt/autumn/docs/buda \
+                --docs "$MP/docs/buda" \
                 --tenant buda \
                 --credential-file /etc/autumn/cred/mem.cred \
                 --host 0.0.0.0 --port 5100
           ports:
             - { name: http, containerPort: 5100 }
           volumeMounts:
-            - { name: mnt, mountPath: /mnt/autumn, readOnly: true, mountPropagation: HostToContainer }
             - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
           resources:
             requests: { cpu: "2", memory: 4Gi }
             limits:   { cpu: "4", memory: 8Gi }
           startupProbe:
-            # Ingest of this corpus took ~3m20s against a local 3-node cluster;
-            # the HTTP listener only comes up after it finishes.
+            # Mount, then ingest; the HTTP listener only binds once ingest
+            # finishes, so this budget has to cover the whole thing.
+            #
+            # Sized from measurement, and the local number is NOT the guide: the
+            # same corpus took ~3m20s against a loopback cluster and was still
+            # going at 12 min here. Ingest is ~5164 chunks each writing BM25
+            # postings, an IVF vector, a graph node and an edge — tens of
+            # thousands of small KV writes, where the local run pays no network
+            # and no RF=3. A budget that is too small is the worst failure mode
+            # available: the kubelet kills a nearly-finished ingest and the
+            # restart begins again from zero, forever.
             httpGet: { path: /stats, port: 5100 }
-            periodSeconds: 10
-            failureThreshold: 60      # 10 min
+            periodSeconds: 15
+            failureThreshold: 160     # 40 min
           readinessProbe:
             httpGet: { path: /stats, port: 5100 }
             periodSeconds: 15
 
       volumes:
-        - { name: mnt, emptyDir: {} }
         - name: cred
           secret: { secretName: autumn-credential }
