@@ -1,0 +1,6 @@
+# The corpus itself is not source: 17 converted markdown files (~6 MB) that live
+# in the autumn cluster under fs/docs/buda/. Keeping a second copy here would
+# invite the two drifting.
+md/
+*.epub
+*.pdf
