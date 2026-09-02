@@ -1,0 +1,72 @@
+# hermes webui — session management and a chat box.
+#
+# Two venvs on purpose. hermes and this app share most of their dependencies and
+# disagree on some, so one venv would resolve to whatever the later install
+# wanted and quietly break the other. `hermes_session_api.py` is executed by
+# HERMES' interpreter for exactly the same reason.
+#
+# There is no autumn client in this image and no `autumn-fuse`. This app reaches
+# retrieval through `memory-mcp` over HTTP MCP, so it holds no autumn credential
+# and — the part that actually matters — is NOT bound by autumn's WIRE lockstep.
+# A cluster wire bump does not require rebuilding this image, which is the whole
+# reason the MCP server grew an HTTP transport.
+
+ARG BASE_REGISTRY=
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+FROM ${BASE_REGISTRY}${PYTHON_IMAGE}
+
+ARG APT_MIRROR=
+# The default index resolves pypi.org but pulls wheels from files.hosted, which
+# stalls from the CN build pool with no output rather than failing. Same trap
+# `Dockerfile.freetoken` documents.
+ARG PIP_INDEX_URL=https://pypi.org/simple/
+ARG HERMES_VERSION=0.17.0
+ARG HERMES_EXTRA_INDEX=
+
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN set -eux; \
+    if [ -n "${APT_MIRROR}" ]; then \
+      sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources || true; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl git tini; \
+    rm -rf /var/lib/apt/lists/*
+
+# --- hermes, in its own venv ------------------------------------------------ #
+# `hermes acp --check` at BUILD time: an image whose agent cannot start should
+# fail here, not at 3am in a rollout. It is also the only cheap proof that the
+# `[acp]` extra actually resolved.
+RUN set -eux; \
+    python -m pip install --no-cache-dir uv; \
+    uv venv /opt/hermes/.venv; \
+    VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache-dir \
+        $( [ -n "${HERMES_EXTRA_INDEX}" ] && echo "--extra-index-url ${HERMES_EXTRA_INDEX} --index-strategy unsafe-best-match" ) \
+        "hermes-agent[acp]==${HERMES_VERSION}"; \
+    ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes; \
+    hermes acp --check
+
+# --- the app ---------------------------------------------------------------- #
+RUN python -m pip install --no-cache-dir "aiohttp>=3.9"
+
+WORKDIR /app
+COPY webui/ /app/
+
+ENV HERMES_BIN=/usr/local/bin/hermes \
+    HERMES_PY=/opt/hermes/.venv/bin/python \
+    HERMES_HOME=/opt/data \
+    HERMES_DISABLE_LAZY_INSTALLS=1 \
+    WORKDIR=/opt/data \
+    PORT=8080 \
+    MEMORY_MCP_URL=http://memory-mcp:5100/mcp
+RUN mkdir -p /opt/data/logs
+
+EXPOSE 8080
+# tini reaps: `hermes acp` is a child of this process, and a chat session that
+# ends without one leaves a zombie per turn. The lerobot console learned this by
+# accumulating 48 of them over 26 hours.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "server.py"]

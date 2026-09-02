@@ -8,11 +8,14 @@ every piece of it talks to an autumn cluster.
 buda/
 ├── docker/
 │   ├── Dockerfile.freetoken     FreeToken serving image (+ the autumn client)
+│   ├── Dockerfile.webui         hermes webui (no autumn client — see below)
 │   └── README.freetoken.md      why the image is shaped the way it is
+├── webui/                       the webui itself + ARCHITECTURE.md
 └── k8s/
     ├── freetoken.yaml           MoE serving on one RTX 4090
-    ├── upload-model-minimax.yaml   one-shot: load the checkpoint into autumn fs/
-    └── memory-mcp.yaml          MCP/HTTP retrieval over the document corpus
+    ├── upload-models.yaml       one-shot: load a checkpoint into autumn fs/
+    ├── memory-mcp.yaml          MCP/HTTP retrieval over the document corpus
+    └── webui.yaml               chat + session management
 ```
 
 ## What it does
@@ -25,6 +28,11 @@ keep them in autumn and read them through a FUSE mount.
 
 **Retrieval** — `memory-mcp` (an autumn tool) indexes a document corpus stored in
 autumn and exposes it over MCP and HTTP.
+
+**Chat** — `webui` is a hermes front end: session management and a chat box. It
+reaches retrieval through `memory-mcp`'s **HTTP** MCP transport rather than
+spawning it, so it holds no autumn credential and is the one workload here NOT
+bound by the WIRE lockstep below. See `webui/ARCHITECTURE.md`.
 
 Both follow the same shape: a privileged `autumn-fuse` sidecar mounts the `fs/`
 namespace, the app reads files from the mount, and anything the app *writes*
@@ -118,8 +126,15 @@ download — so a mistake in the pod shape surfaces cheaply.
 
 ## Status
 
-Not deployed yet. Image tags are placeholders and the model is not uploaded.
-What *has* been verified against the live cluster: `O_DIRECT` reads work on an
-autumn-fuse mount at both 4 KiB and 8 MiB, which is the load path this whole
-design rests on — FreeToken probes `O_DIRECT` once and otherwise falls back to a
-`MAP_SHARED` mmap that a FUSE `direct_io` file refuses outright.
+Deployed and serving. FreeToken runs DeepSeek-V4-Flash reading its weights from
+an autumn-fuse mount; `memory-mcp` is up; the webui is built but not yet rolled
+out. Verified against the live cluster:
+
+- `O_DIRECT` reads work on an autumn-fuse mount at 4 KiB and 8 MiB — the load
+  path this whole design rests on, since FreeToken probes `O_DIRECT` once and
+  otherwise falls back to a `MAP_SHARED` mmap that a FUSE `direct_io` file
+  refuses outright. `--expert-load parallel` therefore works and is what the
+  manifest uses.
+- Reads from the mount sustain ~2.4 GB/s at 24-way concurrency (~97 MiB/s
+  single-stream — this path scales with concurrency, not with one reader, so a
+  serial measurement understates it by an order of magnitude).

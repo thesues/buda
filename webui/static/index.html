@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hermes</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-head">
+      <span class="brand">hermes</span>
+      <button id="new-session" title="新建会话">＋</button>
+    </div>
+    <ul id="sessions" aria-label="会话列表"></ul>
+    <div id="side-foot"><span id="mcp-badge"></span></div>
+  </aside>
+
+  <main id="main">
+    <div id="banner" hidden></div>
+    <div id="messages" aria-live="polite"></div>
+
+    <div id="approval" hidden>
+      <div id="approval-title"></div>
+      <div id="approval-options"></div>
+    </div>
+
+    <form id="composer">
+      <textarea id="input" rows="1" placeholder="发消息…  (Enter 发送 / Shift+Enter 换行)"></textarea>
+      <button id="send" type="submit">发送</button>
+      <button id="stop" type="button" hidden>停止</button>
+    </form>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

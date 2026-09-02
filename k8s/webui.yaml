@@ -1,0 +1,120 @@
+# hermes webui — session management and a chat box.
+#
+# Note what is NOT here, compared to every other workload in this repo: no
+# privileged container, no `autumn-fuse`, no `/dev/fuse`, no autumn credential,
+# no mountPropagation. This pod never talks to autumn. It talks to `memory-mcp`
+# over HTTP MCP and to `freetoken` over the OpenAI-compatible API, both plain
+# ClusterIP Services.
+#
+# The practical consequence is that this image is NOT under autumn's WIRE
+# lockstep: rolling the cluster to a new wire version does not require
+# rebuilding it. That is what the MCP HTTP transport bought.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-webui-data
+  namespace: autumn
+spec:
+  accessModes: [ReadWriteOnce]
+  # Sessions ARE the feature. On an emptyDir every restart would present an
+  # empty sidebar, which reads as data loss whether or not anyone calls it that.
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-webui
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: webui }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: webui }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-webui
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: webui }
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the turn state lives in the process and the
+  # session DB is a ReadWriteOnce volume, so two replicas cannot both hold it.
+  # A surge-first rollout would deadlock on the PVC.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: webui }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: webui }
+    spec:
+      # k8s injects HERMES_WEBUI_PORT=tcp://... style vars for every Service in
+      # the namespace, which collide with plain PORT-shaped config.
+      enableServiceLinks: false
+      containers:
+        - name: webui
+          image: IMAGE_WEBUI
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Point hermes at the local model server. Best-effort on purpose:
+              # a chat UI that refuses to start because a config key moved is
+              # worse than one that starts and reports the model is unset.
+              if [ -n "${LLM_BASE_URL:-}" ]; then
+                hermes config set model.base_url "$LLM_BASE_URL" || \
+                  echo "WARN: could not set model.base_url" >&2
+                hermes config set model.default "${LLM_MODEL:-dsv4-flash}" || true
+                # FreeToken has no auth; hermes still wants the key to be set.
+                hermes config set model.api_key "${LLM_API_KEY:-none}" || true
+              fi
+
+              # The MCP server is written by the app at startup, not here: it
+              # merges into config.yaml idempotently and reports what it did on
+              # /api/status, so there is one owner of that block.
+              exec python server.py
+          env:
+            - { name: PORT, value: "8080" }
+            - { name: HERMES_HOME, value: /opt/data }
+            - { name: WORKDIR, value: /opt/data }
+            # The decoupled dependency: an HTTP URL, not a spawned process.
+            - { name: MEMORY_MCP_URL, value: "http://memory-mcp:5100/mcp" }
+            - { name: MEMORY_MCP_NAME, value: "memory" }
+            - { name: LLM_BASE_URL, value: "http://freetoken:1919/v1" }
+            - { name: LLM_MODEL, value: "dsv4-flash" }
+            # Single-user HTTP Basic. Leave AUTH_USER empty to disable; the app
+            # refuses to start with a user set and an empty password rather than
+            # running with a credential that can never match.
+            - name: AUTH_USER
+              valueFrom:
+                secretKeyRef: { name: hermes-webui-auth, key: user, optional: true }
+            - name: AUTH_PASS
+              valueFrom:
+                secretKeyRef: { name: hermes-webui-auth, key: pass, optional: true }
+          ports:
+            - { name: http, containerPort: 8080 }
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+          resources:
+            requests: { cpu: "200m", memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            # /healthz is deliberately shallow — it answers while a turn is
+            # running and while `hermes acp` is restarting. A deep probe would
+            # restart the pod in exactly the moments this design exists to
+            # survive, taking the running turn with it.
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: hermes-webui-data }
