@@ -157,12 +157,21 @@ spec:
                 --credential-file /etc/autumn/cred/fs.cred &
               FUSE_PID=$!
               trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
+              # Wait for a real READ to succeed, not for /proc/mounts.
+              #
+              # The kernel adds the mount entry BEFORE it sends FUSE INIT, so
+              # /proc/mounts goes true while the handshake is still outstanding — and
+              # if INIT then fails (it has a 30 s timeout), everything after this
+              # point hits a dead mount. That raced: the script logged "mounted", the
+              # init timed out half a minute later, and the first `ls` died with
+              # "Connection refused", crash-looping the pod. Listing the directory we
+              # actually need is the honest readiness signal.
               for i in $(seq 1 120); do
-                grep -qs " $MP fuse" /proc/mounts && break
+                ls "$MP" >/dev/null 2>&1 && break
                 kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
                 sleep 1
               done
-              grep -qs " $MP fuse" /proc/mounts || { echo "mount timed out after 120s"; exit 1; }
+              ls "$MP" >/dev/null 2>&1 || { echo "mount not serving reads after 120s"; exit 1; }
               echo "mounted after ${i}s; model dir:"; ls "$MP/models/dsv4-flash" | head -3
 
               # DeepSeek-V4-Flash, not MiniMax. Two reasons beyond the model

@@ -90,7 +90,14 @@ spec:
 
               # A crashed predecessor can leave the mount entry behind; clear it
               # before remounting or fusermount fails with EBUSY.
-              mountpoint -q "$MP" && fusermount3 -u "$MP" || true
+              # Never `mountpoint -q` a possibly-stale FUSE path: it stats, and
+              # a stale mount blocks stat() forever — so the check meant to
+              # recover from a crashed predecessor is what hangs its
+              # replacement. /proc/mounts is pure VFS metadata; the unmount is
+              # lazy so it cannot block on the dead connection either.
+              if grep -qs " $MP fuse" /proc/mounts; then
+                fusermount3 -uz "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
+              fi
 
               # --direct-read false is required: reads >= 64 KiB go EN-direct and
 
@@ -107,12 +114,18 @@ spec:
               FUSE_PID=$!
               trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
 
-              for i in $(seq 1 60); do
-                mountpoint -q "$MP" && break
+              # Wait for a real READ, not for the mount entry. The kernel adds
+              # the entry BEFORE it sends FUSE INIT, so a mountpoint/proc check
+              # goes true while the handshake is still outstanding — and if INIT
+              # then times out, everything after this point hits a dead mount.
+              # That crash-looped the freetoken pod: "mounted" logged, init
+              # failed 30 s later, first ls died with "Connection refused".
+              for i in $(seq 1 120); do
+                ls "$MP" >/dev/null 2>&1 && break
                 kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
                 sleep 1
               done
-              mountpoint -q "$MP" || { echo "mount timed out after 60s"; exit 1; }
+              ls "$MP" >/dev/null 2>&1 || { echo "mount not serving reads after 120s"; exit 1; }
               echo "mounted; corpus:"; ls "$MP/docs/buda" | head -5
 
               exec memory-mcp "$M" \
