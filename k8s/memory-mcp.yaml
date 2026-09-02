@@ -92,7 +92,17 @@ spec:
               # before remounting or fusermount fails with EBUSY.
               mountpoint -q "$MP" && fusermount3 -u "$MP" || true
 
-              autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+              # --direct-read false is required: reads >= 64 KiB go EN-direct and
+
+              # cannot work on EC-converted extents (the .dat holds RS shards), and
+
+              # the corpus files are up to 820 KB. Without it every document read
+
+              # fails and ingest silently indexes ZERO chunks while the server comes
+
+              # up healthy — measured: 17 files, 389 s, 0 chunks.
+
+              autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp --direct-read false \
                 --credential-file /etc/autumn/cred/fs.cred &
               FUSE_PID=$!
               trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
