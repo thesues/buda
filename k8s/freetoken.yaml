@@ -203,8 +203,13 @@ spec:
                 --host 0.0.0.0 --port 1919 \
                 --moe-backend hybrid \
                 --page-size 64 \
-                --expert-load serial \
-                --tool-call-parser deepseek --reasoning-parser deepseek
+                --expert-load parallel \
+                # `deepseekv32`, not `deepseek` — these are closed argparse
+                # enumerations, and the value is the parser's name, not the
+                # model family's. Guessing it from the model name fails the
+                # process at startup rather than degrading, which is the right
+                # behaviour but reads as a crash-loop.
+                --tool-call-parser deepseekv32 --reasoning-parser deepseekv32
           ports:
             - { name: http, containerPort: 1919 }
           env:

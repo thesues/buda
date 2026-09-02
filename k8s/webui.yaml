@@ -66,6 +66,13 @@ spec:
               # a chat UI that refuses to start because a config key moved is
               # worse than one that starts and reports the model is unset.
               if [ -n "${LLM_BASE_URL:-}" ]; then
+                # `model.provider custom` FIRST, and it is not optional: without
+                # it hermes resolves a provider on its own, lands on openrouter,
+                # and `session/new` fails with a bare "Internal error" whose only
+                # trace is an OPENROUTER_API_KEY warning in the ACP child's
+                # stderr. Verified locally against 0.16 and 0.17 alike.
+                hermes config set model.provider custom || \
+                  echo "WARN: could not set model.provider" >&2
                 hermes config set model.base_url "$LLM_BASE_URL" || \
                   echo "WARN: could not set model.base_url" >&2
                 hermes config set model.default "${LLM_MODEL:-dsv4-flash}" || true
