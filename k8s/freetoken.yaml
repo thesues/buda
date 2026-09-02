@@ -166,12 +166,22 @@ spec:
               # init timed out half a minute later, and the first `ls` died with
               # "Connection refused", crash-looping the pod. Listing the directory we
               # actually need is the honest readiness signal.
+              # Wait until the mount serves the path we actually need.
+              #
+              # Two weaker checks both pass for the wrong reason. /proc/mounts and
+              # `mountpoint -q` go true BEFORE the kernel sends FUSE INIT, so they
+              # are satisfied while the handshake is still outstanding. And `ls
+              # "$MP"` succeeds on the bare mountpoint before the mount takes over,
+              # because listing an empty directory is a success — that raced too,
+              # logging "mounted after 1s" before the daemon had even connected,
+              # and then dying on the first real path. Only reading something that
+              # cannot exist until the filesystem is live actually proves it.
               for i in $(seq 1 120); do
-                ls "$MP" >/dev/null 2>&1 && break
+                ls "$MP/models/dsv4-flash" >/dev/null 2>&1 && break
                 kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
                 sleep 1
               done
-              ls "$MP" >/dev/null 2>&1 || { echo "mount not serving reads after 120s"; exit 1; }
+              ls "$MP/models/dsv4-flash" >/dev/null 2>&1 || { echo "mount not serving "$MP/models/dsv4-flash" after 120s"; exit 1; }
               echo "mounted after ${i}s; model dir:"; ls "$MP/models/dsv4-flash" | head -3
 
               # DeepSeek-V4-Flash, not MiniMax. Two reasons beyond the model
