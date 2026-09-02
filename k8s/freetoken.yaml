@@ -52,6 +52,20 @@
 # hold the dense weights, one layer's expert slots, and the KV pages.
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: freetoken-kernel-cache
+  namespace: autumn
+spec:
+  accessModes: [ReadWriteOnce]
+  # flashinfer/triton JIT their kernels for the exact arch on first use. On an
+  # emptyDir that work is redone on EVERY pod recreation -- observed as ~10+
+  # minutes of `cicc` compiling sampling.cu for compute_89 while the server
+  # answered "model is still loading", which reads exactly like a slow weight
+  # load and is not one.
+  resources: { requests: { storage: 10Gi } }
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: freetoken
@@ -279,4 +293,5 @@ spec:
           secret: { secretName: autumn-credential }
         # Torch's multiprocessing needs more than the 64 MiB default /dev/shm.
         - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
-        - { name: ftcache, emptyDir: {} }
+        - name: ftcache
+          persistentVolumeClaim: { claimName: freetoken-kernel-cache }
