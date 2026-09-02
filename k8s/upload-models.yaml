@@ -59,7 +59,14 @@ spec:
                   | sed 's/^[| ]*//; s/[| ]*$//' > /tmp/oniond-models.txt || true
                 if grep -qx "$name" /tmp/oniond-models.txt; then
                   echo ">>> oniond download $name"
-                  oniond download model "$name" --dir /scratch/dl --turbo && src=/scratch/dl/$name
+                  # --turbo has never actually run on this cluster (the SIGPIPE
+                  # bug above meant this branch was dead), so don't let an
+                  # unsupported flag silently cost us the in-network path and
+                  # send 155 GiB over the public mirror instead. Retry plain.
+                  oniond download model "$name" --dir /scratch/dl --turbo \
+                    || { echo ">>> --turbo failed, retrying without it"
+                         oniond download model "$name" --dir /scratch/dl; }
+                  [ -d "/scratch/dl/$name" ] && src=/scratch/dl/$name
                 fi
                 if [ -z "$src" ] || [ ! -d "$src" ]; then
                   echo ">>> not in bucket (or download failed) -> HF mirror"
