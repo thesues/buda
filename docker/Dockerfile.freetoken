@@ -1,6 +1,8 @@
 # FreeToken + autumn image — MoE serving with weights read from an autumn FUSE mount.
 #
-# Build context = autumn-rs REPO ROOT (needs the Rust workspace to build the wheel):
+# Build context = THIS repo (buda). The autumn-rs workspace is NOT needed as the
+# context: its sources come out of AUTUMN_IMAGE along with the binaries, so that
+# one tag is the only version knob (see "the autumn client" section below).
 #   docker build -f docker/Dockerfile.freetoken \
 #     --build-arg BASE_REGISTRY=hub-cache-cn-beijing.cr.volces.com/ \
 #     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
@@ -151,8 +153,28 @@ RUN FREETOKEN_ALLOW_CUDA_MISMATCH=0 \
       --index-url "${FREETOKEN_INDEX_URL}" "${FREETOKEN_SPEC}"
 
 # ── the autumn client + its kvcache adapters ──────────────────────────────────
+# The SOURCES come out of the autumn-rs image, alongside the binaries above.
+#
+# This used to `COPY . .` the build context, which made the wheel's wire version
+# come from whatever commit that context was at while `autumn-fuse`/`autumnfs`
+# were lifted from a separately pinned AUTUMN_IMAGE. Nothing forced the two to
+# agree, and a wheel at one wire version with binaries at another is a build
+# that looks fine and dies at the handshake — or decodes garbage silently if the
+# fingerprint happens to match across a layout drift. It also meant this file
+# could only be built with the autumn-rs repo as its context, which is not where
+# it lives any more.
+#
+# Now AUTUMN_IMAGE is the ONE version knob and the build context is this repo.
+#
+# We take SOURCE and compile here rather than copying a prebuilt wheel, because
+# the wheel is a native extension with no abi3: it is bound to the builder's
+# glibc and exact CPython. autumn-rs builds on Debian bookworm (glibc 2.36);
+# this image is Ubuntu 22.04 (glibc 2.35, Python 3.10), so a wheel from there
+# would either be rejected by pip as manylinux_2_36 or install and fail at
+# import on a missing GLIBC_2.36. Compiling against this image's own runtime
+# avoids the whole question.
+COPY --from=autumncore /usr/local/share/autumn/src/ /src/
 WORKDIR /src
-COPY . .
 RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
       printf '[source.crates-io]\nreplace-with="m"\n[source.m]\nregistry="%s"\n' "$CARGO_MIRROR" >> "$CARGO_HOME/config.toml"; fi
 
@@ -162,9 +184,8 @@ RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
 #   --hicache-storage-backend dynamic
 #   --hicache-storage-backend-extra-config '{"module_path":"autumn_kvcache.sglang_backend",
 #     "class_name":"AutumnKVCacheStorage","interface_v1":1,...}'
-# Installing it now costs nothing and means the image is ready the moment the
-# engine side lands. `autumn_vllm_loader` is deliberately NOT installed: weights
-# come from the FUSE mount here, not from `--load-format autumn`.
+# `autumn_vllm_loader` is deliberately NOT installed: weights come from the FUSE
+# mount here, not from `--load-format autumn`.
 RUN cd python \
  && maturin build --release --interpreter python3 \
  && python3 -m pip install --no-cache-dir target/wheels/autumn-*.whl \
