@@ -37,7 +37,19 @@ spec:
               AF="autumnfs --manager $M --credential-file /etc/autumn/cred/fs.cred"
               # oniond's shell driver needs jq; the image's .deb extraction skips
               # its dependency graph, so install it here until the image carries it.
-              command -v jq >/dev/null || { apt-get update -qq && apt-get install -y -qq jq; }
+              # `update || true`, NOT `update && install`. The image carries an
+              # NVIDIA CUDA apt source whose index goes stale independently of
+              # us ("File has unexpected size ... Mirror sync in progress?"),
+              # which makes `apt-get update` exit non-zero and short-circuit the
+              # install. jq then goes missing, oniond exits 1 without saying why,
+              # and the whole run silently falls back to the public mirror. The
+              # ubuntu source we actually need is fine; a partial update is
+              # enough to install jq.
+              if ! command -v jq >/dev/null; then
+                apt-get update -qq || true
+                apt-get install -y -qq jq || true
+              fi
+              command -v jq >/dev/null || { echo "FATAL: jq missing, oniond cannot run"; exit 1; }
               echo "manager=$M  bucket=${BUCKET:-unset}  jq=$(command -v jq || echo MISSING)"
 
               $AF mkdir models 2>/dev/null || true
