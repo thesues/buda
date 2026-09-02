@@ -29,8 +29,11 @@
 # ── Sizing ────────────────────────────────────────────────────────────────────
 #   expert banks (host)   256 experts x 62 layers x 3 x 3072 x 1536 x 0.5625 B
 #                         = 224.7B params -> ~118 GiB, pinned and non-reclaimable
-#   memory: 160Gi         banks + one ~3 GiB shard in flight + torch/CUDA overhead
-#   FREETOKEN_PIN_BUDGET_GB=120  caps cudaHostRegister just above the banks
+#   memory: 210Gi         sized for DeepSeek-V4-Flash: 155 GiB of expert banks
+#                         + one ~3 GiB shard in flight + torch/CUDA overhead.
+#                         (160Gi was MiniMax's 118 GiB banks; dsv4 does not fit
+#                         in it, and FreeToken asserts rather than degrading.)
+#   FREETOKEN_PIN_BUDGET_GB=170  caps cudaHostRegister just above the banks
 #   VRAM                  ~7.4 GiB dense + 256 expert slots x 7.59 MB (1.9 GB,
 #                         3.8 GB with prefill overlap) leaves ~10 GB for KV
 #   cpu: 32               one CPU-MoE worker per physical core; raise it if the
@@ -160,8 +163,16 @@ spec:
                 sleep 1
               done
               grep -qs " $MP fuse" /proc/mounts || { echo "mount timed out after 120s"; exit 1; }
-              echo "mounted after ${i}s; model dir:"; ls "$MP/models/minimax-m25" | head -3
+              echo "mounted after ${i}s; model dir:"; ls "$MP/models/dsv4-flash" | head -3
 
+              # DeepSeek-V4-Flash, not MiniMax. Two reasons beyond the model
+              # itself: its experts are ds_fp4, which `ft bench bw` measured on
+              # this GPU as hybrid-capable at 108 GB/s (4.29x over offload),
+              # where MiniMax's NVFP4 path is the one whose serial expert build
+              # hung with zero CPU and zero I/O. And `--nvfp4-backend triton` is
+              # dropped with it — it selects a kernel for NVFP4 experts and says
+              # nothing about ds_fp4.
+              #
               # Calibrate the PCIe/CPU bandwidth split once per GPU. The profile
               # is cached by GPU UUID and does not transfer between machines;
               # without it `--moe-backend auto` never upgrades to hybrid. We pass
@@ -169,13 +180,12 @@ spec:
               ft bench bw || echo "bench bw failed — hybrid will use its default split"
 
               exec ft serve \
-                --model /mnt/autumn/models/minimax-m25 \
+                --model /mnt/autumn/models/dsv4-flash \
                 --host 0.0.0.0 --port 1919 \
                 --moe-backend hybrid \
-                --nvfp4-backend triton \
                 --page-size 64 \
                 --expert-load serial \
-                --tool-call-parser minimax --reasoning-parser minimax
+                --tool-call-parser deepseek --reasoning-parser deepseek
           ports:
             - { name: http, containerPort: 1919 }
           env:
@@ -183,7 +193,7 @@ spec:
             # to cudaHostRegister the ENTIRE expert bank set (_pin_budget_bytes
             # returns None on Linux = uncapped), which under a cgroup limit ends
             # in an mlock failure rather than a graceful fallback.
-            - { name: FREETOKEN_PIN_BUDGET_GB, value: "120" }
+            - { name: FREETOKEN_PIN_BUDGET_GB, value: "170" }
           resources:
             limits:
               nvidia.com/gpu: 1
@@ -193,11 +203,11 @@ spec:
               # quota without exclusive cores wrecks that (its own comment: "SMT
               # oversubscription thrashes the spin-barrier").
               cpu: "32"
-              memory: 160Gi
+              memory: 210Gi
             requests:
               nvidia.com/gpu: 1
               cpu: "32"
-              memory: 160Gi
+              memory: 210Gi
           securityContext:
             # privileged for the FUSE mount (needs /dev/fuse + SYS_ADMIN); it
             # subsumes IPC_LOCK, which pinned host memory needs because it counts
