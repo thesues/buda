@@ -134,7 +134,23 @@ spec:
                 echo "stale mount at $MP — lazy unmounting"
                 fusermount3 -uz "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
               fi
+              # --direct-read false is REQUIRED here, not a tuning knob.
+              #
+              # Direct reads send every read >= 64 KiB straight to an extent
+              # node, bypassing the PS. That cannot work on EC-converted
+              # extents: after conversion the `.dat` file holds RS shards, not
+              # the value, so autumn correctly refuses to hand out a direct-read
+              # descriptor for one. And the weights ARE EC-converted — a cluster
+              # with >= 5 extent nodes bootstraps its log streams at 4+1, every
+              # presplit child inherits that shape, and the default-armed
+              # `balanced` auto-policy converts each 16 GiB sealed extent on its
+              # own. Measured on this cluster with direct reads left on, a
+              # 32 MiB read never returned; with them off it took 0.48 s.
+              #
+              # The proxy path is not a consolation prize either: `autumnfs`
+              # pulled a 5 GB shard through it at 164 MiB/s.
               autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+                --direct-read false \
                 --credential-file /etc/autumn/cred/fs.cred &
               FUSE_PID=$!
               trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
