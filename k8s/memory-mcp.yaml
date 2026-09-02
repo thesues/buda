@@ -61,6 +61,20 @@ spec:
       # only the sidecar was. Reverting to a sidecar requires the node's kubelet
       # to be configured with rshared propagation, which is a cluster-level
       # change on shared infrastructure.
+      #
+      # 2026-09-02 — there is now a SECOND and stronger reason not to go back.
+      # Bidirectional propagation is precisely what lets a FUSE mount escape into
+      # the host mount namespace and outlive the pod. A mount left behind with no
+      # server blocks every stat() that crosses it, in uninterruptible sleep, and
+      # a container runtime stats mount points on every sandbox create and
+      # teardown — so one leaked mount stops the NODE from starting containers
+      # while everything already running carries on normally. We lost five nodes
+      # to that shape in one afternoon and only a reboot cleared them. The
+      # autumn-rs fix (MountOption::AutoUnmount, plus a bounded async read so a
+      # live-but-stalled daemon can't park the kernel either) landed in 344a37f;
+      # do not run any build older than that here, and if a sidecar ever does
+      # become possible, weigh this against it, not just the propagation
+      # mechanics.
       containers:
         - name: memory-mcp
           image: IMAGE_AUTUMN_RS
