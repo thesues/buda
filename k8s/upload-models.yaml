@@ -83,11 +83,17 @@ spec:
                 if [ -z "$src" ] || [ ! -d "$src" ]; then
                   echo ">>> not in bucket (or download failed) -> HF mirror"
                   python3 -m pip install --no-cache-dir -q "huggingface_hub[cli]" 2>/dev/null
-                  # HF_HUB_DISABLE_XET is not optional here. hf-mirror proxies
-                  # the metadata but not Xet's CAS host (cas-server.xethub.hf.co),
-                  # so a Xet-backed repo downloads a while and then dies with a
-                  # 401 from a domain the mirror never served. Disabling Xet
-                  # forces the classic LFS path, which the mirror does proxy.
+                  # HF_HUB_DISABLE_XET stops the hard failure but does NOT make
+                  # this path fast, and it is worth knowing which is which.
+                  # Without it, a Xet-backed repo dies partway with a 401 from
+                  # cas-server.xethub.hf.co, a host hf-mirror never served. With
+                  # it, the transfer succeeds — but measured, the bytes come from
+                  # us.aws.cdn.hf.co, so HF_ENDPOINT only ever redirected the
+                  # METADATA and the weights still cross the Pacific: ~22 MiB/s,
+                  # with 5 GB shards occasionally truncated mid-transfer and
+                  # retried. This branch is the slow fallback, not a solution.
+                  # The fix for any given model is to get it into the oniond
+                  # bucket (~180 MiB/s in-network, measured on DeepSeek-V4).
                   HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 hf download "$repo" \
                     --local-dir /scratch/dl/hf --max-workers 8 || return 1
                   src=/scratch/dl/hf
