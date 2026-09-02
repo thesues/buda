@@ -143,11 +143,23 @@ spec:
             # bigger corpus, while still failing in a useful timeframe. Too
             # small remains the worse error — the kubelet would kill an almost
             # finished ingest and the restart starts from zero.
-            httpGet: { path: /stats, port: 5100 }
+            # /config, NOT /stats. `/stats` runs a full `reconcile()` — a
+            # scan of every doc, vptr, node and edge — which takes seconds on a
+            # 5k-document corpus, while a probe's default timeout is 1s. The
+            # pod then sits 0/1 forever with "context deadline exceeded" while
+            # the server is up and serving, i.e. the check is more expensive
+            # than the thing it checks. /config is static JSON.
+            httpGet: { path: /config, port: 5100 }
             periodSeconds: 15
             failureThreshold: 40      # 10 min
           readinessProbe:
-            httpGet: { path: /stats, port: 5100 }
+            # /config, NOT /stats. `/stats` runs a full `reconcile()` — a
+            # scan of every doc, vptr, node and edge — which takes seconds on a
+            # 5k-document corpus, while a probe's default timeout is 1s. The
+            # pod then sits 0/1 forever with "context deadline exceeded" while
+            # the server is up and serving, i.e. the check is more expensive
+            # than the thing it checks. /config is static JSON.
+            httpGet: { path: /config, port: 5100 }
             periodSeconds: 15
 
       volumes:
