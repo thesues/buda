@@ -42,19 +42,34 @@ spec:
 
               $AF mkdir models 2>/dev/null || true
 
+              FAILED=""
+
               fetch_and_push() {
                 local repo="$1" dest="$2" name="${1##*/}"
                 echo; echo "=============== $repo -> fs/$dest ==============="
                 rm -rf /scratch/dl; mkdir -p /scratch/dl
                 local src=""
-                if timeout 120 oniond list model 2>/dev/null | sed 's/^[| ]*//; s/[| ]*$//' | grep -qx "$name"; then
+                # Materialise the listing before grepping it. Piping straight
+                # into `grep -q` cannot work under `pipefail`: grep exits at the
+                # FIRST match and closes the pipe, oniond dies of SIGPIPE (141),
+                # and pipefail promotes that to the pipeline's status — so a
+                # match is precisely what makes the test fail, and this branch
+                # was never once taken for any model.
+                timeout 120 oniond list model 2>/dev/null \
+                  | sed 's/^[| ]*//; s/[| ]*$//' > /tmp/oniond-models.txt || true
+                if grep -qx "$name" /tmp/oniond-models.txt; then
                   echo ">>> oniond download $name"
-                  oniond download model "$name" --dir /scratch/dl && src=/scratch/dl/$name
+                  oniond download model "$name" --dir /scratch/dl --turbo && src=/scratch/dl/$name
                 fi
                 if [ -z "$src" ] || [ ! -d "$src" ]; then
                   echo ">>> not in bucket (or download failed) -> HF mirror"
                   python3 -m pip install --no-cache-dir -q "huggingface_hub[cli]" 2>/dev/null
-                  HF_ENDPOINT=https://hf-mirror.com hf download "$repo" \
+                  # HF_HUB_DISABLE_XET is not optional here. hf-mirror proxies
+                  # the metadata but not Xet's CAS host (cas-server.xethub.hf.co),
+                  # so a Xet-backed repo downloads a while and then dies with a
+                  # 401 from a domain the mirror never served. Disabling Xet
+                  # forces the classic LFS path, which the mirror does proxy.
+                  HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 hf download "$repo" \
                     --local-dir /scratch/dl/hf --max-workers 8 || return 1
                   src=/scratch/dl/hf
                 fi
@@ -83,9 +98,21 @@ spec:
                 cd /; rm -rf /scratch/dl"
               }
 
-              fetch_and_push nvidia/MiniMax-M2.5-NVFP4        models/minimax-m25
-              fetch_and_push deepseek-ai/DeepSeek-V4-Flash-0731 models/dsv4-flash
+              # `|| FAILED=...` is what makes a failure visible. The script runs
+              # without `set -e` on purpose (one model must not abort the other),
+              # but that meant a download that returned 1 fell straight through to
+              # the next model with no FAIL line anywhere — the upload loop never
+              # ran, so it printed nothing at all, and an empty destination
+              # directory read as success. A dead model must fail the Job.
+              fetch_and_push nvidia/MiniMax-M2.5-NVFP4        models/minimax-m25 \
+                || FAILED="$FAILED nvidia/MiniMax-M2.5-NVFP4"
+              fetch_and_push deepseek-ai/DeepSeek-V4-Flash-0731 models/dsv4-flash \
+                || FAILED="$FAILED deepseek-ai/DeepSeek-V4-Flash-0731"
               echo; echo "=== models/ ==="; $AF ls models
+              if [ -n "$FAILED" ]; then
+                echo; echo "=== FAILED MODELS:$FAILED"
+                exit 1
+              fi
           env:
             - { name: BUCKET, value: "ai-infra" }
             - { name: PIP_INDEX_URL, value: "https://mirrors.aliyun.com/pypi/simple/" }
