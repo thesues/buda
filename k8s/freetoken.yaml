@@ -1,4 +1,6 @@
-# ⚠️ IMAGE_AUTUMN_RS / IMAGE_FREETOKEN must be filled with the SAME commit SHA
+# ⚠️ IMAGE_FREETOKEN only — the fuse daemon now runs inside that image, which
+# already carries autumn-fuse copied from its AUTUMN_IMAGE, so there is no
+# second image to keep in step.
 # (the WIRE lockstep rule — see this repo's README). Applied directly with
 # `kubectl apply -f`; this repo has no kustomization, and deliberately does not
 # reach into autumn-rs's overlay.
@@ -85,37 +87,30 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: "192.168.3.2"
 
-      # Native sidecar (k8s >= 1.29; this cluster is 1.34). An initContainer with
-      # restartPolicy: Always starts BEFORE the app containers and keeps running,
-      # which is exactly the ordering we need — a plain sidecar container would
-      # race `ft serve` against the mount and lose on a cold start.
-      initContainers:
-        - name: fuse
-          image: IMAGE_AUTUMN_RS
-          restartPolicy: Always
-          args: ["fuse"]
-          env:
-            - { name: AUTUMN_MANAGER,          value: "autumn-manager:9001" }
-            - { name: AUTUMN_FUSE_MOUNTPOINT,  value: "/mnt/autumn" }
-            - { name: AUTUMN_CREDENTIAL_FILE,  value: "/etc/autumn/cred/fs.cred" }
-          securityContext:
-            # Mounting needs /dev/fuse and SYS_ADMIN. privileged is the blunt
-            # form; capabilities.add:[SYS_ADMIN] + a /dev/fuse device plugin is
-            # tighter if the cluster grows a policy that forbids privileged.
-            privileged: true
-          volumeMounts:
-            - name: mnt
-              mountPath: /mnt/autumn
-              # Bidirectional: the mount this container makes must become
-              # visible in the app container's namespace. Without the
-              # propagation pair the app sees an empty directory and the model
-              # path silently does not exist.
-              mountPropagation: Bidirectional
-            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
-          startupProbe:
-            exec: { command: ["sh", "-c", "mountpoint -q /mnt/autumn"] }
-            periodSeconds: 3
-            failureThreshold: 40      # ~2 min: cluster connect + partition probe
+      # ── One container, not a fuse sidecar ────────────────────────────────
+      # This was a native-sidecar + `mountPropagation: Bidirectional` pair. Two
+      # independent reasons it is gone.
+      #
+      # It does not work here: measured on this cluster, a privileged sidecar
+      # got ZERO shared mounts and the FUSE mount came up `PROPAGATION: private`
+      # with the container root as its parent. Nothing propagates, so the app
+      # container saw an empty directory and `--model` silently did not exist.
+      #
+      # And Bidirectional is actively dangerous: it is precisely what lets a
+      # FUSE mount escape into the HOST mount namespace and outlive the pod. A
+      # mount left behind with no server blocks every stat() that crosses it in
+      # uninterruptible sleep, and a container runtime stats mount points on
+      # every sandbox create and teardown — so one leak stops the NODE from
+      # starting any container while everything already running looks fine. Five
+      # nodes went that way in one afternoon and only a reboot cleared them.
+      #
+      # Running the mount in the SAME container needs no propagation at all: one
+      # mount namespace, and the mount dies with the container. The freetoken
+      # image already carries `autumn-fuse`, copied from AUTUMN_IMAGE alongside
+      # the client, so there is nothing extra to ship.
+      #
+      # The cost is that the whole container is privileged now, where before
+      # only the sidecar was.
 
       containers:
         - name: freetoken
@@ -128,6 +123,28 @@ spec:
               # DNS — so the manager has to be resolved before anything dials it.
               M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
               echo "manager = $M"
+
+              # Mount here, in this container. See the comment above the pod
+              # spec for why this is not a sidecar.
+              MP=/mnt/autumn; mkdir -p "$MP"
+              # Never `mountpoint -q` a possibly-stale FUSE path: that stats it,
+              # and a stale mount blocks stat() forever. /proc/mounts is pure VFS
+              # metadata, and the unmount is lazy so it cannot block either.
+              if grep -qs " $MP fuse" /proc/mounts; then
+                echo "stale mount at $MP — lazy unmounting"
+                fusermount3 -uz "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
+              fi
+              autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+                --credential-file /etc/autumn/cred/fs.cred &
+              FUSE_PID=$!
+              trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
+              for i in $(seq 1 120); do
+                grep -qs " $MP fuse" /proc/mounts && break
+                kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
+                sleep 1
+              done
+              grep -qs " $MP fuse" /proc/mounts || { echo "mount timed out after 120s"; exit 1; }
+              echo "mounted after ${i}s; model dir:"; ls "$MP/models/minimax-m25" | head -3
 
               # Calibrate the PCIe/CPU bandwidth split once per GPU. The profile
               # is cached by GPU UUID and does not transfer between machines;
@@ -166,18 +183,16 @@ spec:
               cpu: "32"
               memory: 160Gi
           securityContext:
+            # privileged for the FUSE mount (needs /dev/fuse + SYS_ADMIN); it
+            # subsumes IPC_LOCK, which pinned host memory needs because it counts
+            # against RLIMIT_MEMLOCK and k8s has no ulimit field.
+            privileged: true
             capabilities:
-              # Pinned host memory counts against RLIMIT_MEMLOCK, and k8s has no
-              # ulimit field. IPC_LOCK is how a container is allowed to lock more
-              # than the runtime default.
               add: ["IPC_LOCK"]
           volumeMounts:
-            - name: mnt
-              mountPath: /mnt/autumn
-              readOnly: true
-              # HostToContainer: receive the sidecar's mount, don't propagate
-              # anything back.
-              mountPropagation: HostToContainer
+            # No propagation: the mount is made inside this container, so
+            # there is nothing to receive from anywhere.
+            - { name: mnt, mountPath: /mnt/autumn }
             - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
             - { name: dshm, mountPath: /dev/shm }
             # Triton/JIT kernel cache + the `ft bench bw` profile. On emptyDir it
