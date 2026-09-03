@@ -46,6 +46,7 @@ const S = {
   approvalTimer: null,
   awaitingPerm: false,
   skipUserEcho: false,   // we drew this turn's prompt optimistically
+  stopping: false,
   startedAt: 0,
   timer: null,
 };
@@ -69,7 +70,24 @@ function recall() {
 /* ---------- chrome ---------- */
 function status(text) { $("#run-status").textContent = text; }
 
+const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+let spinFrame = 0;
+
 function tick() {
+  // The spinner is the only thing on screen that says "still working" during a
+  // long tool call, where no token arrives for a minute at a time. A static
+  // status line reads as a hang.
+  $("#spin").textContent = S.busy ? SPIN[spinFrame++ % SPIN.length] : "";
+  // Each running tool times itself from when its row appeared, not from the
+  // turn start -- "this search has been going 40s" is the useful number.
+  document.querySelectorAll("[data-since]").forEach((n) => {
+    const ms = Date.now() - Number(n.dataset.since);
+    const sec = Math.floor(ms / 1000);
+    n.textContent = sec < 60 ? ` ${sec}s` : ` ${Math.floor(sec / 60)}m${String(sec % 60).padStart(2, "0")}s`;
+  });
+}
+
+function tickSlow() {
   if (!S.startedAt) { $("#elapsed").textContent = ""; return; }
   const s = Math.floor((Date.now() - S.startedAt) / 1000);
   $("#elapsed").textContent = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
@@ -170,7 +188,9 @@ function toolRow(id, title, st) {
   if (!row) {
     row = el("div", "msg bot");
     const card = el("div", "bubble tool");
-    card.append(el("span", "tool-title", title || "tool"), el("span", "tool-status", st || ""));
+    const since = el("span", "tool-since");
+    since.dataset.since = String(Date.now());
+    card.append(el("span", "tool-title", title || "tool"), since, el("span", "tool-status", st || ""));
     row.appendChild(card);
     $("#messages").appendChild(row);
     S.tools.set(id, card);
@@ -180,7 +200,10 @@ function toolRow(id, title, st) {
     row.querySelector(".tool-status").textContent = st || "";
   }
   row.dataset.status = st || "";
-  if (st && st !== "completed" && st !== "failed") status(title || "工具执行中");
+  if (st === "completed" || st === "failed") {
+    const n = row.querySelector(".tool-since");
+    if (n) n.removeAttribute("data-since");     // freeze the elapsed time
+  } else if (st) status(title || "工具执行中");
   scroll();
 }
 
@@ -285,18 +308,22 @@ function endTurn(error) {
   S.awaitingPerm = false;
   forget();
   if (error) addMsg("error", `⚠ ${error}`);
-  status(error ? "出错" : "就绪");
+  const wasStopping = S.stopping;
+  S.stopping = false;
+  status(error ? "出错" : wasStopping ? "已停止" : "就绪");
   loadSessions();   // the turn may have created or retitled a session
 }
 
 function setBusy(b) {
   S.busy = b;
+  if (!b) S.stopping = false;
+  $("#send").disabled = false;
   $("#send").textContent = b ? "停止" : "发送";
   $("#send").classList.toggle("stop", b);
   if (b) {
     S.startedAt = Date.now();
-    if (!S.timer) S.timer = setInterval(tick, 1000);
-    tick();
+    if (!S.timer) S.timer = setInterval(() => { tick(); tickSlow(); }, 90);
+    tick(); tickSlow();
     // Polling backstop for approvals: the push rides the same stream a proxy or
     // a sleeping laptop can drop, and a missed prompt stalls the turn with
     // nothing on screen to explain it.
@@ -419,7 +446,23 @@ async function boot() {
 
   $("#new-session").onclick = newSession;
   $("#send").onclick = (e) => {
-    if (S.busy) { e.preventDefault(); fetch("/api/chat/cancel", { method: "POST" }).catch(() => {}); }
+    if (!S.busy) return;                    // not busy: let the form submit
+    e.preventDefault();
+    if (S.stopping) return;                 // already asked; a second click adds nothing
+    // Cancel is a REQUEST, not an instant stop: the agent finishes the chunk it
+    // is on first, measured at ~12 s here. Without saying so the button reads as
+    // broken, which is exactly how it was reported.
+    S.stopping = true;
+    $("#send").textContent = "停止中…";
+    $("#send").disabled = true;
+    status("正在停止,等 agent 收尾…");
+    fetch("/api/chat/cancel", { method: "POST" }).catch(() => {
+      // The request itself failed — re-arm so the button is usable again.
+      S.stopping = false;
+      $("#send").textContent = "停止";
+      $("#send").disabled = false;
+      status("停止请求发送失败");
+    });
   };
 
   const input = $("#input");

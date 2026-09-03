@@ -64,6 +64,8 @@ header h1 em { color:var(--accent); font-style:italic; }
              font-size:0.62rem; text-transform:uppercase; letter-spacing:0.15em;
              color:var(--text-dim); display:flex; align-items:center; gap:0.5rem; flex:none; }
 .card-head .dot { width:5px; height:5px; border-radius:50%; background:var(--accent); opacity:0.7; flex:none; }
+#spin { color:var(--accent); font-size:0.75rem; width:0.8rem; display:inline-block; }
+.tool-since { color:var(--text-muted); font-size:0.68rem; }
 .card-head .count { margin-left:auto; color:var(--text-muted); letter-spacing:0.08em; }
 
 /* thin scrollbars, everywhere */
@@ -163,3 +165,5 @@ header h1 em { color:var(--accent); font-style:italic; }
 #input::placeholder { color:var(--text-muted); }
 #input:focus { border-color:var(--border-active); }
 #send { flex:none; align-self:stretch; }
+
+#send:disabled { opacity:.6; cursor:default; }
