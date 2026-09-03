@@ -149,6 +149,31 @@ spec:
           args:
             - |
               set -euo pipefail
+
+              # Pin CUDA to the GPU the device plugin actually allocated.
+              #
+              # This container is privileged (it mounts FUSE), and a privileged
+              # container bypasses the device cgroup: every /dev/nvidia* on the
+              # node appears inside it, all eight of them, no matter that the
+              # plugin allocated one. With CUDA_VISIBLE_DEVICES unset, CUDA then
+              # picks index 0 — which is NOT the allocated device.
+              #
+              # Measured on this cluster before the fix: the plugin had assigned
+              # GPU 7, the process was resident on GPU 0. So GPU 7 was reserved
+              # and idle while GPU 0 was in use and advertised as free — the next
+              # GPU pod scheduled onto this node would have landed on top of a
+              # 23 GiB resident model.
+              #
+              # NVIDIA_VISIBLE_DEVICES is injected per-allocation, so this
+              # follows the scheduler wherever the pod lands. Only pin when the
+              # plugin named a specific device: it is "all" or "void" on a node
+              # without the plugin, and exporting either would be wrong.
+              case "${NVIDIA_VISIBLE_DEVICES:-}" in
+                ""|all|void|none) echo "GPU: no specific allocation, leaving CUDA to choose" ;;
+                *) export CUDA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES"
+                   echo "GPU: pinned to allocated device(s) $CUDA_VISIBLE_DEVICES" ;;
+              esac
+
               # autumn's Rust client parses a SocketAddr — IP literals only, no
               # DNS — so the manager has to be resolved before anything dials it.
               M="$(getent hosts autumn-manager | awk '{print $1}'):9001"

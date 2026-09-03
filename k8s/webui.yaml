@@ -18,10 +18,8 @@ metadata:
 spec:
   accessModes: [ReadWriteOnce]
   # Named explicitly: this cluster has NO default StorageClass, so an unset
-  # class leaves the claim Pending and the pod unschedulable.
-  storageClassName: ebs-ssd
-  # ebs-ssd, not local-path: sessions must survive the pod moving to another
-  # node. No default StorageClass exists here, so this must be named.
+  # class leaves the claim Pending and the pod unschedulable. ebs-ssd rather
+  # than a node-local class because sessions must survive the pod moving.
   storageClassName: ebs-ssd
   # Sessions ARE the feature. On an emptyDir every restart would present an
   # empty sidebar, which reads as data loss whether or not anyone calls it that.
@@ -156,3 +154,37 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim: { claimName: hermes-webui-data }
+---
+# Published through the cluster's existing Volcengine APIG instance, the same
+# one `dataverse`, `rlinf` and the lerobot console go through. The two
+# annotations are what bind an Ingress to that instance; `ingressClassName`
+# alone is not enough, and without them the rule is accepted and never served.
+#
+# There is no TLS here and the app's only gate is single-user HTTP Basic
+# (`hermes-webui-auth`), so this is a plaintext-credential path over the public
+# VIP. Set that secret before publishing, or leave AUTH_USER empty and treat the
+# host as public.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hermes-webui-apig
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: webui }
+  annotations:
+    ingress.vke.volcengine.com/apig-instance-name: gda7u922gbfvc539oufjg-apig-instance
+    ingress.vke.volcengine.com/loadbalancer-id: gda7u922gbfvc539oufjg
+spec:
+  ingressClassName: physicalai-apig
+  rules:
+    - host: buda.apig.local
+      http:
+        paths:
+          # One backend, one prefix. The SSE stream is a plain GET on this same
+          # port; nothing here may buffer it, which is why the app sends
+          # `X-Accel-Buffering: no` on that response.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hermes-webui
+                port: { number: 8080 }
