@@ -339,3 +339,22 @@ def test_no_mcp_url_declares_no_servers():
         assert srv._acp_mcp_servers() == []
     finally:
         srv.MEMORY_MCP_URL = old
+
+
+@pytest.mark.asyncio
+async def test_a_stream_lost_with_the_process_is_reported_as_unknown(aiohttp_client, app):
+    """A restart drops every live stream AND the turn behind it.
+
+    The browser's EventSource retries forever regardless, so a UI that says
+    "reconnecting" on any error keeps saying it long after there is nothing to
+    reconnect to. `status` must answer honestly for an id it has never seen, so
+    the client can tell "still coming" from "gone with the process".
+    """
+    client = await aiohttp_client(app)
+    st = await (await client.get("/api/chat/status?stream_id=from-a-dead-process")).json()
+    assert st == {"known": False}
+
+    # And a stream request for it must 404 rather than hanging or 200-ing empty:
+    # an empty 200 is indistinguishable from a turn that has said nothing yet.
+    resp = await client.get("/api/chat/stream?stream_id=from-a-dead-process&after_seq=0")
+    assert resp.status == 404

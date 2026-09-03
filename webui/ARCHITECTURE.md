@@ -64,7 +64,7 @@ forgotten. Severity is impact-if-hit, not likelihood.
 | ID | Sev | Description | Status |
 |---|---|---|---|
 | W1 | med | One turn at a time, process-wide. A second `POST /chat/start` attaches to the running turn rather than queueing. Two people using one deployment will interleave. | Open — by design for a single-user UI; revisit if it becomes multi-user |
-| W2 | med | Turn state is in-process. A pod restart mid-turn loses the turn; the session DB keeps the history up to the last committed message, but the in-flight answer is gone. | Open — surviving this needs the turn journalled, not just buffered |
+| W2 | med | Turn state is in-process. A pod restart mid-turn loses the turn; the session DB keeps the history up to the last committed message, but the in-flight answer is gone. The UI now RECOVERS from it — an EventSource error asks `/api/chat/status` before claiming a reconnect, and an unknown id is reported as lost rather than reconnected-to forever. | Open — surviving the restart itself needs the turn journalled, not just buffered |
 | W3 | low | `TurnStream` backlog caps at `BACKLOG_EVENTS`; a longer turn drops its oldest events. Reported as `gap`, never silently. | Accepted |
 | W4 | med | `hermes config set model.*` runs in the pod's start script and is best-effort. If hermes renames those keys, the UI starts and chat fails at the first turn with the model unset. | Open — the failure is loud at first use, not at deploy |
 | W5 | low | The MCP block is merged into `config.yaml` by a hand-rolled indentation-aware editor (no pyyaml at runtime). A hand-edited config with unusual indentation could be mis-parsed. | Open — write-then-rename means a bad write cannot leave a half file |

@@ -291,10 +291,32 @@ function attach(streamId, afterSeq) {
     try { ev = JSON.parse(m.data); } catch (_) { return; }
     apply(ev);
   };
-  es.onerror = () => {
-    // EventSource retries on its own. Say so — and do NOT clear the turn: it is
-    // still running on the server.
-    if (S.busy) status("连接中断,重连中…");
+  es.onerror = async () => {
+    if (!S.busy) return;
+    // EventSource retries forever on its own, so "reconnecting" can outlive the
+    // thing it claims to be reconnecting to: a server restart drops every live
+    // stream AND the in-process turn behind it, and the banner then sits there
+    // permanently while nothing is coming. Ask before claiming.
+    status("连接中断,重连中…");
+    try {
+      const st = await (await fetch(
+        `/api/chat/status?stream_id=${encodeURIComponent(streamId)}`
+      )).json();
+      if (!st.known) {
+        // The turn is gone with the process that held it. Say so plainly rather
+        // than pretending a reconnect is in progress.
+        detach();
+        finalizeSeg();
+        setBusy(false);
+        forget();
+        addMsg("note", "服务重启，这一轮的回复已丢失");
+        status("就绪");
+      } else if (!st.running) {
+        // It finished while we were disconnected; the reconnect will collect
+        // the tail, so leave the stream alone and stop alarming the reader.
+        status("接回中…");
+      }
+    } catch (_) { /* the server is genuinely unreachable — keep retrying */ }
   };
 }
 
