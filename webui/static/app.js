@@ -45,6 +45,7 @@ const S = {
   tools: new Map(),
   approvalTimer: null,
   awaitingPerm: false,
+  skipUserEcho: false,   // we drew this turn's prompt optimistically
   startedAt: 0,
   timer: null,
 };
@@ -230,7 +231,14 @@ async function pollApprovals() {
 /* ---------- the stream ---------- */
 function apply(ev) {
   switch (ev.kind) {
-    case "user": finalizeSeg(); addMsg("user", ev.text); break;
+    case "user":
+      // We already drew this optimistically in send(), so the stream's echo of
+      // the SAME message would render it twice. A reattach after reload draws
+      // nothing first, so there the echo is exactly what paints it.
+      finalizeSeg();
+      if (S.skipUserEcho) S.skipUserEcho = false;
+      else addMsg("user", ev.text);
+      break;
     case "history_user": finalizeSeg(); addMsg("user", ev.text); break;
     case "delta": ev.thought ? appendThought(ev.text) : appendToken(ev.text); break;
     case "tool": toolRow(ev.id, ev.title, ev.status); break;
@@ -370,6 +378,7 @@ async function send() {
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
   S.seg = null;
+  S.skipUserEcho = true;
   let j;
   try {
     j = await (await fetch("/api/chat/start", {
@@ -379,6 +388,9 @@ async function send() {
   } catch (_) { status("发送失败"); return; }
   if (j.error) { status(j.error); return; }
   if (!j.streamId) { status("没有可用的会话流"); return; }
+  // `attached` means a turn was ALREADY running and we joined it -- its prompt
+  // is not the one we just drew, so let the echo paint it.
+  if (j.attached) S.skipUserEcho = false;
   remember(j.streamId, 0);
   attach(j.streamId, 0);
 }
@@ -398,6 +410,7 @@ async function boot() {
     try {
       const st = await (await fetch(`/api/chat/status?stream_id=${encodeURIComponent(id)}`)).json();
       if (st.known) {
+        S.skipUserEcho = false;   // nothing drawn yet — the echo must paint it
         if (st.running) status("接回上一次未完成的回复…");
         attach(id, seq);   // finished-but-unseen still needs its tail collected
       } else forget();

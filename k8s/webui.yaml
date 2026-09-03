@@ -103,7 +103,11 @@ spec:
             # ignored and the session keeps the full hermes-acp toolset.
             # `mcp-<server>` toolsets are appended after this list, so narrowing
             # it cannot drop retrieval.
-            - { name: HERMES_ACP_TOOLSETS, value: "terminal,file,todo,memory,skills,vision" }
+            - { name: HERMES_ACP_TOOLSETS, value: "file,todo,memory,skills,vision" }
+            # `terminal` is deliberately absent. With a shell in hand the model
+            # takes the shortcut -- observed locally reading the corpus with
+            # `sed` instead of calling the retrieval server, which also means a
+            # local test stops predicting how the pod will behave.
             - { name: WORKDIR, value: /opt/data }
             # The decoupled dependency: an HTTP URL, not a spawned process.
             - { name: MEMORY_MCP_URL, value: "http://memory-mcp:5100/mcp" }
