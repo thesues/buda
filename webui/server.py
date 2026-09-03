@@ -84,6 +84,15 @@ TURN_RETENTION_SEC = 900
 # An unanswered permission request expires rather than pinning the turn forever.
 APPROVAL_TIMEOUT_SEC = 600
 
+# How long a graceful `session/cancel` gets before the process is restarted.
+# `session/cancel` CANNOT interrupt a running tool -- the agent notices only
+# when the tool returns -- so without an escalation Stop silently does nothing
+# for the whole length of a slow search. But the wait must be REALISTIC: at 1.5s
+# nearly every Stop escalated, and a restart throws away what the turn had
+# already produced. Stop means "end this, keep what it made", so it is worth
+# waiting out the wind-down. Restart is the last resort, not the normal path.
+CANCEL_GRACE_SEC = float(os.environ.get("CANCEL_GRACE_SEC", "12"))
+
 # SSE idle comment interval. Proxies and load balancers cut a silent connection;
 # a comment line is the cheapest thing that keeps it open and costs the client
 # nothing (EventSource ignores comments).
@@ -151,6 +160,9 @@ class TurnStream:
         # a silent hole in it.
         self.dropped = 0
         self.running = True
+        # Set before a deliberate restart, so the death it causes is not reported
+        # as a failure: the reader pressed Stop and must be told it stopped.
+        self.stopped = False
         self.finished_at: float | None = None
         self.error: str | None = None
         # One shared Event, replaced on each emit: cheaper than per-subscriber
@@ -454,6 +466,29 @@ class HermesACP:
             await self._write({"jsonrpc": "2.0", "method": "session/cancel",
                                "params": {"sessionId": self.session_id}})
 
+    async def restart(self) -> None:
+        """Kill the process and bring a fresh one up. The hard half of stop."""
+        async with self._start_lock:
+            if self.alive:
+                old = self.proc
+                with contextlib.suppress(ProcessLookupError):
+                    old.terminate()
+                # WAIT for the old process to actually die before spawning:
+                # terminate() alone races, and the dying process's read-loop
+                # cleanup then fails the NEW process's in-flight `initialize`
+                # with "acp exited". Escalate to SIGKILL -- a stuck tool can
+                # ignore SIGTERM, which is the case this path exists for.
+                try:
+                    await asyncio.wait_for(old.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        old.kill()
+                    await old.wait()
+            self.proc = None
+            self.session_id = None
+            self._directive_sent.clear()
+            await self._spawn()
+
 
 
 def _acp_mcp_servers() -> list[dict]:
@@ -567,8 +602,16 @@ async def handle_chat_start(request: web.Request) -> web.Response:
                 stream.emit("note", text=f"stopped: {reason}")
             stream.finish()
         except Exception as e:  # noqa: BLE001
-            log.warning("turn failed: %s", e)
-            stream.finish(error=str(e))
+            if stream.stopped:
+                # The restart that Stop escalated to kills the in-flight request,
+                # which surfaces as "hermes acp exited". That is the stop
+                # working, not the turn failing, and showing it as an error
+                # tells the reader their own action broke something.
+                log.info("turn ended by stop")
+                stream.finish()
+            else:
+                log.warning("turn failed: %s", e)
+                stream.finish(error=str(e))
 
     st.turn_task = asyncio.create_task(run())
     return web.json_response({"streamId": stream.stream_id, "attached": False})
@@ -634,8 +677,57 @@ async def handle_chat_status(request: web.Request) -> web.Response:
 
 
 async def handle_chat_cancel(request: web.Request) -> web.Response:
-    await state(request).acp.cancel()
-    return web.json_response({"ok": True})
+    """End the in-flight turn for real: graceful first, restart if it will not yield.
+
+    `session/cancel` alone is not enough. It reaches the agent's loop, which
+    notices only between steps -- so while a tool is running (a corpus search, a
+    command) the turn keeps going and the button appears to do nothing for as
+    long as the tool takes. The escalation is what makes Stop mean stop.
+
+    The restart costs this turn's un-flushed output, which is why the graceful
+    path gets a real grace period rather than a token one.
+    """
+    st = state(request)
+    task = st.turn_task
+    if not (task and not task.done()):
+        return web.json_response({"ok": True, "already": "idle"})
+
+    sid = st.acp.session_id
+    await st.acp.cancel()
+    try:
+        # `shield` so OUR timeout does not cancel the turn task itself -- the
+        # point is to observe whether it winds down, not to tear it down here.
+        await asyncio.wait_for(asyncio.shield(task), timeout=CANCEL_GRACE_SEC)
+        return web.json_response({"ok": True, "how": "graceful"})
+    except asyncio.TimeoutError:
+        pass
+    except Exception:  # noqa: BLE001
+        # The turn ended by failing; that is still ended.
+        return web.json_response({"ok": True, "how": "graceful"})
+
+    log.warning("session/cancel not honoured in %.1fs — restarting hermes acp",
+                CANCEL_GRACE_SEC)
+    if st.current and st.current.running:
+        st.current.stopped = True
+        st.current.emit("note", text="取消未被响应，已重启 agent")
+    await st.acp.restart()
+    if not task.done():
+        task.cancel()
+    # Re-select the session the user was in, silently: a restart clears
+    # `session_id`, and without this the next prompt would start a NEW session
+    # and the sidebar would grow a ghost.
+    if sid:
+        async def _sink(_u: dict) -> None:
+            return None
+        try:
+            await st.acp.load_session(sid, _sink)
+        except Exception:  # noqa: BLE001
+            log.debug("re-select after restart failed", exc_info=True)
+    # run() was cancelled before it could finish the stream, so close it here or
+    # the client waits forever for an `end` that is never coming.
+    if st.current and st.current.running:
+        st.current.finish(error=None)
+    return web.json_response({"ok": True, "how": "restart"})
 
 
 # --------------------------------------------------------------------------- #

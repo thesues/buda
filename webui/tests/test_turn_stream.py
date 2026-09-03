@@ -358,3 +358,105 @@ async def test_a_stream_lost_with_the_process_is_reported_as_unknown(aiohttp_cli
     # an empty 200 is indistinguishable from a turn that has said nothing yet.
     resp = await client.get("/api/chat/stream?stream_id=from-a-dead-process&after_seq=0")
     assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_that_is_ignored_escalates_to_a_restart(aiohttp_client, app):
+    """`session/cancel` cannot interrupt a running tool, so Stop must escalate.
+
+    The agent notices a cancel only between steps. While a tool runs the turn
+    keeps going, and a Stop that only sends the notification does nothing
+    visible for as long as the tool takes -- which is how a working button gets
+    reported as broken. This fakes an ACP that ignores cancel entirely and
+    asserts the endpoint restarts it and closes the stream, because a turn
+    cancelled mid-flight can no longer send its own `end`.
+    """
+    srv.CANCEL_GRACE_SEC = 0.2          # the real 12 s is a human timescale, not a test one
+    client = await aiohttp_client(app)
+    acp = app["state"].acp
+    acp.restarted = False
+
+    async def never_yields(text, on_update, on_permission):
+        await asyncio.sleep(30)         # a tool that will not be interrupted
+        return {"stopReason": "end_turn"}
+
+    async def fake_restart():
+        acp.restarted = True
+
+    async def fake_load(sid, on_update):
+        return None
+
+    acp.prompt = never_yields
+    acp.restart = fake_restart
+    acp.load_session = fake_load
+
+    sid = (await (await client.post("/api/chat/start", json={"text": "go"})).json())["streamId"]
+    body = await (await client.post("/api/chat/cancel")).json()
+
+    assert body["how"] == "restart", "an ignored cancel must not report success and stop there"
+    assert acp.restarted, "the process must actually be restarted"
+
+    stream = app["state"].streams[sid]
+    assert not stream.running, "the stream must be closed, or the client waits for an `end` forever"
+    assert [e for _s, e in stream.events if e["kind"] == "end"], "an `end` event must be emitted"
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_that_is_honoured_does_not_restart(aiohttp_client, app):
+    """The graceful path is the normal one -- a restart throws away this turn's output."""
+    srv.CANCEL_GRACE_SEC = 5
+    client = await aiohttp_client(app)
+    acp = app["state"].acp
+    acp.restarted = False
+
+    async def fake_restart():
+        acp.restarted = True
+    acp.restart = fake_restart
+
+    await client.post("/api/chat/start", json={"text": "go"})
+    # Release SHORTLY AFTER the cancel goes out, not before: releasing first
+    # finishes the turn and the endpoint correctly answers "already idle",
+    # which tests nothing about the graceful path.
+    async def wind_down():
+        await asyncio.sleep(0.05)
+        acp.release.set()
+    asyncio.get_event_loop().create_task(wind_down())
+    body = await (await client.post("/api/chat/cancel")).json()
+
+    assert body["how"] == "graceful"
+    assert not acp.restarted, "a cancel that was honoured must not cost the process"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_when_idle_is_not_an_error(aiohttp_client, app):
+    client = await aiohttp_client(app)
+    body = await (await client.post("/api/chat/cancel")).json()
+    assert body["ok"] and body.get("already") == "idle"
+
+
+@pytest.mark.asyncio
+async def test_a_stop_is_not_reported_as_an_error(aiohttp_client, app):
+    """The restart Stop escalates to kills the in-flight request, which raises
+    "hermes acp exited". Reporting that as the turn's error tells the reader
+    their own Stop broke something."""
+    srv.CANCEL_GRACE_SEC = 0.2
+    client = await aiohttp_client(app)
+    acp = app["state"].acp
+
+    async def dies_on_restart(text, on_update, on_permission):
+        await asyncio.sleep(30)
+        raise RuntimeError("hermes acp exited")
+
+    async def fake_restart():
+        # What a real restart does to the in-flight request.
+        app["state"].turn_task.cancel()
+    acp.prompt = dies_on_restart
+    acp.restart = fake_restart
+    acp.load_session = lambda sid, cb: asyncio.sleep(0)
+
+    sid = (await (await client.post("/api/chat/start", json={"text": "go"})).json())["streamId"]
+    await client.post("/api/chat/cancel")
+
+    stream = app["state"].streams[sid]
+    assert not stream.running
+    assert stream.error is None, f"a deliberate stop must not surface as an error: {stream.error}"
