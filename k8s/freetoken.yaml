@@ -181,6 +181,7 @@ spec:
               # pulled a 5 GB shard through it at 164 MiB/s.
               /opt/fusebin/autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
                 --direct-read false \
+                --read-io-threads 8 \
                 --credential-file /etc/autumn/cred/fs.cred &
               FUSE_PID=$!
               trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
