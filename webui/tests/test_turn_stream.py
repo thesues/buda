@@ -460,3 +460,42 @@ async def test_a_stop_is_not_reported_as_an_error(aiohttp_client, app):
     stream = app["state"].streams[sid]
     assert not stream.running
     assert stream.error is None, f"a deliberate stop must not surface as an error: {stream.error}"
+
+
+@pytest.mark.asyncio
+async def test_the_page_title_comes_from_the_file_and_env_overrides_it(aiohttp_client, app):
+    """One deployment should be able to say what it is without a rebuild, and a
+    title with markup in it must not become markup."""
+    client = await aiohttp_client(app)
+
+    srv.PAGE_TITLE = ""
+    html = await (await client.get("/")).text()
+    assert "<title>buda · 佛典检索</title>" in html, "unset env serves the file unchanged"
+
+    srv.PAGE_TITLE = "藏经阁 <script>"
+    try:
+        html = await (await client.get("/")).text()
+        assert "<title>藏经阁 &lt;script&gt;</title>" in html, "the title must be escaped"
+        assert "<script>" not in html.split("</title>")[0], "no raw markup from the env"
+    finally:
+        srv.PAGE_TITLE = ""
+
+
+def test_the_client_renders_a_loaded_transcript_in_full():
+    """The browser-side render ordering, checked in node.
+
+    A loaded session delivers every token in one synchronous pass, so the only
+    render is the deferred rAF -- and finalizeSeg() used to clear the segment
+    that render needs. The answer vanished. Live turns lost their closing
+    sentences the same way, which is subtler and was never noticed.
+
+    Skipped rather than failed without node: this pins client behaviour, and a
+    missing runtime is not a broken client.
+    """
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    script = Path(__file__).parent / "js" / "render_finalize.mjs"
+    r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-400:]

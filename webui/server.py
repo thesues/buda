@@ -41,8 +41,10 @@ import json
 import logging
 import os
 import secrets
+import re
 import shutil
 import time
+from html import escape as html_escape
 from collections import deque
 from pathlib import Path
 
@@ -52,6 +54,11 @@ log = logging.getLogger("webui")
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
+
+# The browser tab's name. The page ships with "buda · 佛典检索"; this rewrites it
+# at startup so one deployment can say what IT is without a rebuild -- the same
+# reason CHAT_DIRECTIVE is an env var. Empty keeps whatever the file has.
+PAGE_TITLE = os.environ.get("PAGE_TITLE", "")
 
 PORT = int(os.environ.get("PORT", "8080"))
 WORKDIR = os.environ.get("WORKDIR") or os.path.expanduser("~")
@@ -885,7 +892,14 @@ async def handle_health(_request: web.Request) -> web.Response:
 
 
 async def handle_index(_request: web.Request) -> web.StreamResponse:
-    return web.FileResponse(STATIC / "index.html")
+    if not PAGE_TITLE:
+        return web.FileResponse(STATIC / "index.html")
+    # Substituted per request rather than at boot: the file is the source of
+    # truth, and a served copy that drifts from it is the kind of thing nobody
+    # thinks to check.
+    html = (STATIC / "index.html").read_text()
+    html = re.sub(r"<title>.*?</title>", f"<title>{html_escape(PAGE_TITLE)}</title>", html, count=1)
+    return web.Response(text=html, content_type="text/html")
 
 
 # --------------------------------------------------------------------------- #

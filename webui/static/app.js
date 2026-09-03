@@ -149,6 +149,13 @@ function clearPending() {
 function finalizeSeg() {
   if (!S.seg) return;
   const seg = S.seg;
+  // Flush any render the rAF has not run yet, BEFORE dropping the reference it
+  // needs. scheduleRender bails on `!S.seg`, so clearing first meant the last
+  // batch of tokens was never painted: a live turn lost its closing sentences,
+  // and a loaded session -- where every token arrives in one synchronous
+  // forEach and the only render is the deferred one -- showed an empty bubble
+  // where the whole answer should be.
+  if (seg.kind === "out") seg.body.innerHTML = renderMD(seg.text);
   S.seg = null;
   if (!seg.text.trim()) { seg.body.closest(".msg").remove(); return; }
   if (seg.kind === "think") {
