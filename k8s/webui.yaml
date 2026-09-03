@@ -17,6 +17,12 @@ metadata:
   namespace: autumn
 spec:
   accessModes: [ReadWriteOnce]
+  # Named explicitly: this cluster has NO default StorageClass, so an unset
+  # class leaves the claim Pending and the pod unschedulable.
+  storageClassName: ebs-ssd
+  # ebs-ssd, not local-path: sessions must survive the pod moving to another
+  # node. No default StorageClass exists here, so this must be named.
+  storageClassName: ebs-ssd
   # Sessions ARE the feature. On an emptyDir every restart would present an
   # empty sidebar, which reads as data loss whether or not anyone calls it that.
   resources: { requests: { storage: 5Gi } }
@@ -93,6 +99,11 @@ spec:
             # browser tools themselves: the ACP path hardcodes its toolset (W9).
             - { name: HERMES_NO_DEP_INSTALL, value: "1" }
             - { name: HERMES_DISABLE_LAZY_INSTALLS, value: "1" }
+            # Needs the image's patch_acp_toolsets.py; without it this is
+            # ignored and the session keeps the full hermes-acp toolset.
+            # `mcp-<server>` toolsets are appended after this list, so narrowing
+            # it cannot drop retrieval.
+            - { name: HERMES_ACP_TOOLSETS, value: "terminal,file,todo,memory,skills,vision" }
             - { name: WORKDIR, value: /opt/data }
             # The decoupled dependency: an HTTP URL, not a spawned process.
             - { name: MEMORY_MCP_URL, value: "http://memory-mcp:5100/mcp" }

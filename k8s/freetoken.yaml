@@ -52,20 +52,6 @@
 # hold the dense weights, one layer's expert slots, and the KV pages.
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: freetoken-kernel-cache
-  namespace: autumn
-spec:
-  accessModes: [ReadWriteOnce]
-  # flashinfer/triton JIT their kernels for the exact arch on first use. On an
-  # emptyDir that work is redone on EVERY pod recreation -- observed as ~10+
-  # minutes of `cicc` compiling sampling.cu for compute_89 while the server
-  # answered "model is still loading", which reads exactly like a slow weight
-  # load and is not one.
-  resources: { requests: { storage: 10Gi } }
----
-apiVersion: v1
 kind: Service
 metadata:
   name: freetoken
@@ -81,17 +67,18 @@ spec:
     - { name: http, port: 1919, targetPort: 1919 }
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: freetoken
   namespace: autumn
   labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
 spec:
   replicas: 1
-  # Recreate, NOT RollingUpdate: one replica pinned to one GPU. A surge-first
-  # rollout would wait for a new pod that cannot schedule until the old one
-  # releases the card, and the old one waits for the new one to be ready.
-  strategy: { type: Recreate }
+  # A StatefulSet, for the volumeClaimTemplate below -- and its default rollout
+  # is what a single-GPU workload needs anyway: it terminates the old pod before
+  # creating its replacement, where a Deployment would have to be told
+  # `Recreate` to stop a surge-first rollout deadlocking on the card.
+  serviceName: freetoken
   selector:
     matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
   template:
@@ -303,5 +290,14 @@ spec:
           secret: { secretName: autumn-credential }
         # Torch's multiprocessing needs more than the 64 MiB default /dev/shm.
         - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
-        - name: ftcache
-          persistentVolumeClaim: { claimName: freetoken-kernel-cache }
+
+  volumeClaimTemplates:
+    - metadata:
+        name: ftcache
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Named explicitly: this cluster has NO default StorageClass, and an
+        # unset class leaves the claim Pending with the pod unschedulable --
+        # which is exactly how this workload went down once already.
+        storageClassName: ebs-ssd
+        resources: { requests: { storage: 10Gi } }

@@ -49,6 +49,12 @@ RUN set -eux; \
     ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes; \
     hermes acp --check
 
+# Let HERMES_ACP_TOOLSETS choose a session's toolsets. Runs in the HERMES venv,
+# where acp_adapter lives. Idempotent, and a no-op if hermes moved the call --
+# a failed patch must not fail the build, the image just keeps the tools it had.
+COPY webui/scripts/patch_acp_toolsets.py /tmp/patch_acp_toolsets.py
+RUN /opt/hermes/.venv/bin/python /tmp/patch_acp_toolsets.py && rm /tmp/patch_acp_toolsets.py
+
 # --- the app ---------------------------------------------------------------- #
 RUN python -m pip install --no-cache-dir "aiohttp>=3.9"
 
