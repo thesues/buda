@@ -216,3 +216,44 @@ def test_the_backlog_cap_reports_a_gap_instead_of_lying():
     assert s.gap_before(0) is True                 # asking from the start: gap
     assert s.gap_before(s.seq - 1) is False        # asking from the tail: no gap
     assert len(s.after(s.seq - 5)) == 5
+
+
+@pytest.mark.asyncio
+async def test_an_acp_error_reply_raises_out_of_request():
+    """The real choke point: `_request` must RAISE on a JSON-RPC error reply.
+
+    Found live: hermes rejected `session/new`; the read loop hands an error back
+    as an ordinary result carrying `_error` (it cannot raise into a future's
+    awaiter), `_request` RETURNED it, `session_id` silently became None, the
+    next prompt sent `sessionId: null`, and the turn ended with no content and
+    `error: None` -- indistinguishable on screen from the agent choosing to say
+    nothing.
+
+    This drives the production `HermesACP._request` with the write stubbed, so
+    it fails if the check is removed. An earlier version of this test injected a
+    prompt that raised directly, which never reached `_request` and passed with
+    the fix disabled -- it proved nothing.
+    """
+    acp = srv.HermesACP()
+    written: list[dict] = []
+
+    async def fake_write(obj):
+        written.append(obj)
+        # Answer the way the read loop does for a JSON-RPC error.
+        acp._pending[obj["id"]].set_result({"_error": {"code": -32602, "message": "Invalid params"}})
+
+    acp._write = fake_write
+    with pytest.raises(RuntimeError, match="Invalid params"):
+        await acp._request("session/new", {"cwd": "/tmp", "mcpServers": []})
+    assert written and written[0]["method"] == "session/new"
+
+
+@pytest.mark.asyncio
+async def test_an_acp_ok_reply_is_returned_unchanged():
+    acp = srv.HermesACP()
+
+    async def fake_write(obj):
+        acp._pending[obj["id"]].set_result({"sessionId": "s-1"})
+
+    acp._write = fake_write
+    assert await acp._request("session/new", {}) == {"sessionId": "s-1"}

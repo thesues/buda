@@ -67,6 +67,7 @@ HERMES_SESSION_API = str(HERE / "hermes_session_api.py")
 MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://memory-mcp:5100/mcp")
 MEMORY_MCP_NAME = os.environ.get("MEMORY_MCP_NAME", "memory")
 
+
 AUTH_USER = os.environ.get("AUTH_USER", "")
 AUTH_PASS = os.environ.get("AUTH_PASS", "")
 
@@ -87,6 +88,14 @@ APPROVAL_TIMEOUT_SEC = 600
 # a comment line is the cheapest thing that keeps it open and costs the client
 # nothing (EventSource ignores comments).
 SSE_HEARTBEAT_SEC = 25
+
+# asyncio's StreamReader caps a line at 64 KiB by default, and ACP frames one
+# JSON-RPC message per line. A chat reply never comes close; an MCP tool RESULT
+# does -- a corpus search returning document text blew straight past it, and
+# `readline()` raises rather than truncating, which killed the read loop and
+# left the turn dead with no output and no error. Sized for a tool result, not
+# for a sentence.
+ACP_LINE_LIMIT = 32 * 1024 * 1024
 
 CHAT_DIRECTIVE = os.environ.get(
     "CHAT_DIRECTIVE",
@@ -269,7 +278,7 @@ class HermesACP:
             self.proc = await asyncio.create_subprocess_exec(
                 HERMES_BIN, "acp", "--accept-hooks",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=stderr_f, cwd=WORKDIR, env=env,
+                stderr=stderr_f, cwd=WORKDIR, env=env, limit=ACP_LINE_LIMIT,
             )
         finally:
             stderr_f.close()  # the child holds its own fd copy
@@ -283,7 +292,9 @@ class HermesACP:
         log.info("hermes acp ready")
 
     async def _new_locked(self) -> str:
-        res = await self._request("session/new", {"cwd": WORKDIR, "mcpServers": []})
+        res = await self._request(
+            "session/new", {"cwd": WORKDIR, "mcpServers": _acp_mcp_servers()}
+        )
         self.session_id = res.get("sessionId")
         log.info("hermes acp session=%s", self.session_id)
         return self.session_id
@@ -314,8 +325,10 @@ class HermesACP:
         await self.ensure_proc()
         self.on_update = on_update
         try:
-            await self._request("session/load",
-                                {"sessionId": sid, "cwd": WORKDIR, "mcpServers": []})
+            await self._request(
+                "session/load",
+                {"sessionId": sid, "cwd": WORKDIR, "mcpServers": _acp_mcp_servers()},
+            )
         finally:
             self.on_update = None
         self.session_id = sid
@@ -347,11 +360,33 @@ class HermesACP:
         fut = asyncio.get_event_loop().create_future()
         self._pending[rid] = fut
         await self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        return await fut
+        res = await fut
+        # A JSON-RPC error comes back as a RESULT carrying `_error` (the read
+        # loop cannot raise into a future's awaiter without this shape). Raise
+        # it here, at the one choke point every request goes through: returning
+        # it made a failed `session/new` look like success, so `session_id`
+        # became None and the next prompt sent `sessionId: null` -- the turn
+        # then ended with no content AND no error, which is the worst of both.
+        if isinstance(res, dict) and "_error" in res:
+            err = res["_error"] or {}
+            raise RuntimeError(
+                f"hermes acp {method} failed: "
+                f"{err.get('message') or err} (code {err.get('code', '?')})"
+            )
+        return res
 
     async def _read_loop(self, proc, pending: dict) -> None:
         while True:
-            line = await proc.stdout.readline()
+            try:
+                line = await proc.stdout.readline()
+            except (ValueError, asyncio.LimitOverrunError) as e:
+                # One oversized frame must not take the whole connection down.
+                # The message is lost either way -- readline() cannot resume mid
+                # line -- but the session survives to serve the next turn, and
+                # the reason reaches the log instead of vanishing.
+                log.error("acp line exceeded %d bytes, dropping the frame: %s",
+                          ACP_LINE_LIMIT, e)
+                continue
             if not line:
                 break
             try:
@@ -418,6 +453,28 @@ class HermesACP:
         if self.alive and self.session_id:
             await self._write({"jsonrpc": "2.0", "method": "session/cancel",
                                "params": {"sessionId": self.session_id}})
+
+
+
+def _acp_mcp_servers() -> list[dict]:
+    """The MCP servers to register on an ACP session.
+
+    This is the ONLY channel that reaches the agent's toolset. Writing
+    `mcp_servers` into hermes' config.yaml registers the server -- `hermes mcp
+    list` shows it enabled -- and the ACP session still has no such tool,
+    because the adapter builds a session's tools from THIS parameter and
+    ignores the file. Verified the hard way: the agent answered that no
+    `search_docs` tool existed while the CLI listed the server as enabled.
+
+    Two fields are easy to miss and both are load-bearing. `type` is the union
+    DISCRIMINATOR: `session/new` takes `HttpMcpServer`, which subclasses
+    `McpServerHttp` only to add `type: Literal["http"]` -- send the parent's
+    shape and the whole request is rejected with `Invalid params`. `headers` is
+    required with no default, so omitting it fails validation the same way.
+    """
+    if not MEMORY_MCP_URL:
+        return []
+    return [{"type": "http", "name": MEMORY_MCP_NAME, "url": MEMORY_MCP_URL, "headers": []}]
 
 
 # --------------------------------------------------------------------------- #
@@ -714,9 +771,11 @@ async def _on_startup(app: web.Application) -> None:
 
 
 async def _on_cleanup(app: web.Application) -> None:
-    app["gc"].cancel()
-    with contextlib.suppress(Exception):
-        await app["gc"]
+    st: State = app["state"]
+    if st.gc:
+        st.gc.cancel()
+        with contextlib.suppress(Exception):
+            await st.gc
     acp = st.acp
     if acp.alive:
         with contextlib.suppress(ProcessLookupError):

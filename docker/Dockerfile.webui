@@ -45,7 +45,7 @@ RUN set -eux; \
     uv venv /opt/hermes/.venv; \
     VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache-dir \
         $( [ -n "${HERMES_EXTRA_INDEX}" ] && echo "--extra-index-url ${HERMES_EXTRA_INDEX} --index-strategy unsafe-best-match" ) \
-        "hermes-agent[acp]==${HERMES_VERSION}"; \
+        "hermes-agent[acp,mcp]==${HERMES_VERSION}"; \
     ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes; \
     hermes acp --check
 
@@ -59,6 +59,11 @@ ENV HERMES_BIN=/usr/local/bin/hermes \
     HERMES_PY=/opt/hermes/.venv/bin/python \
     HERMES_HOME=/opt/data \
     HERMES_DISABLE_LAZY_INSTALLS=1 \
+    # The other half of disabling a toolset. Availability is computed for EVERY
+    # toolset and filtered afterwards, so the browser toolset's lazy installer
+    # still fires during the check even when the toolset is off -- a fresh
+    # volume elsewhere grew 220 KB -> 897 MB pulling Chromium it would never use.
+    HERMES_NO_DEP_INSTALL=1 \
     WORKDIR=/opt/data \
     PORT=8080 \
     MEMORY_MCP_URL=http://memory-mcp:5100/mcp

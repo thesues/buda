@@ -271,8 +271,10 @@ spec:
             # on cold start turns out to matter.
             - { name: ftcache, mountPath: /root/.cache }
           startupProbe:
-            # Weight load from the mount dominates cold start, and a large MoE
-            # takes minutes. Generous budget, then a tight liveness.
+            # /health answers 200 LONG before the model is usable -- inference
+            # still returns 503 "model is still loading" -- so this probe passes
+            # in seconds and hands over to liveness while the heavy load is
+            # still running. It is kept only as a floor, not as a real gate.
             httpGet: { path: /health, port: 1919 }
             periodSeconds: 10
             failureThreshold: 120     # 20 min
@@ -283,9 +285,17 @@ spec:
             # A failed /v1/cache/rebuild latches the server into
             # maintenance_state == "failed" and answers 503 forever; only a
             # restart clears it, so failing liveness on that is correct.
+            #
+            # But the budget must clear the LOAD, not just a hung server. Pinning
+            # a 155 GiB expert bank blocks the process hard enough that a 1 s
+            # probe times out, and 3 x 30 s killed the pod mid-load -- SIGKILL,
+            # exit 137, then a fresh 10-minute load that would be killed the same
+            # way. 10 s x 40 tolerates ~20 minutes of unresponsiveness, which a
+            # genuinely wedged server still fails and a loading one survives.
             httpGet: { path: /health, port: 1919 }
+            timeoutSeconds: 10
             periodSeconds: 30
-            failureThreshold: 3
+            failureThreshold: 40
 
       volumes:
         - { name: mnt, emptyDir: {} }

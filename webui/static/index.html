@@ -4,35 +4,47 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>hermes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div id="app">
-  <aside id="sidebar">
-    <div class="side-head">
-      <span class="brand">hermes</span>
-      <button id="new-session" title="新建会话">＋</button>
+<div class="shell">
+  <header>
+    <h1>hermes<em>.</em></h1>
+    <button id="new-session" class="btn" title="新建会话">＋ 新会话</button>
+    <span class="spacer"></span>
+    <div class="meta">
+      <span id="mcp-badge"></span>
+      <span id="model-badge"></span>
     </div>
-    <ul id="sessions" aria-label="会话列表"></ul>
-    <div id="side-foot"><span id="mcp-badge"></span></div>
-  </aside>
+  </header>
 
-  <main id="main">
-    <div id="banner" hidden></div>
-    <div id="messages" aria-live="polite"></div>
+  <div class="grid">
+    <section class="card sessions">
+      <div class="card-head"><span class="dot"></span>会话<span class="count" id="sess-count"></span></div>
+      <ul id="sessions"></ul>
+    </section>
 
-    <div id="approval" hidden>
-      <div id="approval-title"></div>
-      <div id="approval-options"></div>
-    </div>
-
-    <form id="composer">
-      <textarea id="input" rows="1" placeholder="发消息…  (Enter 发送 / Shift+Enter 换行)"></textarea>
-      <button id="send" type="submit">发送</button>
-      <button id="stop" type="button" hidden>停止</button>
-    </form>
-  </main>
+    <section class="card chat">
+      <div class="card-head">
+        <span class="dot"></span><span id="run-status">就绪</span>
+        <span class="count" id="elapsed"></span>
+      </div>
+      <div id="messages"></div>
+      <form id="composer">
+        <textarea id="input" rows="1" placeholder="发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
+        <button id="send" type="submit" class="btn">发送</button>
+      </form>
+    </section>
+  </div>
 </div>
+
+<!-- marked renders the model's markdown; DOMPurify sanitises what it produces.
+     Both are vendored, not CDN-loaded: this pod has no egress to the internet. -->
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

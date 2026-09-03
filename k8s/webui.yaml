@@ -87,6 +87,12 @@ spec:
           env:
             - { name: PORT, value: "8080" }
             - { name: HERMES_HOME, value: /opt/data }
+            # The browser toolset's availability check will DOWNLOAD Chromium
+            # to decide it is available -- elsewhere a fresh volume grew from
+            # 220 KB to 897 MB doing it. These stop that. They do NOT remove the
+            # browser tools themselves: the ACP path hardcodes its toolset (W9).
+            - { name: HERMES_NO_DEP_INSTALL, value: "1" }
+            - { name: HERMES_DISABLE_LAZY_INSTALLS, value: "1" }
             - { name: WORKDIR, value: /opt/data }
             # The decoupled dependency: an HTTP URL, not a spawned process.
             - { name: MEMORY_MCP_URL, value: "http://memory-mcp:5100/mcp" }

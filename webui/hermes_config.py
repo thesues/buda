@@ -91,3 +91,17 @@ def _write(path: Path, lines: list[str]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("\n".join(lines).rstrip() + "\n")
     tmp.replace(path)
+
+
+# NOTE: an `ensure_disabled_toolsets` used to live here and was REMOVED, because
+# it does not work on the ACP path and shipping it would have looked like it did.
+# `acp_adapter/session.py` builds every session with a hardcoded
+# `_expand_acp_enabled_toolsets(["hermes-acp"], ...)`; neither
+# `agent.disabled_toolsets` nor `agent.enabled_toolsets` in config.yaml reaches
+# it, and there is no environment override. Both were tried against 0.17 and the
+# browser tools stayed. Trimming the ACP toolset needs a patch to hermes itself.
+#
+# What config.yaml IS still needed for: the same function reads `mcp_servers` to
+# derive each server's `mcp-<name>` toolset. So an MCP server must be in BOTH
+# places -- the file (for the toolset name) and the ACP `session/new` parameter
+# (for the actual connection).
