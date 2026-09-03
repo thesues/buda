@@ -149,11 +149,21 @@ header h1 em { color:var(--accent); font-style:italic; }
                 color:var(--text-dim); white-space:pre-wrap; max-height:16rem; overflow-y:auto; }
 
 /* ---------- tool card ---------- */
-.bubble.tool { display:flex; align-items:baseline; gap:0.6rem; font-size:0.72rem;
-               color:var(--text-dim); padding:0.25rem 0; }
-.bubble.tool::before { content:'▸'; color:var(--accent); opacity:.6; }
+.bubble.tool { background:var(--surface-raised); border:1px solid var(--border);
+               border-radius:var(--radius); overflow:hidden; }
+.tool-head { width:100%; display:flex; align-items:baseline; gap:0.6rem;
+             background:none; border:0; cursor:default; font-family:var(--mono);
+             font-size:0.72rem; color:var(--text-dim); padding:0.4rem 0.7rem; text-align:left; }
+.bubble.tool.has-detail .tool-head { cursor:pointer; }
+.bubble.tool.has-detail .tool-head:hover { color:var(--text); }
+.tool-head .caret { color:var(--accent); font-size:0.6rem; opacity:0; }
+.bubble.tool.has-detail .tool-head .caret { opacity:.7; }
 .tool-title { color:var(--text); opacity:.85; }
 .tool-status { margin-left:auto; color:var(--text-muted); }
+.tool-detail { padding:0 0.7rem 0.6rem; font-size:0.72rem; line-height:1.55;
+               color:var(--text-dim); white-space:pre-wrap; overflow-wrap:anywhere;
+               max-height:22rem; overflow-y:auto; margin:0;
+               font-family:var(--mono); }
 .bubble.tool[data-status="completed"] .tool-status { color:var(--success); }
 .bubble.tool[data-status="failed"] .tool-status { color:var(--danger); }
 
@@ -177,3 +187,10 @@ header h1 em { color:var(--accent); font-style:italic; }
 #send { flex:none; align-self:stretch; }
 
 #send:disabled { opacity:.6; cursor:default; }
+
+/* The tail activity row: the only indicator visible when the reader has
+   scrolled to the bottom of a long transcript. */
+.bubble.pending { display:flex; align-items:baseline; gap:0.55rem;
+                  font-size:0.74rem; color:var(--text-dim); padding:0.3rem 0; }
+.p-spin { color:var(--accent); width:0.8rem; display:inline-block; }
+.p-since { color:var(--text-muted); font-size:0.68rem; }

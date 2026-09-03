@@ -68,7 +68,10 @@ function recall() {
 }
 
 /* ---------- chrome ---------- */
-function status(text) { $("#run-status").textContent = text; }
+function status(text) {
+  $("#run-status").textContent = text;
+  setPendingText(text);          // the tail row mirrors it, where the eye is
+}
 
 const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 let spinFrame = 0;
@@ -77,7 +80,10 @@ function tick() {
   // The spinner is the only thing on screen that says "still working" during a
   // long tool call, where no token arrives for a minute at a time. A static
   // status line reads as a hang.
-  $("#spin").textContent = S.busy ? SPIN[spinFrame++ % SPIN.length] : "";
+  const ch = S.busy ? SPIN[spinFrame++ % SPIN.length] : "";
+  $("#spin").textContent = ch;
+  const ps = $("#pending .p-spin");
+  if (ps) ps.textContent = ch;
   // Each running tool times itself from when its row appeared, not from the
   // turn start -- "this search has been going 40s" is the useful number.
   document.querySelectorAll("[data-since]").forEach((n) => {
@@ -109,6 +115,34 @@ function addMsg(role, text) {
   $("#messages").appendChild(wrap);
   scroll();
   return body;
+}
+
+/* ---------- the tail activity row ---------- */
+// The header's spinner is at the TOP of a scrolling transcript, so during a long
+// wait the reader is looking at the bottom where nothing moves -- reported as
+// "I cannot tell if the model died or is thinking". This row lives at the TAIL,
+// where the eye already is.
+function showPending() {
+  let row = $("#pending");
+  if (!row) {
+    row = el("div", "msg bot");
+    row.id = "pending";
+    const b = el("div", "bubble pending");
+    b.append(el("span", "p-spin"), el("span", "p-text", "思考中"), el("span", "p-since"));
+    b.querySelector(".p-since").dataset.since = String(Date.now());
+    row.appendChild(b);
+    $("#messages").appendChild(row);
+    scroll();
+  }
+  return row;
+}
+function setPendingText(t) {
+  const n = $("#pending .p-text");
+  if (n) n.textContent = t;
+}
+function clearPending() {
+  const row = $("#pending");
+  if (row) row.remove();
 }
 
 /* ---------- segments ---------- */
@@ -146,6 +180,7 @@ function newThinkSeg() {
 }
 
 function newOutputSeg() {
+  clearPending();      // tokens are their own proof of life
   const body = addMsg("bot", "");
   body.classList.add("streaming", "md");
   S.seg = { kind: "out", body, text: "", refs: null };
@@ -167,6 +202,7 @@ function scheduleRender() {
 
 function appendThought(text) {
   if (!text) return;
+  clearPending();
   status("思考中");
   if (!S.seg || S.seg.kind !== "think") { finalizeSeg(); newThinkSeg(); }
   S.seg.text += text;
@@ -183,27 +219,46 @@ function appendToken(text) {
 }
 
 /* ---------- tools ---------- */
-function toolRow(id, title, st) {
-  let row = S.tools.get(id);
-  if (!row) {
-    row = el("div", "msg bot");
-    const card = el("div", "bubble tool");
-    const since = el("span", "tool-since");
-    since.dataset.since = String(Date.now());
-    card.append(el("span", "tool-title", title || "tool"), since, el("span", "tool-status", st || ""));
+function toolRow(id, title, st, detail) {
+  let card = S.tools.get(id);
+  if (!card) {
+    const row = el("div", "msg bot");
+    card = el("div", "bubble tool");
+    const head = el("button", "tool-head");
+    head.append(
+      el("span", "caret", "▸"),
+      el("span", "tool-title", title || "tool"),
+      el("span", "tool-since"),
+      el("span", "tool-status", st || "")
+    );
+    const body = el("pre", "tool-detail");
+    body.hidden = true;
+    // Collapsed by default and openable: a corpus search returns whole
+    // passages, and pasting them into the transcript buries the answer the
+    // reader came for. Hiding them entirely is the other failure — then there
+    // is no way to check what the citation was actually built from.
+    head.onclick = () => {
+      body.hidden = !body.hidden;
+      head.querySelector(".caret").textContent = body.hidden ? "▸" : "▾";
+    };
+    card.append(head, body);
     row.appendChild(card);
     $("#messages").appendChild(row);
+    card.querySelector(".tool-since").dataset.since = String(Date.now());
     S.tools.set(id, card);
-    row = card;
-  } else {
-    if (title) row.querySelector(".tool-title").textContent = title;
-    row.querySelector(".tool-status").textContent = st || "";
   }
-  row.dataset.status = st || "";
+  if (title) card.querySelector(".tool-title").textContent = title;
+  card.querySelector(".tool-status").textContent = st || "";
+  if (detail) {
+    card.querySelector(".tool-detail").textContent = detail;
+    card.classList.add("has-detail");
+  }
+  card.dataset.status = st || "";
   if (st === "completed" || st === "failed") {
-    const n = row.querySelector(".tool-since");
+    const n = card.querySelector(".tool-since");
     if (n) n.removeAttribute("data-since");     // freeze the elapsed time
-  } else if (st) status(title || "工具执行中");
+    if (S.busy) { showPending(); setPendingText("处理检索结果"); }
+  } else if (st) { status(title || "工具执行中"); showPending(); }
   scroll();
 }
 
@@ -264,7 +319,7 @@ function apply(ev) {
       break;
     case "history_user": finalizeSeg(); addMsg("user", ev.text); break;
     case "delta": ev.thought ? appendThought(ev.text) : appendToken(ev.text); break;
-    case "tool": toolRow(ev.id, ev.title, ev.status); break;
+    case "tool": toolRow(ev.id, ev.title, ev.status, ev.detail); break;
     case "approval": showApproval(ev); break;
     case "approval_expired":
       S.awaitingPerm = false;
@@ -324,6 +379,7 @@ function detach() { if (S.es) { S.es.close(); S.es = null; } }
 
 function endTurn(error) {
   detach();
+  clearPending();
   finalizeSeg();
   setBusy(false);
   S.tools.clear();
@@ -446,6 +502,7 @@ async function send() {
   // is not the one we just drew, so let the echo paint it.
   if (j.attached) S.skipUserEcho = false;
   remember(j.streamId, 0);
+  showPending();
   attach(j.streamId, 0);
 }
 

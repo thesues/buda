@@ -532,6 +532,51 @@ def _chunk_text(update: dict) -> str:
     return c.get("text", "") if isinstance(c, dict) else ""
 
 
+
+# A tool card's expandable body: what was asked, and what came back. Bounded --
+# a corpus search returns whole passages, and the whole point of the card is
+# that the reader can glance at it and open it only if it matters.
+TOOL_DETAIL_MAX = int(os.environ.get("TOOL_DETAIL_MAX", "4000"))
+
+# What the UI shows and what the MODEL sees are different budgets. This one
+# only bounds the card; the text the agent actually reasons over comes back
+# through ACP untouched, and on a 24 GiB card a few whole passages in the
+# prefill context was enough to OOM dsv4's sparse indexer and take the server
+# down with it. Bounding the card does NOT bound that -- the fix for the model
+# side is `k` on the search and the serving flags, not this number.
+
+
+def _tool_detail(u: dict) -> str:
+    """Best-effort over the ACP shape: `rawInput` (the arguments) plus the text
+    in `content` blocks (the output). Truncated head+tail so a long result stays
+    readable at both ends rather than being cut off mid-sentence."""
+    parts: list[str] = []
+    ri = u.get("rawInput")
+    if isinstance(ri, dict) and ri:
+        try:
+            parts.append(json.dumps(ri, ensure_ascii=False, indent=2))
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(ri, str) and ri.strip():
+        parts.append(ri)
+    out: list[str] = []
+    for blk in u.get("content") or []:
+        if not isinstance(blk, dict):
+            continue
+        c = blk.get("content")
+        if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+            out.append(c["text"])
+        elif blk.get("type") == "diff" and blk.get("path"):
+            out.append(f"[diff] {blk['path']}")
+    if out:
+        parts.append("\n".join(o for o in out if o))
+    text = "\n\n".join(p for p in parts if p).strip()
+    if len(text) > TOOL_DETAIL_MAX:
+        keep = TOOL_DETAIL_MAX // 2
+        text = text[:keep] + f"\n\n…（省略 {len(text) - TOOL_DETAIL_MAX} 字）…\n\n" + text[-keep:]
+    return text
+
+
 def _to_event(update: dict) -> tuple[str, dict] | None:
     """Map one ACP `session/update` to a UI event, or None to ignore it.
 
@@ -545,14 +590,13 @@ def _to_event(update: dict) -> tuple[str, dict] | None:
         if not text:
             return None
         return ("delta", {"text": text, "thought": kind == "agent_thought_chunk"})
-    if kind == "tool_call":
-        return ("tool", {"id": update.get("toolCallId"),
-                         "title": update.get("title") or update.get("kind") or "tool",
-                         "status": update.get("status") or "pending"})
-    if kind == "tool_call_update":
-        return ("tool", {"id": update.get("toolCallId"),
-                         "title": update.get("title") or "",
-                         "status": update.get("status") or ""})
+    if kind in ("tool_call", "tool_call_update"):
+        return ("tool", {
+            "id": update.get("toolCallId"),
+            "title": update.get("title") or update.get("kind") or ("tool" if kind == "tool_call" else ""),
+            "status": update.get("status") or ("pending" if kind == "tool_call" else ""),
+            "detail": _tool_detail(update),
+        })
     if kind == "user_message_chunk":
         # Only seen while replaying a loaded session's history.
         text = _chunk_text(update)

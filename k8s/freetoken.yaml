@@ -116,6 +116,25 @@ spec:
       # The cost is that the whole container is privileged now, where before
       # only the sidecar was.
 
+      # `autumn-fuse` is LIFTED here at start, not baked in at build. The image
+      # used to carry it via `COPY --from=$AUTUMN_IMAGE`, which made every
+      # autumn change that touches the mount cost a 20 GiB rebuild and a 12
+      # minute pull -- and bound this image to autumn's WIRE lockstep through a
+      # build-arg no tag can see. Choosing the version here makes it a DEPLOY
+      # decision: to pick up a fuse change, edit this line.
+      #
+      # Deliberately an initContainer and not a sidecar. A sidecar needs
+      # `mountPropagation: Bidirectional` to share the mount, and that leaked
+      # mounts badly enough to wedge nodes (see c6b5970). This only copies a
+      # file; the mount still runs in the app container, in one namespace, and
+      # dies with it.
+      initContainers:
+        - name: fusebin
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:1e2cca496cf747a92e8d9f7626cfcc01d2d5857b
+          command: ["sh","-c","cp /usr/local/bin/autumn-fuse /fusebin/ && chmod +x /fusebin/autumn-fuse"]
+          volumeMounts:
+            - { name: fusebin, mountPath: /fusebin }
+
       containers:
         - name: freetoken
           image: IMAGE_FREETOKEN
@@ -160,7 +179,7 @@ spec:
               #
               # The proxy path is not a consolation prize either: `autumnfs`
               # pulled a 5 GB shard through it at 164 MiB/s.
-              autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+              /opt/fusebin/autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
                 --direct-read false \
                 --credential-file /etc/autumn/cred/fs.cred &
               FUSE_PID=$!
@@ -206,17 +225,42 @@ spec:
               # hybrid explicitly below, so this is for the fetch/compute ratio.
               ft bench bw || echo "bench bw failed — hybrid will use its default split"
 
+              # NOTE: no comments inside the command below. A `#` line breaks
+              # the backslash continuation, so everything after it silently
+              # stops being an argument -- which is how --max-running-req,
+              # --expert-load and --tool-call-parser were all being dropped
+              # while the log happily showed their defaults.
+              # A 4090 has 23.5 GiB and dsv4's dense weights plus KV leave
+              # little slack. Observed: a corpus search returns whole
+              # passages, the prefill context grows with them, and
+              # dsv4_indexer's select_prefill asked for another 174 MiB with
+              # 43 MiB free -- CUDA OOM, and FreeToken cannot restart a dead
+              # worker, so the whole API server exits (cleanly, exit 0, which
+              # is why it does not look like a crash).
+              #
+              # Flag names come from the ARGUMENT PARSER, not from ServerArgs'
+              # field names: the log prints `max_running_req=4` while the flag
+              # is `--max-running-requests`, and there is no --max-extend-tokens
+              # at all. Guessing from the log crash-looped the pod on
+              # "unrecognized arguments", which is at least loud.
+              #
+              # This is a single-user retrieval UI: four concurrent requests
+              # buy nothing and cost four sets of activations.
+              # `deepseekv32`, not `deepseek` — these are closed argparse
+              # enumerations, and the value is the parser's name, not the
+              # model family's. Guessing it from the model name fails the
+              # process at startup rather than degrading, which is the right
+              # behaviour but reads as a crash-loop.
+
               exec ft serve \
                 --model /mnt/autumn/models/dsv4-flash \
                 --host 0.0.0.0 --port 1919 \
                 --moe-backend hybrid \
                 --page-size 64 \
+                --max-running-requests 1 \
+                --memory-ratio 0.85 \
+                --kv-reserve-tokens 4096 \
                 --expert-load parallel \
-                # `deepseekv32`, not `deepseek` — these are closed argparse
-                # enumerations, and the value is the parser's name, not the
-                # model family's. Guessing it from the model name fails the
-                # process at startup rather than degrading, which is the right
-                # behaviour but reads as a crash-loop.
                 --tool-call-parser deepseekv32 --reasoning-parser deepseekv32
           ports:
             - { name: http, containerPort: 1919 }
@@ -251,6 +295,7 @@ spec:
             # No propagation: the mount is made inside this container, so
             # there is nothing to receive from anywhere.
             - { name: mnt, mountPath: /mnt/autumn }
+            - { name: fusebin, mountPath: /opt/fusebin }
             - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
             - { name: dshm, mountPath: /dev/shm }
             # Triton/JIT kernel cache + the `ft bench bw` profile. On emptyDir it
@@ -286,6 +331,7 @@ spec:
 
       volumes:
         - { name: mnt, emptyDir: {} }
+        - { name: fusebin, emptyDir: {} }
         - name: cred
           secret: { secretName: autumn-credential }
         # Torch's multiprocessing needs more than the 64 MiB default /dev/shm.

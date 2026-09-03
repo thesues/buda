@@ -1,15 +1,20 @@
-# FreeToken + autumn image — MoE serving with weights read from an autumn FUSE mount.
+# FreeToken — MoE serving. The weights come from an autumn FUSE mount, but this
+# image contains no autumn code at all.
 #
-# Build context = THIS repo (buda). The autumn-rs workspace is NOT needed as the
-# context: its sources come out of AUTUMN_IMAGE along with the binaries, so that
-# one tag is the only version knob (see "the autumn client" section below).
+# It used to. It lifted `autumn-fuse` / `autumnfs` / `autumn-op` out of an
+# AUTUMN_IMAGE, and built autumn's PyO3 client from source with a full rustup +
+# cargo toolchain for a kvcache adapter nothing loads. That made one tag bind
+# two projects: every autumn change touching the mount cost a 20 GiB rebuild and
+# a 12 minute pull, and rkyv's WIRE lockstep applied here through a build-arg no
+# image tag can show.
+#
+# Now the pod's initContainer copies `autumn-fuse` out of the autumn-rs image at
+# start. The mount binary is a DEPLOY-time choice -- a fuse change is a manifest
+# edit -- and this image is free of the lockstep entirely.
+#
 #   docker build -f docker/Dockerfile.freetoken \
 #     --build-arg BASE_REGISTRY=hub-cache-cn-beijing.cr.volces.com/ \
-#     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
-#     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
-#     --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/ \
 #     --build-arg PIP_INDEX_URL=https://mirrors.ivolces.com/pypi/simple/ \
-#     --build-arg AUTUMN_IMAGE=<cr>/autumn-rs:<same-commit> \
 #     -t <cr>/freetoken-autumn:<tag> .
 #
 # ── Why a -devel CUDA base and not a slim runtime ──────────────────────────────
@@ -37,9 +42,6 @@ ARG CUDA_IMAGE=nvidia/cuda:13.0.1-devel-ubuntu22.04
 # PUBLIC base images through a mirror, and this one is a full private-registry
 # reference already (`<host>.cr.volces.com/<ns>/autumn-rs:<sha>`). Prefixing it
 # would produce `hub-cache-cn-beijing.cr.volces.com/<host>.cr.volces.com/...` and fail to pull.
-ARG AUTUMN_IMAGE=autumn-rs:latest
-
-FROM ${AUTUMN_IMAGE} AS autumncore
 
 FROM ${BASE_REGISTRY}${CUDA_IMAGE}
 
@@ -53,17 +55,13 @@ FROM ${BASE_REGISTRY}${CUDA_IMAGE}
 #     does not carry `freetoken` at all (`from versions: none`, build #55), while
 #     aliyun has the cp310-cp313 manylinux wheels.
 #   APT_MIRROR     : Ubuntu apt mirror BASE URL (e.g. https://mirrors.aliyun.com).
-ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
-ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
-ARG CARGO_MIRROR=
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ARG APT_MIRROR=
 # torch for CUDA 13 is not on PyPI proper; it comes from PyTorch's own index.
 # Kept separate from PIP_INDEX_URL so a mirror can serve everything else.
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
 
-ENV CARGO_HOME=/root/.cargo \
-    PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH \
+ENV PATH=/usr/local/cuda/bin:$PATH \
     RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
     RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
@@ -81,8 +79,6 @@ RUN if [ -n "$APT_MIRROR" ]; then \
       curl wget ca-certificates git build-essential pkg-config libssl-dev \
       libfuse3-3 fuse3 numactl aria2 jq \
  && rm -rf /var/lib/apt/lists/* \
- && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
- && python3 -m pip install --no-cache-dir --upgrade pip "maturin>=1,<2"
 
 # ── oniond: Volcengine TOS model downloader ───────────────────────────────────
 # Model weights come from the internal TOS bucket, not HuggingFace: it is
@@ -112,9 +108,6 @@ ENV BUCKET=ai-infra
 # `autumn-fuse` mounts the fs/ namespace so FreeToken can read weights as files.
 # Lifted from the core image rather than rebuilt: one Rust build, one binary,
 # and it cannot drift from the cluster it talks to.
-COPY --from=autumncore /usr/local/bin/autumn-fuse /usr/local/bin/autumn-fuse
-COPY --from=autumncore /usr/local/bin/autumnfs     /usr/local/bin/autumnfs
-COPY --from=autumncore /usr/local/bin/autumn-op    /usr/local/bin/autumn-op
 
 # ── torch first, pinned to the CUDA-13 build ──────────────────────────────────
 # FreeToken requires torch>=2.11,<2.12 and its extensions compile against it, so
@@ -173,27 +166,17 @@ RUN FREETOKEN_ALLOW_CUDA_MISMATCH=0 \
 # would either be rejected by pip as manylinux_2_36 or install and fail at
 # import on a missing GLIBC_2.36. Compiling against this image's own runtime
 # avoids the whole question.
-COPY --from=autumncore /usr/local/share/autumn/src/ /src/
-WORKDIR /src
-RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
-      printf '[source.crates-io]\nreplace-with="m"\n[source.m]\nregistry="%s"\n' "$CARGO_MIRROR" >> "$CARGO_HOME/config.toml"; fi
+# NOTE: this image used to build autumn's PyO3 client here -- a full rustup +
+# cargo toolchain and a maturin build of the workspace, ~1.5 GB of it -- for the
+# kvcache adapter. Nothing loads that adapter: the manifest passes no
+# --hicache-storage-backend, weights come from the mount, and the wheel was
+# imported by no code that runs. It went, and with it the only reason this image
+# had to be built at the cluster's commit.
+#
+# `autumn-fuse` is not here either. The pod's initContainer copies it out of the
+# autumn-rs image at start, so the mount binary is a DEPLOY-time choice: a fuse
+# change costs a manifest edit, not a 20 GiB rebuild and a 12 minute pull.
 
-# The native `autumn` PyO3 client, then the pure-python adapter package. The
-# kvcache adapter carries `AutumnKVCacheStorage`, the sglang-HiCache-shaped L3
-# backend that a HiCache-enabled FreeToken loads via
-#   --hicache-storage-backend dynamic
-#   --hicache-storage-backend-extra-config '{"module_path":"autumn_kvcache.sglang_backend",
-#     "class_name":"AutumnKVCacheStorage","interface_v1":1,...}'
-# `autumn_vllm_loader` is deliberately NOT installed: weights come from the FUSE
-# mount here, not from `--load-format autumn`.
-RUN cd python \
- && maturin build --release --interpreter python3 \
- && python3 -m pip install --no-cache-dir target/wheels/autumn-*.whl \
- && python3 -m pip install --no-cache-dir -e autumn_kvcache
-
-# Trim the Rust toolchain and the build tree; they are ~1.5 GB and nothing at
-# runtime needs them. Keep /src/python/autumn_kvcache (installed with -e).
-RUN rm -rf /root/.rustup /root/.cargo/registry /src/target /src/python/target
 
 # `ft serve` defaults to 127.0.0.1:1919 and has NO authentication of any kind —
 # no API key, no bearer. Expose it as a ClusterIP only, never a LoadBalancer.
