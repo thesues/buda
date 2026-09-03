@@ -160,6 +160,25 @@ spec:
 # annotations are what bind an Ingress to that instance; `ingressClassName`
 # alone is not enough, and without them the rule is accepted and never served.
 #
+# PREREQUISITE, and it fails silently: that instance carries a namespace
+# allow-list, and `autumn` is not on it —
+#
+#   APIGInstance/gda7u922gbfvc539oufjg-apig-instance
+#     spec.ingress.enableAllNamespaces: false
+#     spec.ingress.watchNamespaces:     [dataverse, default, rlinf]
+#
+# An Ingress outside those namespaces is accepted by the API server, shows up
+# in `kubectl get ingress`, and is simply never programmed into the gateway.
+# There is no event and no status condition to notice. Add `autumn` to that
+# list before expecting this to route:
+#
+#   kubectl patch apiginstance gda7u922gbfvc539oufjg-apig-instance --type=merge \
+#     -p '{"spec":{"ingress":{"watchNamespaces":["dataverse","default","rlinf","autumn"]}}}'
+#
+# Moving the Ingress into a watched namespace instead does not work: an Ingress
+# backend must live in the Ingress's own namespace, so the Service would have to
+# move too, and a Service cannot select pods in another namespace.
+#
 # There is no TLS here and the app's only gate is single-user HTTP Basic
 # (`hermes-webui-auth`), so this is a plaintext-credential path over the public
 # VIP. Set that secret before publishing, or leave AUTH_USER empty and treat the
