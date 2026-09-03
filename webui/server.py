@@ -229,7 +229,9 @@ class Approval:
         self.id = approval_id
         self.stream_id = stream_id
         self.params = params
-        self.future: asyncio.Future = asyncio.get_event_loop().create_future()
+        # get_running_loop, not get_event_loop: this must belong to the loop
+        # that will await it, and only the running one is guaranteed to be that.
+        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.created_at = time.time()
 
     def brief(self) -> dict:
@@ -272,27 +274,43 @@ class HermesACP:
         self.session_id: str | None = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
-        self._write_lock = asyncio.Lock()
-        self._start_lock = asyncio.Lock()
+        # Created lazily, inside the loop that will use them. On Python 3.9 an
+        # asyncio.Lock BINDS to the running loop at construction time, and this
+        # object is built in `build_app()` -- before `run_app` makes the loop it
+        # will actually serve on. The mismatch surfaced only on the first path
+        # that took the lock after a restart: "got Future attached to a
+        # different loop", reported as a session that would not load.
+        self._write_lock: asyncio.Lock | None = None
+        self._start_lock: asyncio.Lock | None = None
         # Sessions already steered with CHAT_DIRECTIVE. A loaded session is
         # marked on load so the directive is never injected mid-conversation.
         self._directive_sent: set[str] = set()
         self.on_update = None      # async fn(update)
         self.on_permission = None  # async fn(params) -> optionId | None
 
+    def _wl(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
+
+    def _sl(self) -> asyncio.Lock:
+        if self._start_lock is None:
+            self._start_lock = asyncio.Lock()
+        return self._start_lock
+
     @property
     def alive(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
 
     async def ensure(self) -> None:
-        async with self._start_lock:
+        async with self._sl():
             if not self.alive:
                 await self._spawn()
             if not self.session_id:
                 await self._new_locked()
 
     async def ensure_proc(self) -> None:
-        async with self._start_lock:
+        async with self._sl():
             if not self.alive:
                 await self._spawn()
 
@@ -381,14 +399,14 @@ class HermesACP:
             self.session_id = None
 
     async def _write(self, obj: dict) -> None:
-        async with self._write_lock:
+        async with self._wl():
             self.proc.stdin.write((json.dumps(obj) + "\n").encode())
             await self.proc.stdin.drain()
 
     async def _request(self, method: str, params: dict):
         self._id += 1
         rid = self._id
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         await self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         res = await fut
@@ -487,7 +505,7 @@ class HermesACP:
 
     async def restart(self) -> None:
         """Kill the process and bring a fresh one up. The hard half of stop."""
-        async with self._start_lock:
+        async with self._sl():
             if self.alive:
                 old = self.proc
                 with contextlib.suppress(ProcessLookupError):
@@ -543,7 +561,11 @@ def _chunk_text(update: dict) -> str:
 # A tool card's expandable body: what was asked, and what came back. Bounded --
 # a corpus search returns whole passages, and the whole point of the card is
 # that the reader can glance at it and open it only if it matters.
-TOOL_DETAIL_MAX = int(os.environ.get("TOOL_DETAIL_MAX", "4000"))
+# The card's body is CLAMPED by the client, which can reveal the rest -- so this
+# is a transport ceiling, not a display budget, and it can be generous. It still
+# exists: a search over the whole corpus can return more than anyone will read,
+# and an unbounded value would ride every SSE frame and sit in the backlog.
+TOOL_DETAIL_MAX = int(os.environ.get("TOOL_DETAIL_MAX", "60000"))
 
 # What the UI shows and what the MODEL sees are different budgets. This one
 # only bounds the card; the text the agent actually reasons over comes back
@@ -553,8 +575,12 @@ TOOL_DETAIL_MAX = int(os.environ.get("TOOL_DETAIL_MAX", "4000"))
 # side is `k` on the search and the serving flags, not this number.
 
 
-def _tool_detail(u: dict) -> str:
-    """Best-effort over the ACP shape: `rawInput` (the arguments) plus the text
+def _tool_detail(u: dict) -> tuple[str, int]:
+    """Returns `(text, full_len)`. `full_len > len(text)` means the tail was cut
+    at the transport ceiling, and the client says so rather than pretending the
+    value ended there.
+
+    Best-effort over the ACP shape: `rawInput` (the arguments) plus the text
     in `content` blocks (the output). Truncated head+tail so a long result stays
     readable at both ends rather than being cut off mid-sentence."""
     parts: list[str] = []
@@ -578,10 +604,13 @@ def _tool_detail(u: dict) -> str:
     if out:
         parts.append("\n".join(o for o in out if o))
     text = "\n\n".join(p for p in parts if p).strip()
-    if len(text) > TOOL_DETAIL_MAX:
-        keep = TOOL_DETAIL_MAX // 2
-        text = text[:keep] + f"\n\n…（省略 {len(text) - TOOL_DETAIL_MAX} 字）…\n\n" + text[-keep:]
-    return text
+    full = len(text)
+    if full > TOOL_DETAIL_MAX:
+        # Head only, not head+tail: the client reveals progressively, and a
+        # stitched-together middle would make "show more" reveal a seam rather
+        # than more of the same value.
+        text = text[:TOOL_DETAIL_MAX]
+    return text, full
 
 
 def _to_event(update: dict) -> tuple[str, dict] | None:
@@ -602,7 +631,8 @@ def _to_event(update: dict) -> tuple[str, dict] | None:
             "id": update.get("toolCallId"),
             "title": update.get("title") or update.get("kind") or ("tool" if kind == "tool_call" else ""),
             "status": update.get("status") or ("pending" if kind == "tool_call" else ""),
-            "detail": _tool_detail(update),
+            "detail": (_d := _tool_detail(update))[0],
+            "detailFull": _d[1],
         })
     if kind == "user_message_chunk":
         # Only seen while replaying a loaded session's history.

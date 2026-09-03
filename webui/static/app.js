@@ -46,6 +46,7 @@ const S = {
   approvalTimer: null,
   awaitingPerm: false,
   skipUserEcho: false,   // we drew this turn's prompt optimistically
+  activity: null,        // the current turn's one activity disclosure
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -157,33 +158,54 @@ function finalizeSeg() {
   // where the whole answer should be.
   if (seg.kind === "out") seg.body.innerHTML = renderMD(seg.text);
   S.seg = null;
+  if (seg.kind === "think") { activitySummary(); return; }
   if (!seg.text.trim()) { seg.body.closest(".msg").remove(); return; }
-  if (seg.kind === "think") {
-    seg.refs.label.textContent = "思考";
-    seg.refs.detail.hidden = true;      // collapse; the header reopens it
-    seg.refs.caret.textContent = "▸";
-  } else {
-    seg.body.classList.remove("streaming");
-  }
+  seg.body.classList.remove("streaming");
+}
+
+function activityGroup() {
+  // One disclosure row per assistant turn, holding the thinking AND every tool.
+  // Upstream's design guide is explicit about this: a turn that used ten tools
+  // should read as one turn with one compact "Activity: 10 tools" row, not ten
+  // chat cards. Ours rendered a card per tool and a separate row for thinking,
+  // which is what buried the answer the reader came for.
+  if (S.activity && document.body.contains(S.activity.wrap)) return S.activity;
+  const wrap = el("div", "msg bot");
+  const card = el("div", "bubble activity");
+  const head = el("button", "act-head");
+  const caret = el("span", "caret", "▸");
+  const label = el("span", "act-label", "思考中");
+  head.append(caret, label);
+  const body = el("div", "act-body");
+  body.hidden = true;
+  head.onclick = () => {
+    body.hidden = !body.hidden;
+    caret.textContent = body.hidden ? "▸" : "▾";
+  };
+  card.append(head, body);
+  wrap.appendChild(card);
+  $("#messages").appendChild(wrap);
+  S.activity = { wrap, card, head, caret, label, body, think: null, tools: 0 };
+  scroll();
+  return S.activity;
+}
+
+function activitySummary() {
+  const a = S.activity;
+  if (!a) return;
+  const bits = [];
+  if (a.tools) bits.push(`${a.tools} 个工具`);
+  if (a.think && a.think.textContent.trim()) bits.push("思考");
+  a.label.textContent = bits.length ? `活动 · ${bits.join(" · ")}` : "思考";
 }
 
 function newThinkSeg() {
-  const wrap = el("div", "msg bot");
-  const card = el("div", "bubble think");
-  const head = el("button", "think-head");
-  const caret = el("span", "caret", "▾");
-  const label = el("span", "think-label", "思考中…");
-  head.append(caret, label);
-  const detail = el("div", "think-detail");
-  head.onclick = () => {
-    detail.hidden = !detail.hidden;
-    caret.textContent = detail.hidden ? "▸" : "▾";
-  };
-  card.append(head, detail);
-  wrap.appendChild(card);
-  $("#messages").appendChild(wrap);
-  S.seg = { kind: "think", body: card, text: "", refs: { head, caret, label, detail } };
-  scroll();
+  const a = activityGroup();
+  if (!a.think) {
+    a.think = el("div", "act-think");
+    a.body.appendChild(a.think);
+  }
+  S.seg = { kind: "think", body: a.think, text: "", refs: null };
 }
 
 function newOutputSeg() {
@@ -213,7 +235,8 @@ function appendThought(text) {
   status("思考中");
   if (!S.seg || S.seg.kind !== "think") { finalizeSeg(); newThinkSeg(); }
   S.seg.text += text;
-  S.seg.refs.detail.textContent = S.seg.text;
+  S.seg.body.textContent = S.seg.text;
+  activitySummary();
   scroll();
 }
 
@@ -227,45 +250,44 @@ function appendToken(text) {
 
 /* ---------- tools ---------- */
 function toolRow(id, title, st, detail) {
-  let card = S.tools.get(id);
-  if (!card) {
-    const row = el("div", "msg bot");
-    card = el("div", "bubble tool");
-    const head = el("button", "tool-head");
-    head.append(
-      el("span", "caret", "▸"),
-      el("span", "tool-title", title || "tool"),
-      el("span", "tool-since"),
-      el("span", "tool-status", st || "")
+  const a = activityGroup();
+  let row = S.tools.get(id);
+  if (!row) {
+    row = el("div", "act-tool");
+    row.append(
+      el("span", "t-name", title || "tool"),
+      el("span", "t-since"),
+      el("span", "t-status", st || "")
     );
-    const body = el("pre", "tool-detail");
-    body.hidden = true;
-    // Collapsed by default and openable: a corpus search returns whole
-    // passages, and pasting them into the transcript buries the answer the
-    // reader came for. Hiding them entirely is the other failure — then there
-    // is no way to check what the citation was actually built from.
-    head.onclick = () => {
-      body.hidden = !body.hidden;
-      head.querySelector(".caret").textContent = body.hidden ? "▸" : "▾";
-    };
-    card.append(head, body);
-    row.appendChild(card);
-    $("#messages").appendChild(row);
-    card.querySelector(".tool-since").dataset.since = String(Date.now());
-    S.tools.set(id, card);
+    row.querySelector(".t-since").dataset.since = String(Date.now());
+    a.body.appendChild(row);
+    a.tools += 1;
+    S.tools.set(id, row);
   }
-  if (title) card.querySelector(".tool-title").textContent = title;
-  card.querySelector(".tool-status").textContent = st || "";
+  if (title) row.querySelector(".t-name").textContent = title;
+  row.querySelector(".t-status").textContent = st || "";
   if (detail) {
-    card.querySelector(".tool-detail").textContent = detail;
-    card.classList.add("has-detail");
+    let d = row.nextElementSibling;
+    if (!d || !d.classList.contains("act-detail")) {
+      d = el("pre", "act-detail");
+      row.after(d);
+      // The row toggles only ITS detail. The group's own caret is about the
+      // whole activity; a tool's arguments and result are one more level down,
+      // which is where the design guide puts them ("arguments and result
+      // snippets stay behind expansion").
+      row.classList.add("has-detail");
+      row.onclick = () => { d.hidden = !d.hidden; };
+      d.hidden = true;
+    }
+    d.textContent = detail;
   }
-  card.dataset.status = st || "";
+  row.dataset.status = st || "";
   if (st === "completed" || st === "failed") {
-    const n = card.querySelector(".tool-since");
-    if (n) n.removeAttribute("data-since");     // freeze the elapsed time
+    const n = row.querySelector(".t-since");
+    if (n) n.removeAttribute("data-since");
     if (S.busy) { showPending(); setPendingText("处理检索结果"); }
   } else if (st) { status(title || "工具执行中"); showPending(); }
+  activitySummary();
   scroll();
 }
 
@@ -388,6 +410,7 @@ function endTurn(error) {
   detach();
   clearPending();
   finalizeSeg();
+  S.activity = null;      // the next turn opens its own group
   setBusy(false);
   S.tools.clear();
   S.awaitingPerm = false;
@@ -444,7 +467,7 @@ async function loadSessions() {
 async function openSession(id) {
   if (S.busy) { status("先等待或停止当前回复"); return; }
   $("#messages").textContent = "";
-  S.tools.clear(); S.seg = null;
+  S.tools.clear(); S.seg = null; S.activity = null;
   let j;
   try {
     j = await (await fetch("/api/session/load", {
@@ -495,6 +518,7 @@ async function send() {
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
   S.seg = null;
+  S.activity = null;
   S.skipUserEcho = true;
   let j;
   try {

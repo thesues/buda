@@ -420,7 +420,7 @@ async def test_a_cancel_that_is_honoured_does_not_restart(aiohttp_client, app):
     async def wind_down():
         await asyncio.sleep(0.05)
         acp.release.set()
-    asyncio.get_event_loop().create_task(wind_down())
+    asyncio.get_running_loop().create_task(wind_down())
     body = await (await client.post("/api/chat/cancel")).json()
 
     assert body["how"] == "graceful"
