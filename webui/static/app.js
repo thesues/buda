@@ -25,6 +25,32 @@ const el = (tag, cls, text) => {
 
 const LS_STREAM = "hermes.streamId";
 const LS_SEQ = "hermes.lastSeq";
+const LS_OPEN = "hermes.open";      // which activity groups the reader had open
+
+// Keyed by session + the group's index in the transcript, which is stable for a
+// given conversation: reload it, switch away and back, and the rows you opened
+// are still open. Upstream persists this per chat and per turn for the same
+// reason -- being made to re-open the same trace every visit is what makes a
+// disclosure feel like it is fighting you.
+function openState() {
+  try { return JSON.parse(localStorage.getItem(LS_OPEN) || "{}"); } catch (_) { return {}; }
+}
+// Keyed by session so one conversation's open groups do not decide another's.
+// `S.sessionId` used to be set only by `openSession`, so every conversation
+// started from 新会话 — and every boot-time reattach — shared one "-" bucket:
+// opening group 0 in one of them pre-opened group 0 in all the others.
+function openKey(idx) { return `${S.sessionId || "-"}#${idx}`; }
+function isOpen(idx) { return openState()[openKey(idx)] === 1; }
+function setOpen(idx, on) {
+  try {
+    const m = openState();
+    if (on) m[openKey(idx)] = 1; else delete m[openKey(idx)];
+    // Bounded: one entry per turn per session forever would grow without limit.
+    const keys = Object.keys(m);
+    if (keys.length > 400) keys.slice(0, keys.length - 400).forEach((k) => delete m[k]);
+    localStorage.setItem(LS_OPEN, JSON.stringify(m));
+  } catch (_) { /* private mode: the state is a convenience, not a requirement */ }
+}
 
 // Open links in a new tab, and never hand the opener over with them.
 DOMPurify.addHook("afterSanitizeAttributes", (node) => {
@@ -47,6 +73,9 @@ const S = {
   awaitingPerm: false,
   skipUserEcho: false,   // we drew this turn's prompt optimistically
   activity: null,        // the current turn's one activity disclosure
+  actIndex: 0,           // its position in the transcript, for the open-state key
+  sessionId: null,
+  switching: null,      // a session/load in flight; sending must wait for it
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -177,10 +206,14 @@ function activityGroup() {
   const label = el("span", "act-label", "思考中");
   head.append(caret, label);
   const body = el("div", "act-body");
-  body.hidden = true;
+  const idx = S.actIndex++;
+  const open = isOpen(idx);
+  body.hidden = !open;
+  caret.textContent = open ? "▾" : "▸";
   head.onclick = () => {
     body.hidden = !body.hidden;
     caret.textContent = body.hidden ? "▸" : "▾";
+    setOpen(idx, !body.hidden);
   };
   card.append(head, body);
   wrap.appendChild(card);
@@ -249,7 +282,7 @@ function appendToken(text) {
 }
 
 /* ---------- tools ---------- */
-function toolRow(id, title, st, detail) {
+function toolRow(id, title, st, detail, full) {
   const a = activityGroup();
   let row = S.tools.get(id);
   if (!row) {
@@ -271,15 +304,14 @@ function toolRow(id, title, st, detail) {
     if (!d || !d.classList.contains("act-detail")) {
       d = el("pre", "act-detail");
       row.after(d);
-      // The row toggles only ITS detail. The group's own caret is about the
-      // whole activity; a tool's arguments and result are one more level down,
-      // which is where the design guide puts them ("arguments and result
-      // snippets stay behind expansion").
+      // The row toggles only ITS detail. The group's caret is about the whole
+      // activity; a tool's arguments and result are one level further down,
+      // which is where the design guide puts them.
       row.classList.add("has-detail");
       row.onclick = () => { d.hidden = !d.hidden; };
       d.hidden = true;
     }
-    d.textContent = detail;
+    renderDetail(d, detail, full || detail.length);
   }
   row.dataset.status = st || "";
   if (st === "completed" || st === "failed") {
@@ -289,6 +321,42 @@ function toolRow(id, title, st, detail) {
   } else if (st) { status(title || "工具执行中"); showPending(); }
   activitySummary();
   scroll();
+}
+
+// Clamp a tool result and let the reader open it, instead of cutting it and
+// hoping the middle did not matter. `full` is the value's TRUE length: when the
+// server hit its transport ceiling the tail never arrived, and saying so is the
+// difference between "there is more, here it is" and a value that just stops.
+const DETAIL_CLAMP = 1200;
+
+function renderDetail(pre, text, full) {
+  // A tool emits several `tool_call_update`s, and each one re-renders this
+  // block. Read back the reader's own choice first: without it, a detail they
+  // opened mid-run snapped shut the moment the tool reported progress.
+  let expanded = pre.dataset.expanded === "1";
+  pre.textContent = "";
+  const short = text.length > DETAIL_CLAMP;
+  const body = el("span", null, short ? text.slice(0, DETAIL_CLAMP) : text);
+  pre.appendChild(body);
+  if (!short && full <= text.length) return;
+
+  const more = el("button", "more");
+  const cut = full - text.length;          // never delivered
+  const setLabel = (expanded) => {
+    more.textContent = expanded
+      ? "收起"
+      : `显示全部（还有 ${full - DETAIL_CLAMP} 字${cut > 0 ? `，其中 ${cut} 字未传输` : ""}）`;
+  };
+  more.onclick = (e) => {
+    e.stopPropagation();                    // the row's own toggle must not fire
+    expanded = !expanded;
+    pre.dataset.expanded = expanded ? "1" : "0";
+    body.textContent = expanded ? text : text.slice(0, DETAIL_CLAMP);
+    setLabel(expanded);
+  };
+  if (expanded) body.textContent = text;
+  setLabel(expanded);
+  pre.appendChild(more);
 }
 
 /* ---------- approvals ---------- */
@@ -348,7 +416,7 @@ function apply(ev) {
       break;
     case "history_user": finalizeSeg(); addMsg("user", ev.text); break;
     case "delta": ev.thought ? appendThought(ev.text) : appendToken(ev.text); break;
-    case "tool": toolRow(ev.id, ev.title, ev.status, ev.detail); break;
+    case "tool": toolRow(ev.id, ev.title, ev.status, ev.detail, ev.detailFull); break;
     case "approval": showApproval(ev); break;
     case "approval_expired":
       S.awaitingPerm = false;
@@ -358,7 +426,11 @@ function apply(ev) {
     case "gap": finalizeSeg(); addMsg("note", "（断线期间有部分输出未能保留）"); break;
     case "end": endTurn(ev.error); break;
   }
-  if (ev.seq) { S.lastSeq = ev.seq; remember(S.streamId, ev.seq); }
+  // Only while a turn is actually live. `endTurn()` clears the saved cursor,
+  // and this line runs AFTER the switch that called it — so persisting
+  // unconditionally put the finished stream straight back into localStorage,
+  // and the next reload reattached to a turn that had nothing left to say.
+  if (ev.seq) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
 }
 
 function attach(streamId, afterSeq) {
@@ -407,6 +479,8 @@ function attach(streamId, afterSeq) {
 function detach() { if (S.es) { S.es.close(); S.es = null; } }
 
 function endTurn(error) {
+  // This session's transcript just grew; a cached copy would replay it short.
+  if (S.sessionId) HISTORY_CACHE.delete(S.sessionId);
   detach();
   clearPending();
   finalizeSeg();
@@ -451,6 +525,11 @@ async function loadSessions() {
   const ul = $("#sessions");
   ul.textContent = "";
   const rows = j.sessions || [];
+  // Adopt the id the server says is current. It is the only place the client
+  // can learn it for a conversation it did not open from the sidebar — a fresh
+  // one gets its id from hermes on its first turn — and without it those
+  // conversations all key their disclosure state to the same "-" bucket.
+  if (j.current) S.sessionId = j.current;
   $("#sess-count").textContent = rows.length ? String(rows.length) : "";
   rows.forEach((s) => {
     const li = el("li", s.id === j.current ? "sess cur" : "sess");
@@ -464,25 +543,53 @@ async function loadSessions() {
   });
 }
 
+// Transcripts already replayed in this page's lifetime. A switch back is then
+// a repaint, not a round trip — which matters because `session/load` costs
+// about a second: hermes re-registers the MCP server and rebuilds its whole
+// tool surface on EVERY load, regardless of how short the transcript is.
+const HISTORY_CACHE = new Map();
+
+function paintHistory(history) {
+  // Skip empty replayed messages. A turn that produced only a tool call, or was
+  // cancelled before its first token, leaves a text-less entry that renders as
+  // a blank bubble the reader cannot account for.
+  history
+    .filter((ev) => ev.kind !== "delta" || (ev.text || "").length)
+    .forEach(apply);   // history carries no seq — a finished transcript
+  finalizeSeg();
+}
+
 async function openSession(id) {
   if (S.busy) { status("先等待或停止当前回复"); return; }
   $("#messages").textContent = "";
-  S.tools.clear(); S.seg = null; S.activity = null;
+  S.tools.clear(); S.seg = null; S.activity = null; S.actIndex = 0; S.sessionId = id;
+
+  // Paint what we already have BEFORE asking the server. The request cannot be
+  // skipped even on a hit — it is what moves the ACP process to this session,
+  // and without it the next prompt would land on the previous one — but the
+  // reader does not have to wait for it to see the transcript. Sending is
+  // blocked until it lands, so the two can never disagree.
+  const cached = HISTORY_CACHE.get(id);
+  if (cached) paintHistory(cached);
+  S.switching = id;
+  status(cached ? "切换中…" : "载入中…");
+
   let j;
   try {
     j = await (await fetch("/api/session/load", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id }),
     })).json();
-  } catch (_) { status("载入会话失败"); return; }
+  } catch (_) {
+    S.switching = null; status("载入会话失败"); return;
+  }
+  S.switching = null;
   if (j.error) { status(`载入失败: ${j.error}`); return; }
-  // Skip empty replayed messages. A turn that produced only a tool call, or was
-  // cancelled before its first token, leaves a text-less entry that renders as
-  // a blank bubble the reader cannot account for.
-  (j.history || [])
-    .filter((ev) => ev.kind !== "delta" || (ev.text || "").length)
-    .forEach(apply);   // history carries no seq — a finished transcript
-  finalizeSeg();
+  // A switch the reader started and then abandoned: they are looking at another
+  // session now, so painting this one's history would corrupt what they see.
+  if (S.sessionId !== id) return;
+  HISTORY_CACHE.set(id, j.history || []);
+  if (!cached) paintHistory(j.history || []);
   status("就绪");
   loadSessions();
 }
@@ -496,7 +603,7 @@ async function newSession() {
   if (S.busy) { status("先等待或停止当前回复"); return; }
   await fetch("/api/session/new", { method: "POST" }).catch(() => {});
   $("#messages").textContent = "";
-  S.seg = null; S.tools.clear();
+  S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
   status("就绪");
   loadSessions();
 }
@@ -515,6 +622,7 @@ async function send() {
     return;
   }
   if (S.busy) return;
+  if (S.switching) { status("正在切换会话，稍候"); return; }
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
   S.seg = null;
@@ -558,6 +666,31 @@ async function boot() {
       } else forget();
     } catch (_) { forget(); }
   }
+
+  // The architecture note. Fetched on first open, not inlined: it is prose that
+  // changes on its own schedule, and a reader who never opens it should not pay
+  // for it.
+  let aboutLoaded = false;
+  const openAbout = async () => {
+    const box = $("#about");
+    if (!aboutLoaded) {
+      try {
+        box.querySelector("#about-body").innerHTML = renderMD(
+          await (await fetch("/static/about.md")).text()
+        );
+        aboutLoaded = true;
+      } catch (_) {
+        box.querySelector("#about-body").textContent = "架构说明加载失败";
+      }
+    }
+    box.hidden = false;
+  };
+  $("#about-btn").onclick = openAbout;
+  $("#about-close").onclick = () => { $("#about").hidden = true; };
+  $("#about").onclick = (e) => { if (e.target.id === "about") $("#about").hidden = true; };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("#about").hidden) $("#about").hidden = true;
+  });
 
   $("#new-session").onclick = newSession;
   // Cmd/Ctrl+K from anywhere, including the composer -- the shortcut is useless

@@ -14,6 +14,7 @@
   <header>
     <button id="new-session" class="btn" title="新建会话">＋ 新会话</button>
     <span class="spacer"></span>
+    <button id="about-btn" class="btn ghost" title="架构说明">架构</button>
     <div class="meta">
       <span id="mcp-badge"></span>
       <span id="model-badge"></span>
@@ -37,6 +38,15 @@
         <button id="send" type="submit" class="btn">发送</button>
       </form>
     </section>
+  </div>
+
+  <!-- The architecture note. Hidden markup rather than a fetched fragment for
+       the shell; the prose itself is fetched on first open. -->
+  <div id="about" hidden>
+    <div class="about-panel">
+      <button id="about-close" title="关闭">×</button>
+      <div id="about-body" class="md"></div>
+    </div>
   </div>
 </div>
 

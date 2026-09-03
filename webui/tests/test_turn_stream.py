@@ -499,3 +499,327 @@ def test_the_client_renders_a_loaded_transcript_in_full():
     script = Path(__file__).parent / "js" / "render_finalize.mjs"
     r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-400:]
+
+
+def test_a_tool_update_does_not_rename_the_tool():
+    """ACP's `kind` is a CATEGORY (other/read/search), not a name.
+
+    Using it as a title fallback let a tool_call_update -- which carries no
+    title -- rename `mcp_buda_corpus_search_docs` to "other" the moment it
+    completed, so the transcript credited the work to a tool that does not
+    exist.
+    """
+    call = srv._to_event({"sessionUpdate": "tool_call", "toolCallId": "t1",
+                          "title": "mcp_buda_corpus_search_docs", "status": "pending"})
+    assert call[1]["title"] == "mcp_buda_corpus_search_docs"
+
+    upd = srv._to_event({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                         "kind": "other", "status": "completed"})
+    assert upd[1]["title"] == "", "an update with no title must not assert one"
+
+
+def test_the_end_event_is_appended_while_the_stream_still_reads_as_running():
+    """The invariant the SSE reader depends on.
+
+    That reader drains the backlog and only then tests `running`. If `finish()`
+    lowers the flag before appending the terminal event, a reader that samples
+    the flag in between exits with `end` still unread — the browser goes on
+    believing the turn is live and the banner sits on "接回中…" until
+    EventSource reconnects on its own schedule. Ablation: swap the two lines in
+    `finish()` and this goes red.
+    """
+    st = srv.TurnStream("s", None)
+    st.emit("delta", text="hi")
+
+    running_at_emit: list[bool] = []
+    inner = st.emit
+
+    def spy(kind: str, **data):
+        running_at_emit.append(st.running)
+        inner(kind, **data)
+
+    st.emit = spy  # type: ignore[method-assign]
+    st.finish()
+
+    assert running_at_emit == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_finished_stream_closes_after_delivering_its_end_event(
+    aiohttp_client, app
+):
+    """A finished stream hands over its whole backlog and then closes.
+
+    This pins the ordinary shape — every frame, terminating with `end`, plus the
+    `retry` hint. It does NOT distinguish the drain-loop shapes: both the old
+    loop and the new one drain before testing the flag, so it stays green under
+    that ablation. What pins the loop fix is
+    `test_a_turn_finishing_after_the_drain_list_is_fixed_still_sends_end`.
+    """
+    st = srv.TurnStream("gone", None)
+    st.emit("delta", text="partial")
+    st.running = False              # as if the flag had been lowered first
+    st.emit("end", error=None)
+    app["state"].streams["gone"] = st
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get("/api/chat/stream", params={"stream_id": "gone", "after_seq": 0})
+    body = (await resp.read()).decode()
+
+    kinds = [json.loads(ln[6:])["kind"] for ln in body.splitlines() if ln.startswith("data: ")]
+    assert kinds == ["delta", "end"]
+    assert "retry: " in body
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_resumes_from_last_event_id_not_the_stale_query(
+    aiohttp_client, app
+):
+    """EventSource reuses the URL it was constructed with, so `after_seq` is
+    frozen at attach time. Only `Last-Event-ID` knows where the reader got to;
+    without honouring it, every reconnect re-delivers the whole turn."""
+    st = srv.TurnStream("r", None)
+    for i in range(4):
+        st.emit("delta", text=f"t{i}")
+    st.finish()
+    app["state"].streams["r"] = st
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get(
+        "/api/chat/stream",
+        params={"stream_id": "r", "after_seq": 0},   # the stale opening position
+        headers={"Last-Event-ID": "3"},              # where the browser really is
+    )
+    body = (await resp.read()).decode()
+
+    texts = [
+        json.loads(ln[6:]).get("text")
+        for ln in body.splitlines() if ln.startswith("data: ")
+    ]
+    assert texts == ["t3", None]  # only the delta it missed, then `end`
+
+
+@pytest.mark.asyncio
+async def test_a_turn_finishing_after_the_drain_list_is_fixed_still_sends_end(
+    aiohttp_client, app
+):
+    """The actual race behind a stuck "接回中…".
+
+    `stream.after()` materialises its list before the send loop awaits, so a turn
+    that calls `finish()` during one of those writes lands its terminal event
+    OUTSIDE the current pass. A reader that then breaks on the `running` flag
+    hangs up with `end` undelivered — and the browser, still believing the turn
+    is live, sits on the reconnect banner until EventSource retries on its own
+    schedule. (hermes-webui hit the same shape from the other direction: a
+    terminal event dropped at the resume boundary stalls the reader on
+    keepalives.)
+
+    Reproduced by finishing the stream from inside `after()`, immediately after
+    the list it returns has been built — the exact interleaving, without having
+    to win a race.
+
+    This no longer reddens on the drain-loop shape alone: the synthetic `end`
+    the flag path now sends covers delivery here too. What it still pins is that
+    the terminal frame arrives PROMPTLY — the 5 s read timeout fails if it waits
+    for a heartbeat.
+    """
+    st = srv.TurnStream("race", None)
+    st.emit("delta", text="a")
+    app["state"].streams["race"] = st
+
+    inner_after, calls = st.after, 0
+
+    def after(seq: int):
+        nonlocal calls
+        out = inner_after(seq)
+        calls += 1
+        if calls == 1:
+            st.finish()  # lands after `out` was built, so it is not in this pass
+        return out
+
+    st.after = after  # type: ignore[method-assign]
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get(
+        "/api/chat/stream", params={"stream_id": "race", "after_seq": 0}
+    )
+    body = (await asyncio.wait_for(resp.read(), 5)).decode()
+
+    kinds = [
+        json.loads(ln[6:])["kind"]
+        for ln in body.splitlines() if ln.startswith("data: ")
+    ]
+    assert kinds == ["delta", "end"], f"the terminal event was dropped: {kinds}"
+
+
+@pytest.mark.asyncio
+async def test_a_cursor_ahead_of_the_stream_replays_instead_of_skipping(
+    aiohttp_client, app
+):
+    """A stale id from a previous process must not become the resume point.
+
+    Adopting it would skip every frame below it — the terminal event included —
+    and leave the reader waiting on keepalives for a turn that already ended.
+    """
+    st = srv.TurnStream("ahead", None)
+    st.emit("delta", text="only")
+    st.finish()
+    app["state"].streams["ahead"] = st
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get(
+        "/api/chat/stream",
+        params={"stream_id": "ahead", "after_seq": 0},
+        headers={"Last-Event-ID": "99999"},
+    )
+    body = (await resp.read()).decode()
+
+    kinds = [
+        json.loads(ln[6:])["kind"]
+        for ln in body.splitlines() if ln.startswith("data: ")
+    ]
+    assert kinds == ["delta", "end"]
+
+
+@pytest.mark.asyncio
+async def test_a_reader_that_arrives_caught_up_is_still_told_the_turn_ended(
+    aiohttp_client, app
+):
+    """The reload path, and the one that leaves the banner stuck for real.
+
+    A page reload reattaches at the cursor it last saw. If that turn finished
+    while the page was away, the reader arrives with nothing outstanding — and
+    a handler that just closes has told it nothing, so the browser goes on
+    believing the turn is live and EventSource reconnects forever, every 750 ms,
+    with the composer locked. The endpoint owes every reader a terminal frame,
+    whatever is left in the backlog. Ablation: drop the synthetic `end` from the
+    flag-break path and this goes red.
+    """
+    st = srv.TurnStream("caught-up", None)
+    st.emit("delta", text="all of it")
+    st.finish()
+    app["state"].streams["caught-up"] = st
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get(
+        "/api/chat/stream", params={"stream_id": "caught-up", "after_seq": st.seq}
+    )
+    body = (await resp.read()).decode()
+
+    kinds = [
+        json.loads(ln[6:])["kind"]
+        for ln in body.splitlines() if ln.startswith("data: ")
+    ]
+    assert kinds == ["end"], f"a caught-up reader was told nothing: {body!r}"
+
+
+def test_a_finished_turn_does_not_leave_its_cursor_in_local_storage():
+    """The client half of the same bug.
+
+    `apply()` persists the cursor AFTER the switch, and the switch is where
+    `end` runs `endTurn()` -> `forget()`. Persisting unconditionally therefore
+    undid the forget one line later, and the next reload reattached to a stream
+    that had nothing left to send. Ablation: drop the `S.busy` guard and this
+    goes red.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    line = next(l for l in src.splitlines() if "remember(S.streamId, ev.seq)" in l)
+    assert "S.busy" in line, (
+        "apply() persists the stream cursor unconditionally; `end` clears it "
+        f"earlier in the same call and this line writes it back: {line.strip()}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_finishing_between_the_drain_and_the_flag_check_delivers(
+    aiohttp_client, app
+):
+    """The materialisation window, one branch further down.
+
+    The flag path synthesises a terminal frame for a reader with nothing
+    outstanding. But `after()` fixed its list before this pass, so a turn that
+    finished during it left real events behind — and synthesising `end` without
+    re-reading would hang up on them. Ablation: drop the `if stream.after(after):
+    continue` guard and the delta never reaches the reader.
+    """
+    assert srv.SSE_HEARTBEAT_SEC >= 10, "the timeout below must be well under it"
+    st = srv.TurnStream("wakeup", None)
+    app["state"].streams["wakeup"] = st
+
+    inner_after, fired = st.after, False
+
+    def after(seq: int):
+        nonlocal fired
+        out = inner_after(seq)
+        if not out and not fired:      # the reader is about to park
+            fired = True
+            st.emit("delta", text="late")
+            st.finish()
+        return out
+
+    st.after = after  # type: ignore[method-assign]
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get(
+        "/api/chat/stream", params={"stream_id": "wakeup", "after_seq": 0}
+    )
+    body = (await asyncio.wait_for(resp.read(), 5)).decode()
+
+    assert fired, "the window was never entered; the test proves nothing"
+    kinds = [
+        json.loads(ln[6:])["kind"]
+        for ln in body.splitlines() if ln.startswith("data: ")
+    ]
+    assert kinds == ["delta", "end"], kinds
+
+
+@pytest.mark.asyncio
+async def test_an_event_emitted_between_the_drain_and_the_park_is_not_slept_through(
+    aiohttp_client, app
+):
+    """The lost-wakeup window, and why the reader takes the bell up front.
+
+    `emit()` sets the current wakeup and then swaps in a fresh one. A reader
+    that reads the backlog, finds it empty, and only THEN reaches for
+    `stream._bell` is handed the replacement — while the wakeup meant for it has
+    already gone off. It sleeps the full heartbeat with the event sitting in the
+    deque. Taking the bell BEFORE reading the backlog closes that: whatever is
+    emitted after the snapshot rings the object the reader is holding.
+
+    Unlike the test above, this one leaves the stream RUNNING at the window, so
+    the reader actually parks — which is the only state where the bell matters.
+    Ablation: await `stream.wait()` instead of the snapshot and the reader sleeps
+    until the heartbeat, failing the 5 s read timeout.
+    """
+    assert srv.SSE_HEARTBEAT_SEC >= 10, "the timeout below must be well under it"
+    st = srv.TurnStream("park", None)
+    app["state"].streams["park"] = st
+
+    inner_after, hits = st.after, 0
+
+    def after(seq: int):
+        nonlocal hits
+        out = inner_after(seq)
+        if not out:
+            hits += 1
+            if hits == 1:
+                st.emit("delta", text="late")   # stream stays running -> park
+            elif hits == 2:
+                st.finish()
+        return out
+
+    st.after = after  # type: ignore[method-assign]
+
+    cli = await aiohttp_client(app)
+    resp = await cli.get(
+        "/api/chat/stream", params={"stream_id": "park", "after_seq": 0}
+    )
+    body = (await asyncio.wait_for(resp.read(), 5)).decode()
+
+    assert hits >= 2, "the reader never parked; the test proves nothing"
+    kinds = [
+        json.loads(ln[6:])["kind"]
+        for ln in body.splitlines() if ln.startswith("data: ")
+    ]
+    assert kinds == ["delta", "end"], kinds
+    assert ": keepalive" not in body, "the reader slept through its own wakeup"

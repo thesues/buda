@@ -198,9 +198,13 @@ class TurnStream:
 
     def finish(self, error: str | None = None) -> None:
         self.error = error
-        self.running = False
         self.finished_at = time.time()
+        # Emit BEFORE lowering `running`. A reader's loop drains, then tests
+        # `running`; lowering it first opens a window where the reader breaks out
+        # with the terminal event still unread, and the browser is left believing
+        # the turn is live until EventSource reconnects on its own schedule.
         self.emit("end", error=error)
+        self.running = False
 
     def after(self, seq: int) -> list[dict]:
         return [e for s, e in self.events if s > seq]
@@ -210,6 +214,16 @@ class TurnStream:
         if not self.dropped or not self.events:
             return False
         return seq < self.events[0][0] - 1
+
+    def bell(self) -> asyncio.Event:
+        """The wakeup that is current RIGHT NOW.
+
+        A reader must take this before reading the backlog and await the object
+        it took, not `self._bell` at park time: `emit()` sets the current bell
+        and then replaces it, so re-reading the attribute later can hand back a
+        fresh, never-to-be-set Event while the wakeup it was meant to catch has
+        already gone off."""
+        return self._bell
 
     async def wait(self) -> None:
         await self._bell.wait()
@@ -629,7 +643,12 @@ def _to_event(update: dict) -> tuple[str, dict] | None:
     if kind in ("tool_call", "tool_call_update"):
         return ("tool", {
             "id": update.get("toolCallId"),
-            "title": update.get("title") or update.get("kind") or ("tool" if kind == "tool_call" else ""),
+            # `kind` is ACP's tool CATEGORY (other/read/search), not a name. Using
+            # it as a fallback let a tool_call_update -- which carries no title --
+            # rename an identified tool to "other" halfway through. An update with
+            # no title says nothing about the name, so it sends nothing and the
+            # client keeps what it had.
+            "title": update.get("title") or ("tool" if kind == "tool_call" else ""),
             "status": update.get("status") or ("pending" if kind == "tool_call" else ""),
             "detail": (_d := _tool_detail(update))[0],
             "detailFull": _d[1],
@@ -732,20 +751,84 @@ async def handle_chat_stream(request: web.Request) -> web.StreamResponse:
     await resp.prepare(request)
 
     async def send(obj: dict) -> None:
-        await resp.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
+        # `id:` lets the browser resume by itself: EventSource replays the last id
+        # it saw as `Last-Event-ID` on reconnect. Without it a reconnect reuses the
+        # URL's original `after_seq` and re-delivers the whole turn.
+        await resp.write(
+            b"id: " + str(obj.get("seq", 0)).encode()
+            + b"\ndata: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n"
+        )
+
+    # A browser reconnect carries where it actually got to; the query parameter is
+    # only the opening position of a fresh attach.
+    resumed = request.headers.get("Last-Event-ID")
+    if resumed:
+        try:
+            cursor = int(resumed)
+        except ValueError:
+            cursor = -1
+        # Fail closed on a cursor we cannot honour. One that is unparseable or
+        # AHEAD of what this stream ever emitted (a stale id from a previous
+        # process, a foreign stream) must not be adopted: doing so would skip
+        # every frame up to it, the terminal event included, and leave the reader
+        # stalled on keepalives. Replaying is cheap; a silent hole is not.
+        after = cursor if 0 <= cursor <= stream.seq else after
+
+    # Chrome's default reconnect delay is 3s. Everything here is one hop away, so
+    # a stall that long is all overhead.
+    await resp.write(b"retry: 750\n\n")
+
+    async def _close(r: web.StreamResponse) -> web.StreamResponse:
+        with contextlib.suppress(Exception):
+            await r.write_eof()
+        return r
 
     if stream.gap_before(after):
         await send({"kind": "gap", "seq": after,
                     "text": "some output was dropped while disconnected"})
     try:
         while True:
-            for ev in stream.after(after):
-                await send(ev)
-                after = ev["seq"]
+            # Snapshot the bell BEFORE reading the backlog. `emit()` sets the
+            # current bell and then swaps in a fresh one, so a wakeup that lands
+            # between the read below and the park at the bottom would be rung on
+            # an Event nobody is holding, and this reader would sleep until the
+            # heartbeat with the event already sitting in the deque.
+            bell = stream.bell()
+
+            # Drain, then loop back to drain again. `after()` fixes its list
+            # before the first write awaits, so a turn that finishes during one
+            # of those writes lands its terminal event OUTSIDE this pass. Park
+            # only when there is genuinely nothing pending.
+            pending = stream.after(after)
+            if pending:
+                for ev in pending:
+                    await send(ev)
+                    after = ev["seq"]
+                    if ev["kind"] == "end":
+                        return await _close(resp)
+                continue
+
             if not stream.running:
+                # Nothing pending and the turn is over — and because the branch
+                # above returns the moment it writes `end`, reaching here means
+                # this reader has been sent no terminal frame. That is the
+                # ordinary reload: the client reattaches at the cursor it last
+                # saw, so a turn that finished while the page was away leaves it
+                # with nothing outstanding. Closing silently would leave the
+                # browser believing the turn is live, reconnecting every 750 ms
+                # with the composer locked. Every reader leaves this endpoint
+                # having been told the turn ended.
+                # Re-read before concluding there is nothing left. The list
+                # above was fixed before its writes awaited, so a turn that
+                # finished during them left its own events behind this pass —
+                # the same materialisation window, one branch further down.
+                if stream.after(after):
+                    continue
+                await send({"kind": "end", "seq": stream.seq, "error": stream.error})
                 break
+
             try:
-                await asyncio.wait_for(stream.wait(), timeout=SSE_HEARTBEAT_SEC)
+                await asyncio.wait_for(bell.wait(), timeout=SSE_HEARTBEAT_SEC)
             except asyncio.TimeoutError:
                 # A comment line: EventSource ignores it, proxies see traffic.
                 await resp.write(b": keepalive\n\n")

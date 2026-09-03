@@ -6,9 +6,9 @@
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-  --bg:#0a0a0b; --surface:#131315; --surface-raised:#1a1a1d;
-  --border:#2a2a2e; --border-active:#4a4a50;
-  --text:#e8e6e3; --text-dim:#7a7880; --text-muted:#4a4850;
+  --bg:#0b0a09; --surface:#221e18; --surface-raised:#2d2820;
+  --border:#3a342b; --border-active:#5a5145;
+  --text:#ece8e1; --text-dim:#9a9184; --text-muted:#6b6357;
   --accent:#c5a05e; --accent-dim:#8a7040;
   --success:#6fae7f; --danger:#cf8f8f;
   --radius:6px;
@@ -41,15 +41,33 @@ body {
    `scale(1.1)` hides the soft edges a 60px blur leaves at the viewport border. */
 body::after {
   content:''; position:fixed; inset:0; z-index:-1; pointer-events:none;
-  background:url("/static/img/mural.jpg") center/cover no-repeat;
-  filter:blur(60px) saturate(0.75) brightness(0.42);
-  transform:scale(1.1);
-  opacity:.55;
+  /* `?v=` because the file changed under its own name: a browser holding the
+     first, much darker cut would keep showing it. */
+  background:url("/static/img/mural.jpg?v=4") center 30%/cover no-repeat;
+  /* The asset is already blurred and brightness-lifted at encode time, so what
+     is left here is a small blur to hide JPEG blocking at this upscale. It is
+     deliberately NOT dimmed much further: the painting is dark earth pigment to
+     begin with, and the earlier brightness(0.42) on top of that put it below
+     the point where a viewer could see it at all. The cards above carry their
+     own near-opaque background, so contrast does not depend on this layer. */
+  filter:blur(2px) brightness(0.82);
+  transform:scale(1.04);
+  opacity:.8;
 }
-/* A scrim over the mural so text contrast never depends on which part of the
-   painting happens to sit behind it. */
 body { position:relative; }
+/* A scrim over the mural so text contrast never depends on which part of the
+   painting happens to sit behind it. It belongs to `.shell` because `.shell` is
+   a stacking context: a z-index:-1 child of it lands above the mural (which is
+   in the ROOT context) and below every pixel of the interface. */
 .shell { position:relative; z-index:1; }
+.shell::before {
+  content:''; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:
+    radial-gradient(130% 100% at 50% 0%,
+      transparent 0%,
+      color-mix(in srgb, var(--bg) 22%, transparent) 60%,
+      color-mix(in srgb, var(--bg) 55%, transparent) 100%);
+}
 
 /* Grain. Fixed, 3%, pointer-events:none — texture, never interaction. */
 body::before {
@@ -81,8 +99,8 @@ header h1 em { color:var(--accent); font-style:italic; }
         gap:1.2rem; align-items:stretch; flex:1; min-height:0; }
 @media (max-width:820px){ .grid { grid-template-columns:1fr; } .sessions { display:none; } }
 
-.card { background:color-mix(in srgb, var(--surface) 88%, transparent);
-        backdrop-filter:blur(6px); border:1px solid var(--border); border-radius:var(--radius);
+.card { background:color-mix(in srgb, var(--surface) 68%, transparent);
+        backdrop-filter:blur(14px) saturate(0.9); border:1px solid var(--border); border-radius:var(--radius);
         display:flex; flex-direction:column; min-height:0; overflow:hidden; }
 .card-head { padding:0.7rem 1rem; border-bottom:1px solid var(--border);
              font-size:0.62rem; text-transform:uppercase; letter-spacing:0.15em;
@@ -217,3 +235,27 @@ header h1 em { color:var(--accent); font-style:italic; }
 .msg.bot .bubble.md { font-family:var(--serif); font-size:0.95rem; line-height:1.8; }
 .md code, .md pre { font-family:var(--mono); }
 .msg.user .bubble { font-family:var(--sans); }
+
+.act-detail .more { display:block; margin-top:0.4rem; background:none; border:0;
+                    color:var(--accent); font-family:var(--sans); font-size:0.68rem;
+                    cursor:pointer; padding:0; text-align:left; }
+.act-detail .more:hover { text-decoration:underline; }
+
+/* ---------- architecture note ---------- */
+.btn.ghost { background:transparent; border-color:var(--border); color:var(--text-dim); }
+.btn.ghost:hover { color:var(--accent); border-color:var(--accent-dim); background:transparent; }
+#about[hidden] { display:none; }
+#about { position:fixed; inset:0; z-index:50; display:flex; align-items:center;
+         justify-content:center; padding:2rem 1rem;
+         background:color-mix(in srgb, var(--bg) 78%, transparent); backdrop-filter:blur(3px); }
+.about-panel { position:relative; width:min(760px,100%); max-height:86vh; overflow-y:auto;
+               background:var(--surface); border:1px solid var(--border);
+               border-radius:var(--radius); padding:2rem 2.2rem;
+               scrollbar-width:thin; scrollbar-color:var(--border) transparent; }
+.about-panel::-webkit-scrollbar { width:4px; }
+.about-panel::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+#about-close { position:absolute; right:0.8rem; top:0.6rem; background:none; border:0;
+               color:var(--text-muted); font-size:1.3rem; line-height:1; cursor:pointer; }
+#about-close:hover { color:var(--text); }
+#about-body { font-family:var(--serif); font-size:0.95rem; line-height:1.85; }
+#about-body pre { font-family:var(--mono); font-size:0.72rem; line-height:1.45; }
