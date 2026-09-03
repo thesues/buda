@@ -77,15 +77,25 @@ header h1 em { color:var(--accent); font-style:italic; }
 
 /* ---------- sessions ---------- */
 #sessions { list-style:none; overflow-y:auto; padding:0.4rem; flex:1; min-height:0; }
-.sess { position:relative; padding:0.55rem 1.6rem 0.55rem 0.65rem; border-radius:var(--radius);
-        cursor:pointer; transition:background .12s var(--ease); }
+.sess { position:relative; padding:0.55rem 0.65rem; border-radius:var(--radius);
+        cursor:pointer; transition:background .12s var(--ease);
+        /* A flex/grid child's default min-width is `auto`, i.e. its content --
+           so text-overflow:ellipsis below never fires and a long title pushes
+           the column wider instead of truncating. */
+        min-width:0; }
 .sess:hover { background:var(--surface-raised); }
 .sess.cur { background:var(--surface-raised); box-shadow:inset 2px 0 0 var(--accent); }
 .sess .t { font-size:0.78rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .sess .p { font-size:0.68rem; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.sess .del { position:absolute; right:0.4rem; top:0.45rem; border:0; background:none;
-             color:var(--text-muted); cursor:pointer; font-size:0.9rem; line-height:1; opacity:0; }
-.sess:hover .del { opacity:1; }
+/* The delete button rides in an OVERLAY, not in the flow: reserving space for
+   it truncated every title by its width even while it was invisible. It fades
+   in over a gradient so the text it covers does not just get cut. */
+.sess .del { position:absolute; right:0; top:0; bottom:0; width:2.4rem; border:0;
+             padding-right:0.45rem; text-align:right;
+             background:linear-gradient(to right, transparent, var(--surface-raised) 45%);
+             color:var(--text-muted); cursor:pointer; font-size:0.95rem; line-height:1;
+             opacity:0; transition:opacity .12s var(--ease); }
+.sess:hover .del, .sess:focus-within .del { opacity:1; }
 .sess .del:hover { color:var(--danger); }
 
 /* ---------- messages ---------- */

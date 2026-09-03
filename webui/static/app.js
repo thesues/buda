@@ -368,7 +368,12 @@ async function openSession(id) {
     })).json();
   } catch (_) { status("载入会话失败"); return; }
   if (j.error) { status(`载入失败: ${j.error}`); return; }
-  (j.history || []).forEach(apply);   // history carries no seq — a finished transcript
+  // Skip empty replayed messages. A turn that produced only a tool call, or was
+  // cancelled before its first token, leaves a text-less entry that renders as
+  // a blank bubble the reader cannot account for.
+  (j.history || [])
+    .filter((ev) => ev.kind !== "delta" || (ev.text || "").length)
+    .forEach(apply);   // history carries no seq — a finished transcript
   finalizeSeg();
   status("就绪");
   loadSessions();
@@ -445,6 +450,14 @@ async function boot() {
   }
 
   $("#new-session").onclick = newSession;
+  // Cmd/Ctrl+K from anywhere, including the composer -- the shortcut is useless
+  // if you have to leave the box you are typing in to reach it.
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      newSession();
+    }
+  });
   $("#send").onclick = (e) => {
     if (!S.busy) return;                    // not busy: let the form submit
     e.preventDefault();

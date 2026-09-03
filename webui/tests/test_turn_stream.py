@@ -257,3 +257,85 @@ async def test_an_acp_ok_reply_is_returned_unchanged():
 
     acp._write = fake_write
     assert await acp._request("session/new", {}) == {"sessionId": "s-1"}
+
+
+# --- Regressions, one per failure actually observed against a live stack. -----
+# Named after what they pin, in the upstream hermes-webui convention: a test
+# whose name says which bug it is stops anyone from "simplifying" it away.
+
+@pytest.mark.asyncio
+async def test_an_oversized_acp_frame_is_actually_read():
+    """asyncio caps a line at 64 KiB and RAISES past it -- it does not truncate.
+
+    An MCP tool result carrying document text blew through that: the read loop
+    died and the turn ended with no output and no error. This drives a REAL
+    subprocess emitting a 1 MiB JSON-RPC line through the production spawn
+    settings, because a test that greps the source for `limit=` proves only that
+    the string is present.
+    """
+    # Build the payload IN the child: a 1 MiB argv blows past ARG_MAX.
+    prog = (
+        "import json,sys;"
+        "sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':1,"
+        "'result':{'t':'x'*(1024*1024)}})+chr(10));"
+        "sys.stdout.flush()"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", prog,
+        stdout=asyncio.subprocess.PIPE, limit=srv.ACP_LINE_LIMIT,
+    )
+    line = await asyncio.wait_for(proc.stdout.readline(), timeout=10)
+    await proc.wait()
+    msg = json.loads(line)
+    assert len(msg["result"]["t"]) == 1024 * 1024, "the whole frame must survive"
+
+
+@pytest.mark.asyncio
+async def test_the_default_limit_would_have_lost_that_frame():
+    """The ablation: at asyncio's default the same line raises rather than truncating.
+
+    This is what makes the fix load-bearing rather than decorative.
+    """
+    # Build the payload IN the child: a 1 MiB argv blows past ARG_MAX.
+    prog = (
+        "import json,sys;"
+        "sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':1,"
+        "'result':{'t':'x'*(1024*1024)}})+chr(10));"
+        "sys.stdout.flush()"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", prog, stdout=asyncio.subprocess.PIPE,   # default 64 KiB
+    )
+    with pytest.raises((ValueError, asyncio.LimitOverrunError)):
+        await asyncio.wait_for(proc.stdout.readline(), timeout=10)
+    proc.kill()
+    await proc.wait()
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_server_is_declared_with_its_union_discriminator(aiohttp_client, app):
+    """`type` and `headers` are both required, and omitting either is silent.
+
+    `session/new` takes `HttpMcpServer`, which subclasses `McpServerHttp` ONLY to
+    add `type: Literal["http"]`; `headers` has no default. Sending the parent's
+    shape is rejected outright (-32602), and sending nothing at all yields an
+    agent with no tools while `hermes mcp list` still reports the server enabled.
+    """
+    old = (srv.MEMORY_MCP_URL, srv.MEMORY_MCP_NAME)
+    srv.MEMORY_MCP_URL, srv.MEMORY_MCP_NAME = "http://example:5100/mcp", "corpus"
+    try:
+        entry = srv._acp_mcp_servers()[0]
+    finally:
+        srv.MEMORY_MCP_URL, srv.MEMORY_MCP_NAME = old
+    assert entry["type"] == "http", "the union discriminator"
+    assert entry["headers"] == [], "required, no default"
+    assert entry["name"] == "corpus" and entry["url"].endswith("/mcp")
+
+
+def test_no_mcp_url_declares_no_servers():
+    old = srv.MEMORY_MCP_URL
+    srv.MEMORY_MCP_URL = ""
+    try:
+        assert srv._acp_mcp_servers() == []
+    finally:
+        srv.MEMORY_MCP_URL = old
