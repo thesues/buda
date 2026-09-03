@@ -114,6 +114,16 @@ spec:
             - { name: MEMORY_MCP_NAME, value: "memory" }
             - { name: LLM_BASE_URL, value: "http://freetoken:1919/v1" }
             - { name: LLM_MODEL, value: "dsv4-flash" }
+            # What this deployment is for. Appended to a session's first prompt.
+            # Left unset it falls back to the same text in server.py; set it here
+            # to change the agent's brief without rebuilding the image.
+            - name: CHAT_DIRECTIVE
+              value: |
+                你是佛教典籍的检索助手，工作是从已索引的语料库中找出依据来回答问题。
+                - 凡涉及经文内容的问题，先用语料库工具检索，不要凭记忆作答。
+                - 回答时给出经名与原文引文，并标出出处（文件 › 标题路径 › 行号）。
+                - 语料库里没有的，直说没有；可以补充常识背景，但要注明那不是来自语料库。
+                - 简明作答，通常几段以内。除非明确要求，不要写长文、不要综述式铺陈。
             # Single-user HTTP Basic. Leave AUTH_USER empty to disable; the app
             # refuses to start with a user set and an empty password rather than
             # running with a credential that can never match.

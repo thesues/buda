@@ -106,9 +106,21 @@ SSE_HEARTBEAT_SEC = 25
 # for a sentence.
 ACP_LINE_LIMIT = 32 * 1024 * 1024
 
+# Appended to the first prompt of a session, never prepended: the session's
+# auto-title is taken from its opening words, and a prepended block titles every
+# conversation after the directive instead of after the question.
+#
+# It says what this deployment is FOR. The default it replaced was inherited
+# from a coding console ("use fenced code blocks with a language tag") and
+# steered the agent toward long prose, which is the opposite of what a scripture
+# lookup wants.
 CHAT_DIRECTIVE = os.environ.get(
     "CHAT_DIRECTIVE",
-    "请用简洁的 Markdown 回答；代码用围栏代码块并标注语言。",
+    "你是佛教典籍的检索助手，工作是从已索引的语料库中找出依据来回答问题。\n"
+    "- 凡涉及经文内容的问题，先用语料库工具检索，不要凭记忆作答。\n"
+    "- 回答时给出经名与原文引文，并标出出处（文件 › 标题路径 › 行号）。\n"
+    "- 语料库里没有的，直说没有；可以补充常识背景，但要注明那不是来自语料库。\n"
+    "- 简明作答，通常几段以内。除非明确要求，不要写长文、不要综述式铺陈。",
 )
 
 
