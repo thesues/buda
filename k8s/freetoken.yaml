@@ -149,6 +149,19 @@ spec:
           command: ["sh","-c","cp /usr/local/bin/autumn-fuse /fusebin/ && chmod +x /fusebin/autumn-fuse"]
           volumeMounts:
             - { name: fusebin, mountPath: /fusebin }
+          # Requests == limits, integer CPU, on the INIT container too. QoS is a
+          # property of the whole pod: one container without both set makes the
+          # pod Burstable however carefully the app container is specced — and
+          # that is what this was, silently, while its resources were `{}`.
+          #
+          # It matters because `cpu-manager-policy=static` hands exclusive cores
+          # only to Guaranteed pods with integer CPU. Without this the kubelet
+          # setting is inert here and the CPU-MoE threads keep roaming both NUMA
+          # nodes. Init resources do not add to the pod's scheduling footprint —
+          # that is max(init, sum(app)) — so this costs nothing.
+          resources:
+            requests: { cpu: "1", memory: 256Mi }
+            limits:   { cpu: "1", memory: 256Mi }
 
       containers:
         - name: freetoken
