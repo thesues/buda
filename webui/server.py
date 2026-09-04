@@ -1082,6 +1082,20 @@ def build_app() -> web.Application:
     app.router.add_post("/api/session/new", handle_session_new)
     app.router.add_post("/api/session/load", handle_session_load)
     app.router.add_delete(r"/api/session/{sid}", handle_session_delete)
+    # `must-revalidate` with a zero max-age: the browser may keep the file, but
+    # it has to ask before using it. aiohttp already sends an ETag, so a
+    # revalidation that finds nothing new costs one 304 and no body.
+    #
+    # Without this the browser applies heuristic freshness and serves a cached
+    # stylesheet after a deploy — the page comes back looking like the previous
+    # version, which reads as "the change did not ship" rather than as a cache
+    # hit. Cost is one conditional request per asset per load, on a UI that
+    # loads a handful of small files.
+    async def _no_stale_static(_req: web.Request, resp: web.StreamResponse) -> None:
+        if _req.path.startswith("/static/"):
+            resp.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
+
+    app.on_response_prepare.append(_no_stale_static)
     app.router.add_static("/static/", STATIC, show_index=False)
     return app
 

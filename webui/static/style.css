@@ -23,6 +23,13 @@
      paths and tool names. Everything in one monospace made a long sutra passage
      read like a log file. */
   --sans:-apple-system,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,sans-serif;
+  /* Prose. Latin gets the serif; CJK deliberately does NOT — fallback is
+     per-glyph, and neither Instrument Serif nor Georgia carries Chinese, so the
+     next entry decides. It used to be Songti SC: a printing face whose
+     horizontal strokes are hairlines. At 14px, weight 300, light-on-dark, those
+     hairlines are below what a screen can hold steady, and the eye refocuses on
+     every line. PingFang was drawn for screens and keeps an even stroke. */
+  --prose:'Instrument Serif',Georgia,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
   --ease:cubic-bezier(0.4,0,0.2,1);
   color-scheme: dark;
 }
@@ -31,10 +38,10 @@
 button:focus:not(:focus-visible), textarea:focus:not(:focus-visible) { outline:none; }
 @media (prefers-reduced-motion: reduce) { * { transition-duration:.01ms !important; animation:none !important; } }
 
-html { font-size:15px; }
+html { font-size:16px; }
 body {
   background:var(--bg); color:var(--text);
-  font-family:var(--sans); font-weight:300;
+  font-family:var(--sans); font-weight:400;
   height:100vh; overflow:hidden;
 }
 /* The Yuan-dynasty Bhaishajyaguru assembly from Guangsheng Lower Monastery
@@ -112,7 +119,7 @@ header h1 em { color:var(--accent); font-style:italic; }
    mural stays visible where it costs nothing — the margins, and the band above
    the cards — which is where background art belongs. */
 .card { background:color-mix(in srgb, var(--surface) 94%, transparent);
-        backdrop-filter:blur(14px) saturate(0.9); border:1px solid var(--border); border-radius:var(--radius);
+        border:1px solid var(--border); border-radius:var(--radius);
         display:flex; flex-direction:column; min-height:0; overflow:hidden; }
 .card-head { padding:0.7rem 1rem; border-bottom:1px solid var(--border);
              font-size:0.62rem; text-transform:uppercase; letter-spacing:0.15em;
@@ -155,7 +162,7 @@ header h1 em { color:var(--accent); font-style:italic; }
 /* ---------- messages ---------- */
 #messages { flex:1; overflow-y:auto; padding:1.2rem 1.1rem 0.4rem; min-height:0; }
 .msg { max-width:760px; margin:0 auto 0.9rem; }
-.bubble { font-size:0.86rem; line-height:1.7; overflow-wrap:anywhere; }
+.bubble { font-size:0.92rem; line-height:1.75; overflow-wrap:anywhere; }
 
 .msg.user .bubble { background:var(--surface-raised); border:1px solid var(--border);
                     border-radius:var(--radius); padding:0.6rem 0.85rem;
@@ -244,7 +251,8 @@ header h1 em { color:var(--accent); font-style:italic; }
               border:1px solid var(--border); border-radius:4px; }
 
 /* Assistant prose in serif; user text and controls stay sans. */
-.msg.bot .bubble.md { font-family:var(--serif); font-size:0.95rem; line-height:1.8; }
+.msg.bot .bubble.md { font-family:var(--prose); font-size:1rem; line-height:1.9;
+                      font-weight:400; }
 .md code, .md pre { font-family:var(--mono); }
 .msg.user .bubble { font-family:var(--sans); }
 
