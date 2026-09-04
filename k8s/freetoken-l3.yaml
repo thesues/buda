@@ -1,0 +1,445 @@
+# A SECOND FreeToken, built from the hicache-autumn branch, for validating the
+# L3 KV tier. A separate StatefulSet rather than a change to the production one:
+# `freetoken-0` keeps serving throughout, on its own GPU, from its own image.
+# The node has seven idle cards.
+#
+# The read path cannot be tested in the serving pod — its installed package is
+# PyPI freetoken 0.1.2, not this branch — so an image built from the branch is
+# the only way to exercise it. The experiment that has no other explanation:
+#
+#   1. send a long prompt; the writer persists its prefix to autumn
+#   2. DELETE this pod; VRAM goes with it, autumn keeps the pages
+#   3. send the SAME prompt to the replacement
+#   4. the log must show `#cached-token > 0` — after a restart L1 is empty, so a
+#      non-zero hit can only have come from L3
+#   5. ablation: drop --hicache-storage-backend and repeat; it must return to
+#      `#cached-token: 0`
+#
+# Step 4 carries the argument. An empty L1 is what makes the hit unambiguous;
+# without the restart a hit could just as well be VRAM.
+#
+# Two engines on one node contend for CPU-MoE — measured 1.68x rather than 2x,
+# and erratic (see the note in freetoken.yaml). Irrelevant here: this is a
+# correctness experiment, not a throughput one.
+# already carries autumn-fuse copied from its AUTUMN_IMAGE, so there is no
+# second image to keep in step.
+# (the WIRE lockstep rule — see this repo's README). Applied directly with
+# `kubectl apply -f`; this repo has no kustomization, and deliberately does not
+# reach into autumn-rs's overlay.
+#
+# ── Model: nvidia/MiniMax-M2.5-NVFP4, and why this one ────────────────────────
+# 130 GiB checkpoint, ~225B params. It is the only model on FreeToken's
+# supported list that satisfies all four constraints at once:
+#
+#   MoE + large                 225B, 256 routed experts x 62 layers, top-8
+#   fits 24 GB of VRAM          dense weights are only ~7.4 GiB — it has NO
+#                               shared experts (shared_intermediate_size=0),
+#                               which is what sinks the alternatives
+#   CPU-MoE format (hybrid)     nvfp4 is in moe/cpu_executor.py's whitelist;
+#                               an fp8 checkpoint cannot run experts on the CPU
+#                               at all and silently degrades to pure offload
+#   plain `radix` prefix cache  MiniMaxM2ForCausalLM has no SWA and no GDN, so
+#                               the engine does not rewrite --cache-type — which
+#                               is what keeps the HiCache port to one implementation
+#
+# The ones that did not survive the arithmetic: GLM-5.2-NVFP4 (433 GiB, ~53 GiB
+# dense) and GLM-4.7-NVFP4 (214 GiB, ~38 GiB dense) — their NVFP4 recipes exclude
+# embeddings, lm_head, attention and shared experts from quantization, and those
+# BF16 leftovers alone exceed the card. DeepSeek-V4-Flash fits the card (~10 GiB
+# dense) but is forced onto swa_radix, off the cheap HiCache path.
+#
+# ── Sizing ────────────────────────────────────────────────────────────────────
+#   expert banks (host)   256 experts x 62 layers x 3 x 3072 x 1536 x 0.5625 B
+#                         = 224.7B params -> ~118 GiB, pinned and non-reclaimable
+#   memory: 210Gi         sized for DeepSeek-V4-Flash: 155 GiB of expert banks
+#                         + one ~3 GiB shard in flight + torch/CUDA overhead.
+#                         (160Gi was MiniMax's 118 GiB banks; dsv4 does not fit
+#                         in it, and FreeToken asserts rather than degrading.)
+#   FREETOKEN_PIN_BUDGET_GB=170  caps cudaHostRegister just above the banks
+#   VRAM                  ~7.4 GiB dense + 256 expert slots x 7.59 MB (1.9 GB,
+#                         3.8 GB with prefill overlap) leaves ~10 GB for KV
+#   cpu: 32               one CPU-MoE worker per physical core; raise it if the
+#                         CPU half of hybrid is the bottleneck (node has 180)
+#
+# FreeToken — MoE serving on one RTX 4090, weights read from the autumn fs/ mount.
+#
+# Node is not a preference, it is a constraint: FreeToken needs driver r580+
+# (CUDA 13) and 192.168.3.2 (8× RTX 4090, driver 580.105.08) is the only node
+# that qualifies — 192.168.0.102 is a 4090D on driver 550 and cannot run it.
+# That node's CPU (Xeon 8457C) also carries avx512_bf16 + avx_vnni, which is the
+# top tier FreeToken's CPU-MoE kernel dispatches to.
+#
+# Hybrid execution keeps the routed experts in HOST RAM and computes part of
+# them on the CPU, so host memory sets the model ceiling and VRAM only has to
+# hold the dense weights, one layer's expert slots, and the KV pages.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: freetoken-l3
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-l3 }
+spec:
+  # ClusterIP, never a LoadBalancer: `ft serve` has NO authentication of any
+  # kind — no API key, no bearer, nothing in server/. Put an authenticating
+  # gateway in front of it before anything outside the cluster reaches it.
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-l3 }
+  ports:
+    - { name: http, port: 1919, targetPort: 1919 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: freetoken-l3
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-l3 }
+spec:
+  # One replica. A second was measured on this node and reverted: it gave 1.68x
+  # (10 requests in 21.8 s across two, against 36.6 s serialised on one), short
+  # of 2x and erratic — repeated runs of the same test came in at 0.91x, 0.94x,
+  # and twice at 4-5x slow on one replica alone.
+  #
+  # The reason is not the GPUs. DSV4 resolves to `moe_backend='hybrid'`, and the
+  # calibration table says only 31.2% of expert misses cross PCIe (CPU-MoE
+  # 37.8 GB/s vs PCIe 17.2 GB/s at 12.75 MB per expert) — the bulk of the expert
+  # work is on the CPU. Host-to-device bandwidth is nowhere near the limit:
+  # 23.3 GiB/s per card alone, 46.6 GiB/s across two, scaling perfectly, while
+  # inference draws about 6 GB/s and the GPUs sit at 18-47% SM.
+  #
+  # So the shared resource is CPU and host memory bandwidth, and CPU-MoE assumes
+  # one NUMA node with its threads pinned to physical cores. Getting that needs
+  # `cpu-manager-policy=static` on the kubelet, which is a node-pool setting —
+  # and the init container's resources below, without which this pod is
+  # Burstable and the kubelet policy would not apply to it anyway.
+  replicas: 1
+  # A StatefulSet, for the volumeClaimTemplate below -- and its default rollout
+  # is what a single-GPU workload needs anyway: it terminates the old pod before
+  # creating its replacement, where a Deployment would have to be told
+  # `Recreate` to stop a surge-first rollout deadlocking on the card.
+  serviceName: freetoken-l3
+  selector:
+    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-l3 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-l3 }
+    spec:
+      # K8s injects AUTUMN_MANAGER_PORT=tcp://<ip>:9001 from the ClusterIP
+      # Service, which collides with the entrypoint's own env convention.
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.3.2"
+
+      # ── One container, not a fuse sidecar ────────────────────────────────
+      # This was a native-sidecar + `mountPropagation: Bidirectional` pair. Two
+      # independent reasons it is gone.
+      #
+      # It does not work here: measured on this cluster, a privileged sidecar
+      # got ZERO shared mounts and the FUSE mount came up `PROPAGATION: private`
+      # with the container root as its parent. Nothing propagates, so the app
+      # container saw an empty directory and `--model` silently did not exist.
+      #
+      # And Bidirectional is actively dangerous: it is precisely what lets a
+      # FUSE mount escape into the HOST mount namespace and outlive the pod. A
+      # mount left behind with no server blocks every stat() that crosses it in
+      # uninterruptible sleep, and a container runtime stats mount points on
+      # every sandbox create and teardown — so one leak stops the NODE from
+      # starting any container while everything already running looks fine. Five
+      # nodes went that way in one afternoon and only a reboot cleared them.
+      #
+      # Running the mount in the SAME container needs no propagation at all: one
+      # mount namespace, and the mount dies with the container. The freetoken
+      # image already carries `autumn-fuse`, copied from AUTUMN_IMAGE alongside
+      # the client, so there is nothing extra to ship.
+      #
+      # The cost is that the whole container is privileged now, where before
+      # only the sidecar was.
+
+      # `autumn-fuse` is LIFTED here at start, not baked in at build. The image
+      # used to carry it via `COPY --from=$AUTUMN_IMAGE`, which made every
+      # autumn change that touches the mount cost a 20 GiB rebuild and a 12
+      # minute pull -- and bound this image to autumn's WIRE lockstep through a
+      # build-arg no tag can see. Choosing the version here makes it a DEPLOY
+      # decision: to pick up a fuse change, edit this line.
+      #
+      # Deliberately an initContainer and not a sidecar. A sidecar needs
+      # `mountPropagation: Bidirectional` to share the mount, and that leaked
+      # mounts badly enough to wedge nodes (see c6b5970). This only copies a
+      # file; the mount still runs in the app container, in one namespace, and
+      # dies with it.
+      initContainers:
+        - name: fusebin
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:1e2cca496cf747a92e8d9f7626cfcc01d2d5857b
+          command: ["sh","-c","cp /usr/local/bin/autumn-fuse /fusebin/ && chmod +x /fusebin/autumn-fuse"]
+          volumeMounts:
+            - { name: fusebin, mountPath: /fusebin }
+          # Requests == limits, integer CPU, on the INIT container too. QoS is a
+          # property of the whole pod: one container without both set makes the
+          # pod Burstable however carefully the app container is specced — and
+          # that is what this was, silently, while its resources were `{}`.
+          #
+          # It matters because `cpu-manager-policy=static` hands exclusive cores
+          # only to Guaranteed pods with integer CPU. Without this the kubelet
+          # setting is inert here and the CPU-MoE threads keep roaming both NUMA
+          # nodes. Init resources do not add to the pod's scheduling footprint —
+          # that is max(init, sum(app)) — so this costs nothing.
+          resources:
+            requests: { cpu: "1", memory: 256Mi }
+            limits:   { cpu: "1", memory: 256Mi }
+
+      containers:
+        - name: freetoken
+          image: IMAGE_FREETOKEN_L3
+          # Always, not the IfNotPresent default: this tag is the buda commit,
+          # but the image ALSO embeds an autumn client chosen by a build-arg the
+          # tag cannot see. Rebuilding at the same commit against a new
+          # AUTUMN_IMAGE produces different bytes under an identical tag, and a
+          # node that already had the old copy silently kept serving it -- the
+          # mount then failed a wire handshake against a cluster that had moved.
+          imagePullPolicy: Always
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Pin CUDA to the GPU the device plugin actually allocated.
+              #
+              # This container is privileged (it mounts FUSE), and a privileged
+              # container bypasses the device cgroup: every /dev/nvidia* on the
+              # node appears inside it, all eight of them, no matter that the
+              # plugin allocated one. With CUDA_VISIBLE_DEVICES unset, CUDA then
+              # picks index 0 — which is NOT the allocated device.
+              #
+              # Measured on this cluster before the fix: the plugin had assigned
+              # GPU 7, the process was resident on GPU 0. So GPU 7 was reserved
+              # and idle while GPU 0 was in use and advertised as free — the next
+              # GPU pod scheduled onto this node would have landed on top of a
+              # 23 GiB resident model.
+              #
+              # NVIDIA_VISIBLE_DEVICES is injected per-allocation, so this
+              # follows the scheduler wherever the pod lands. Only pin when the
+              # plugin named a specific device: it is "all" or "void" on a node
+              # without the plugin, and exporting either would be wrong.
+              case "${NVIDIA_VISIBLE_DEVICES:-}" in
+                ""|all|void|none) echo "GPU: no specific allocation, leaving CUDA to choose" ;;
+                *) export CUDA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES"
+                   echo "GPU: pinned to allocated device(s) $CUDA_VISIBLE_DEVICES" ;;
+              esac
+
+              # autumn's Rust client parses a SocketAddr — IP literals only, no
+              # DNS — so the manager has to be resolved before anything dials it.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "manager = $M"
+
+              # Mount here, in this container. See the comment above the pod
+              # spec for why this is not a sidecar.
+              MP=/mnt/autumn; mkdir -p "$MP"
+              # Never `mountpoint -q` a possibly-stale FUSE path: that stats it,
+              # and a stale mount blocks stat() forever. /proc/mounts is pure VFS
+              # metadata, and the unmount is lazy so it cannot block either.
+              if grep -qs " $MP fuse" /proc/mounts; then
+                echo "stale mount at $MP — lazy unmounting"
+                fusermount3 -uz "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
+              fi
+              # --direct-read false is REQUIRED here, not a tuning knob.
+              #
+              # Direct reads send every read >= 64 KiB straight to an extent
+              # node, bypassing the PS. That cannot work on EC-converted
+              # extents: after conversion the `.dat` file holds RS shards, not
+              # the value, so autumn correctly refuses to hand out a direct-read
+              # descriptor for one. And the weights ARE EC-converted — a cluster
+              # with >= 5 extent nodes bootstraps its log streams at 4+1, every
+              # presplit child inherits that shape, and the default-armed
+              # `balanced` auto-policy converts each 16 GiB sealed extent on its
+              # own. Measured on this cluster with direct reads left on, a
+              # 32 MiB read never returned; with them off it took 0.48 s.
+              #
+              # The proxy path is not a consolation prize either: `autumnfs`
+              # pulled a 5 GB shard through it at 164 MiB/s.
+              /opt/fusebin/autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+                --direct-read false \
+                --read-io-threads 8 \
+                --credential-file /etc/autumn/cred/fs.cred &
+              FUSE_PID=$!
+              trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
+              # Wait for a real READ to succeed, not for /proc/mounts.
+              #
+              # The kernel adds the mount entry BEFORE it sends FUSE INIT, so
+              # /proc/mounts goes true while the handshake is still outstanding — and
+              # if INIT then fails (it has a 30 s timeout), everything after this
+              # point hits a dead mount. That raced: the script logged "mounted", the
+              # init timed out half a minute later, and the first `ls` died with
+              # "Connection refused", crash-looping the pod. Listing the directory we
+              # actually need is the honest readiness signal.
+              # Wait until the mount serves the path we actually need.
+              #
+              # Two weaker checks both pass for the wrong reason. /proc/mounts and
+              # `mountpoint -q` go true BEFORE the kernel sends FUSE INIT, so they
+              # are satisfied while the handshake is still outstanding. And `ls
+              # "$MP"` succeeds on the bare mountpoint before the mount takes over,
+              # because listing an empty directory is a success — that raced too,
+              # logging "mounted after 1s" before the daemon had even connected,
+              # and then dying on the first real path. Only reading something that
+              # cannot exist until the filesystem is live actually proves it.
+              for i in $(seq 1 120); do
+                ls "$MP/models/dsv4-flash" >/dev/null 2>&1 && break
+                kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
+                sleep 1
+              done
+              ls "$MP/models/dsv4-flash" >/dev/null 2>&1 || { echo "mount not serving "$MP/models/dsv4-flash" after 120s"; exit 1; }
+              echo "mounted after ${i}s; model dir:"; ls "$MP/models/dsv4-flash" | head -3
+
+              # DeepSeek-V4-Flash, not MiniMax. Two reasons beyond the model
+              # itself: its experts are ds_fp4, which `ft bench bw` measured on
+              # this GPU as hybrid-capable at 108 GB/s (4.29x over offload),
+              # where MiniMax's NVFP4 path is the one whose serial expert build
+              # hung with zero CPU and zero I/O. And `--nvfp4-backend triton` is
+              # dropped with it — it selects a kernel for NVFP4 experts and says
+              # nothing about ds_fp4.
+              #
+              # Calibrate the PCIe/CPU bandwidth split once per GPU. The profile
+              # is cached by GPU UUID and does not transfer between machines;
+              # without it `--moe-backend auto` never upgrades to hybrid. We pass
+              # hybrid explicitly below, so this is for the fetch/compute ratio.
+              ft bench bw || echo "bench bw failed — hybrid will use its default split"
+
+              # NOTE: no comments inside the command below. A `#` line breaks
+              # the backslash continuation, so everything after it silently
+              # stops being an argument -- which is how --max-running-req,
+              # --expert-load and --tool-call-parser were all being dropped
+              # while the log happily showed their defaults.
+              # A 4090 has 23.5 GiB and dsv4's dense weights plus KV leave
+              # little slack. Observed: a corpus search returns whole
+              # passages, the prefill context grows with them, and
+              # dsv4_indexer's select_prefill asked for another 174 MiB with
+              # 43 MiB free -- CUDA OOM, and FreeToken cannot restart a dead
+              # worker, so the whole API server exits (cleanly, exit 0, which
+              # is why it does not look like a crash).
+              #
+              # Flag names come from the ARGUMENT PARSER, not from ServerArgs'
+              # field names: the log prints `max_running_req=4` while the flag
+              # is `--max-running-requests`, and there is no --max-extend-tokens
+              # at all. Guessing from the log crash-looped the pod on
+              # "unrecognized arguments", which is at least loud.
+              #
+              # This is a single-user retrieval UI: four concurrent requests
+              # buy nothing and cost four sets of activations.
+              # `deepseekv32`, not `deepseek` — these are closed argparse
+              # enumerations, and the value is the parser's name, not the
+              # model family's. Guessing it from the model name fails the
+              # process at startup rather than degrading, which is the right
+              # behaviour but reads as a crash-loop.
+
+              # The backend is named, not linked: `dynamic` loads the class by module
+              # path, which is why autumn needs no code inside FreeToken. Built into a
+              # variable rather than written inline, so the JSON stays readable and $M
+              # (resolved above -- the Rust client is IP-only) interpolates exactly once.
+              L3CFG='{"backend_name":"autumn",'
+              L3CFG="$L3CFG"'"module_path":"autumn_kvcache.sglang_backend",'
+              L3CFG="$L3CFG"'"class_name":"AutumnKVCacheStorage",'
+              L3CFG="$L3CFG"'"interface_v1":1,'
+              L3CFG="$L3CFG""\"endpoint\":\"$M\","
+              L3CFG="$L3CFG"'"transport":"tcp",'
+              L3CFG="$L3CFG"'"auth_credential_file":"/etc/autumn/cred/kvc.cred"}'
+              echo "L3 config: $L3CFG"
+              
+              exec ft serve \
+                --model /mnt/autumn/models/dsv4-flash \
+                --host 0.0.0.0 --port 1919 \
+                --moe-backend hybrid \
+                --page-size 64 \
+                --max-running-requests 1 \
+                --memory-ratio 0.85 \
+                --kv-reserve-tokens 4096 \
+                --expert-load parallel \
+                --tool-call-parser deepseekv32 --reasoning-parser deepseekv32 \
+                --hicache-storage-backend dynamic \
+                --hicache-storage-backend-extra-config "$L3CFG" \
+                --hicache-staging-pages 8 \
+                --hicache-prefetch-deadline-s 0.5 \
+                --hicache-max-inflight 2
+          ports:
+            - { name: http, containerPort: 1919 }
+          env:
+            # Bound how much host memory gets pinned. FreeToken otherwise tries
+            # to cudaHostRegister the ENTIRE expert bank set (_pin_budget_bytes
+            # returns None on Linux = uncapped), which under a cgroup limit ends
+            # in an mlock failure rather than a graceful fallback.
+            - { name: FREETOKEN_PIN_BUDGET_GB, value: "170" }
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              # requests == limits keeps this pod Guaranteed, which is what lets
+              # a static CPU manager hand it exclusive cores. The CPU MoE kernel
+              # pins one worker per physical core and spins on a barrier; a cfs
+              # quota without exclusive cores wrecks that (its own comment: "SMT
+              # oversubscription thrashes the spin-barrier").
+              cpu: "32"
+              memory: 210Gi
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "32"
+              memory: 210Gi
+          securityContext:
+            # privileged for the FUSE mount (needs /dev/fuse + SYS_ADMIN); it
+            # subsumes IPC_LOCK, which pinned host memory needs because it counts
+            # against RLIMIT_MEMLOCK and k8s has no ulimit field.
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK"]
+          volumeMounts:
+            # No propagation: the mount is made inside this container, so
+            # there is nothing to receive from anywhere.
+            - { name: mnt, mountPath: /mnt/autumn }
+            - { name: fusebin, mountPath: /opt/fusebin }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+            # Triton/JIT kernel cache + the `ft bench bw` profile. On emptyDir it
+            # is rebuilt every pod start; point it at a PVC if JIT compile time
+            # on cold start turns out to matter.
+            - { name: ftcache, mountPath: /root/.cache }
+          startupProbe:
+            # /health answers 200 LONG before the model is usable -- inference
+            # still returns 503 "model is still loading" -- so this probe passes
+            # in seconds and hands over to liveness while the heavy load is
+            # still running. It is kept only as a floor, not as a real gate.
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 10
+            failureThreshold: 120     # 20 min
+          readinessProbe:
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 10
+          livenessProbe:
+            # A failed /v1/cache/rebuild latches the server into
+            # maintenance_state == "failed" and answers 503 forever; only a
+            # restart clears it, so failing liveness on that is correct.
+            #
+            # But the budget must clear the LOAD, not just a hung server. Pinning
+            # a 155 GiB expert bank blocks the process hard enough that a 1 s
+            # probe times out, and 3 x 30 s killed the pod mid-load -- SIGKILL,
+            # exit 137, then a fresh 10-minute load that would be killed the same
+            # way. 10 s x 40 tolerates ~20 minutes of unresponsiveness, which a
+            # genuinely wedged server still fails and a loading one survives.
+            httpGet: { path: /health, port: 1919 }
+            timeoutSeconds: 10
+            periodSeconds: 30
+            failureThreshold: 40
+
+      volumes:
+        - { name: mnt, emptyDir: {} }
+        - { name: fusebin, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }
+        # Torch's multiprocessing needs more than the 64 MiB default /dev/shm.
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
+
+  volumeClaimTemplates:
+    - metadata:
+        name: ftcache
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Named explicitly: this cluster has NO default StorageClass, and an
+        # unset class leaves the claim Pending with the pod unschedulable --
+        # which is exactly how this workload went down once already.
+        storageClassName: ebs-ssd
+        resources: { requests: { storage: 10Gi } }
