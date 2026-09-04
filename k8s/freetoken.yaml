@@ -73,22 +73,24 @@ metadata:
   namespace: autumn
   labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
 spec:
-  # Two replicas, one GPU each. The bottleneck this fixes is not model speed:
-  # `--max-running-requests 1` means a second request queues behind the first,
-  # and the live p95 was 85 s against a 12.6 s mean TTFT. A second engine is the
-  # only thing that changes that number.
+  # One replica. A second was measured on this node and reverted: it gave 1.68x
+  # (10 requests in 21.8 s across two, against 36.6 s serialised on one), short
+  # of 2x and erratic — repeated runs of the same test came in at 0.91x, 0.94x,
+  # and twice at 4-5x slow on one replica alone.
   #
-  # Each replica holds its OWN full copy of the expert banks in host RAM —
-  # FreeToken has no tensor parallelism, so this is 2 x 137 GiB, not a shared
-  # pool. That fits here (686 GiB allocatable, 426 GiB requested at two
-  # replicas) and is the reason this cannot simply keep scaling.
+  # The reason is not the GPUs. DSV4 resolves to `moe_backend='hybrid'`, and the
+  # calibration table says only 31.2% of expert misses cross PCIe (CPU-MoE
+  # 37.8 GB/s vs PCIe 17.2 GB/s at 12.75 MB per expert) — the bulk of the expert
+  # work is on the CPU. Host-to-device bandwidth is nowhere near the limit:
+  # 23.3 GiB/s per card alone, 46.6 GiB/s across two, scaling perfectly, while
+  # inference draws about 6 GB/s and the GPUs sit at 18-47% SM.
   #
-  # The Service is headless, so `freetoken-0.freetoken` and
-  # `freetoken-1.freetoken` are stable per-pod names. Routing a conversation to
-  # one of them by hand is what keeps its prefix resident: the bare `freetoken`
-  # name resolves to both pods, and a turn that lands on the wrong one re-prefills
-  # the whole history — measured at 99% cached when it lands on the right one.
-  replicas: 2
+  # So the shared resource is CPU and host memory bandwidth, and CPU-MoE assumes
+  # one NUMA node with its threads pinned to physical cores. Getting that needs
+  # `cpu-manager-policy=static` on the kubelet, which is a node-pool setting —
+  # and the init container's resources below, without which this pod is
+  # Burstable and the kubelet policy would not apply to it anyway.
+  replicas: 1
   # A StatefulSet, for the volumeClaimTemplate below -- and its default rollout
   # is what a single-GPU workload needs anyway: it terminates the old pod before
   # creating its replacement, where a Deployment would have to be told
