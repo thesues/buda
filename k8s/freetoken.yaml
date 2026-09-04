@@ -73,7 +73,22 @@ metadata:
   namespace: autumn
   labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken }
 spec:
-  replicas: 1
+  # Two replicas, one GPU each. The bottleneck this fixes is not model speed:
+  # `--max-running-requests 1` means a second request queues behind the first,
+  # and the live p95 was 85 s against a 12.6 s mean TTFT. A second engine is the
+  # only thing that changes that number.
+  #
+  # Each replica holds its OWN full copy of the expert banks in host RAM —
+  # FreeToken has no tensor parallelism, so this is 2 x 137 GiB, not a shared
+  # pool. That fits here (686 GiB allocatable, 426 GiB requested at two
+  # replicas) and is the reason this cannot simply keep scaling.
+  #
+  # The Service is headless, so `freetoken-0.freetoken` and
+  # `freetoken-1.freetoken` are stable per-pod names. Routing a conversation to
+  # one of them by hand is what keeps its prefix resident: the bare `freetoken`
+  # name resolves to both pods, and a turn that lands on the wrong one re-prefills
+  # the whole history — measured at 99% cached when it lands on the right one.
+  replicas: 2
   # A StatefulSet, for the volumeClaimTemplate below -- and its default rollout
   # is what a single-GPU workload needs anyway: it terminates the old pod before
   # creating its replacement, where a Deployment would have to be told
