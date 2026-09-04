@@ -12,13 +12,11 @@
 # so instead of putting it back behind a flag, the L3 build starts from the
 # production image and pays the toolchain only here.
 #
-# Building on the image rather than beside it also removes the reason the last
-# four attempts were slow. A `git+` FREETOKEN_SPEC makes pip build FreeToken
-# from source, and PEP 517 build isolation then re-installs its build
-# requirements — `torch>=2.11,<2.12` among them — into a fresh environment that
-# cannot see the torch installed a step earlier. Build #4 spent 59 minutes on
-# torch and then another 44 downloading it again. Here FreeToken is already
-# installed in the base and nothing rebuilds it.
+# Building on the image also fixes what made the last attempts slow. FreeToken
+# still has to be installed from git here — the base carries released 0.1.2 and
+# the L3 tier is not in it — but with `--no-deps --no-build-isolation` against a
+# base that already has torch, instead of build #4's isolated environment that
+# re-downloaded torch for 44 minutes after 59 spent installing it.
 #
 # ── ⚠ This image is back under the WIRE lockstep ──────────────────────────────
 # The production image is free of it; this one is not. It embeds autumn's rkyv
@@ -73,6 +71,32 @@ ENV CARGO_HOME=/root/.cargo \
 # maturin need.
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
  && python3 -m pip install --no-cache-dir --upgrade "maturin>=1,<2"
+
+# ── FreeToken, at the commit that HAS the L3 tier ─────────────────────────────
+# The base image carries released FreeToken 0.1.2, which has no
+# `freetoken.kvcache.hicache` package at all — the tier and the vendored
+# HiCacheStorage interface live only on this branch. Layering the autumn client
+# onto the base is necessary but not sufficient; without this step the adapter
+# resolves no interface and the assertion below fires.
+#
+# Overlaying the branch's .py files onto 0.1.2 was tried and does NOT work:
+# `git describe` puts this commit at v0.1.2-22-g…, and six of the changed files
+# are MODIFICATIONS of existing ones, so the mix is 22 commits of skew. (Copying
+# just scheduler/*.py into a running 0.1.2 pod broke its import outright.)
+#
+# --no-deps: the base already installed freetoken[accel], so every runtime
+#   dependency is present and resolving them again buys nothing.
+# --no-build-isolation: this is the fix for what made build #4 take two hours.
+#   FreeToken's [build-system] requires torch, and PEP 517 isolation installs it
+#   into a fresh environment that cannot see the torch already here — a
+#   multi-GB re-download, and the extensions would then link against a generic
+#   libtorch while the runtime uses the +cu130 build. Without isolation the
+#   build uses the torch that will actually be imported.
+ARG FREETOKEN_SPEC=freetoken@git+https://github.com/thesues/FreeToken@80f40bc
+RUN python3 -m pip install --no-cache-dir "setuptools>=77" wheel \
+ && FREETOKEN_ALLOW_CUDA_MISMATCH=0 python3 -m pip install --no-cache-dir \
+      --no-deps --no-build-isolation "${FREETOKEN_SPEC}" \
+ && python3 -c "import freetoken.kvcache.hicache.storage as s; print('hicache present:', s.__file__)"
 
 COPY --from=autumncore /usr/local/share/autumn/src/ /src/
 WORKDIR /src
