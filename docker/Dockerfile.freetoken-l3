@@ -30,7 +30,6 @@
 #     -o jsonpath='{.spec.template.spec.containers[0].image}'
 #
 #   docker build -f docker/Dockerfile.freetoken-l3 \
-#     --build-arg BASE_REGISTRY=hub-cache-cn-beijing.cr.volces.com/ \
 #     --build-arg FREETOKEN_IMAGE=<cr>/freetoken-autumn:<tag> \
 #     --build-arg AUTUMN_IMAGE=<cr>/autumn-rs:<cluster's commit> \
 #     --build-arg CARGO_MIRROR=https://rsproxy.cn/crates.io-index \
@@ -38,16 +37,18 @@
 #     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
 #     -t <cr>/freetoken-l3:<tag> .
 
-ARG BASE_REGISTRY=
+# No BASE_REGISTRY here: unlike Dockerfile.freetoken, which prefixes a Docker
+# Hub CUDA image with a pull-through cache, both images below are full paths in
+# our own registry. Prefixing them would name a repository that does not exist.
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
 ARG AUTUMN_IMAGE=autumn-rs:latest
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
 # of the autumn-rs image via the pod's initContainer, so the mount is a deploy-
 # time choice here exactly as it is for the production image.
-FROM ${BASE_REGISTRY}${AUTUMN_IMAGE} AS autumncore
+FROM ${AUTUMN_IMAGE} AS autumncore
 
-FROM ${BASE_REGISTRY}${FREETOKEN_IMAGE}
+FROM ${FREETOKEN_IMAGE}
 
 # ── Mirror knobs (override for China / air-gapped builds) ─────────────────────
 #   RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT : rustup TOOLCHAIN download mirror.
@@ -94,7 +95,7 @@ RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
 #     "class_name":"AutumnKVCacheStorage","interface_v1":1,...}'
 # It resolves its HiCacheStorage interface from the host engine, so it binds
 # FreeToken's vendored `freetoken.kvcache.hicache.storage` here — sglang the
-# runtime is not installed and is not needed (autumn-rs 9d752a2; before that
+# runtime is not installed and is not needed (autumn-rs ed71f2b; before that
 # commit the adapter bound nothing, and the tier failed silently at construction).
 #
 # `autumn_vllm_loader` is deliberately NOT installed: weights come from the FUSE
