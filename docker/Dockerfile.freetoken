@@ -60,17 +60,16 @@ ARG APT_MIRROR=
 # torch for CUDA 13 is not on PyPI proper; it comes from its own index, which is
 # why this is a separate arg from PIP_INDEX_URL.
 #
-# Mirrored, and that is not optional here. The upstream index resolves fine but
-# serves the wheels from files.pythonhosted.org, which from the CN build pool
-# crawls: a build died after 549 s of ReadTimeoutError on exactly this step
-# while every other pip call in this file was already mirrored. It is the same
-# trap the PIP_INDEX_URL comment above describes, one step further down, reached
-# because torch brings its own index and so skipped that protection.
-#
-# The mirror carries cu100 through cu132, cu130 included, with the
-# torch-2.11.0+cu130 cp310 manylinux wheel this needs (checked 2026-09-04).
-# Point the arg back at download.pytorch.org if the mirror ever lags a release.
-ARG TORCH_INDEX_URL=https://mirrors.aliyun.com/pytorch-wheels/cu130
+# This MUST stay the upstream index, and the reason is worth writing down
+# because the obvious mirror is a trap. `mirrors.aliyun.com/pytorch-wheels/cu130`
+# carries the right wheel but is a flat directory, not a PEP 503 index: it has
+# per-package pages for the dependencies (filelock/, fsspec/, jinja2/) and none
+# for torch itself, so `--index-url` gets a 404 and reports
+# `from versions: none` (build #3). Switching to `--find-links` fixes that and
+# introduces something worse: PyPI carries a plain torch-2.11.0 without the
+# +cu130 local version, and pip may satisfy `>=2.11,<2.12` with the non-CUDA
+# build. A silently wrong torch is a far worse outcome than a slow download.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
 
 ENV PATH=/usr/local/cuda/bin:$PATH \
     RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
@@ -123,7 +122,18 @@ ENV BUCKET=ai-infra
 # ── torch first, pinned to the CUDA-13 build ──────────────────────────────────
 # FreeToken requires torch>=2.11,<2.12 and its extensions compile against it, so
 # torch must be present and correct BEFORE freetoken is built/installed.
-RUN python3 -m pip install --no-cache-dir --index-url ${TORCH_INDEX_URL} "torch>=2.11,<2.12"
+# The slowness this originally hit was in torch's DEPENDENCIES, not torch: the
+# upstream torch page links only to download.pytorch.org, but the dependency
+# pages hand pip files.pythonhosted.org URLs, and from the CN build pool those
+# crawl — build #1 died after 549 s of ReadTimeoutError. So the mirror belongs
+# on the extra index, where it serves the dependencies, while torch itself keeps
+# coming from the index that has the +cu130 build. The timeout and retries are
+# the belt: a slow mirror should cost minutes, not a failed build.
+RUN python3 -m pip install --no-cache-dir \
+      --timeout 120 --retries 10 \
+      --index-url ${TORCH_INDEX_URL} \
+      --extra-index-url ${PIP_INDEX_URL} \
+      "torch>=2.11,<2.12"
 
 # ── FreeToken ─────────────────────────────────────────────────────────────────
 # A pip spec, so this can point at a released wheel or a git ref:
