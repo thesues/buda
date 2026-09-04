@@ -12,7 +12,13 @@
 # reason the MCP server grew an HTTP transport.
 
 ARG BASE_REGISTRY=
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+# `library/` spelled out, not the bare `python:` Docker Hub lets you write.
+# BASE_REGISTRY points this at a Hub cache in CI, and that cache rejects a
+# repository name with no namespace as malformed — a build there dies in
+# resolveBaseImage before running a single instruction, while the same
+# Dockerfile builds fine on a laptop. Docker Hub accepts both spellings, so the
+# explicit one is the one that works in both places.
+ARG PYTHON_IMAGE=library/python:3.12-slim-bookworm
 FROM ${BASE_REGISTRY}${PYTHON_IMAGE}
 
 ARG APT_MIRROR=
