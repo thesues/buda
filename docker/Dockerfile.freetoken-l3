@@ -32,7 +32,6 @@
 #   docker build -f docker/Dockerfile.freetoken-l3 \
 #     --build-arg FREETOKEN_IMAGE=<cr>/freetoken-autumn:<tag> \
 #     --build-arg AUTUMN_IMAGE=<cr>/autumn-rs:<cluster's commit> \
-#     --build-arg CARGO_MIRROR=https://rsproxy.cn/crates.io-index \
 #     --build-arg RUSTUP_DIST_SERVER=https://rsproxy.cn \
 #     --build-arg RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
 #     -t <cr>/freetoken-l3:<tag> .
@@ -77,8 +76,18 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
 
 COPY --from=autumncore /usr/local/share/autumn/src/ /src/
 WORKDIR /src
+# REPLACE, never append. The base image already ships a
+# `$CARGO_HOME/config.toml` -- the production build installed rustup and then
+# trimmed `~/.rustup`, which leaves the rustup shims, maturin, and this config
+# behind -- so `>>` lands a SECOND [source.crates-io] table in it and cargo
+# fails with "could not parse TOML configuration" before it reads any manifest.
+#
+# Normally leave CARGO_MIRROR unset: the config already there points at
+# rsproxy's SPARSE index (`sparse+https://rsproxy.cn/index/`), which is faster
+# than the git index this knob would write over it.
 RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
-      printf '[source.crates-io]\nreplace-with="m"\n[source.m]\nregistry="%s"\n' "$CARGO_MIRROR" >> "$CARGO_HOME/config.toml"; fi
+      printf '[source.crates-io]\nreplace-with="m"\n[source.m]\nregistry="%s"\n' "$CARGO_MIRROR" > "$CARGO_HOME/config.toml"; fi \
+ && echo "--- cargo config in effect ---" && cat "$CARGO_HOME/config.toml" 2>/dev/null || true
 
 # The native `autumn` PyO3 client, then the pure-python adapter package.
 #
