@@ -8,7 +8,11 @@
 :root {
   --bg:#0b0a09; --surface:#221e18; --surface-raised:#2d2820;
   --border:#3a342b; --border-active:#5a5145;
-  --text:#ece8e1; --text-dim:#9a9184; --text-muted:#6b6357;
+  /* 10.7:1 on --surface, not the 13.6:1 this used to be. Above about 12:1 a
+     light-on-dark page starts to halate — the glyph edges bloom into the
+     ground — and dense CJK strokes smear first. Dropping the text rather than
+     lifting the surface keeps the panels dark enough to sit on the painting. */
+  --text:#d6cfc4; --text-dim:#a79d8e; --text-muted:#7d7466;
   --accent:#c5a05e; --accent-dim:#8a7040;
   --success:#6fae7f; --danger:#cf8f8f;
   --radius:6px;
@@ -70,8 +74,11 @@ body { position:relative; }
 }
 
 /* Grain. Fixed, 3%, pointer-events:none — texture, never interaction. */
+/* Under the interface, not over it. At z-index 9999 this noise fell on the
+   glyphs themselves, and high-frequency texture directly on text edges is a
+   strain source out of all proportion to 3% opacity. It belongs on the mural. */
 body::before {
-  content:''; position:fixed; inset:0; opacity:.03; pointer-events:none; z-index:9999;
+  content:''; position:fixed; inset:0; opacity:.03; pointer-events:none; z-index:0;
   background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   background-size:256px;
 }
@@ -99,7 +106,12 @@ header h1 em { color:var(--accent); font-style:italic; }
         gap:1.2rem; align-items:stretch; flex:1; min-height:0; }
 @media (max-width:820px){ .grid { grid-template-columns:1fr; } .sessions { display:none; } }
 
-.card { background:color-mix(in srgb, var(--surface) 68%, transparent);
+/* Near-opaque on purpose. A lower value let the painting read through the
+   panel, which looked better in a screenshot and is the single worst thing you
+   can put behind a paragraph: local contrast changes under every line. The
+   mural stays visible where it costs nothing — the margins, and the band above
+   the cards — which is where background art belongs. */
+.card { background:color-mix(in srgb, var(--surface) 94%, transparent);
         backdrop-filter:blur(14px) saturate(0.9); border:1px solid var(--border); border-radius:var(--radius);
         display:flex; flex-direction:column; min-height:0; overflow:hidden; }
 .card-head { padding:0.7rem 1rem; border-bottom:1px solid var(--border);
