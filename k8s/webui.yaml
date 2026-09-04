@@ -122,9 +122,13 @@ spec:
                 - 回答时给出经名与原文引文，并标出出处（文件 › 标题路径 › 行号）。
                 - 语料库里没有的，直说没有；可以补充常识背景，但要注明那不是来自语料库。
                 - 简明作答，通常几段以内。除非明确要求，不要写长文、不要综述式铺陈。
-            # Single-user HTTP Basic. Leave AUTH_USER empty to disable; the app
-            # refuses to start with a user set and an empty password rather than
-            # running with a credential that can never match.
+            # Single-user HTTP Basic, currently OFF: the `hermes-webui-auth`
+            # secret does not exist, `optional: true` leaves both unset, and an
+            # empty AUTH_USER bypasses the check on every path. Kept wired so
+            # turning it on is `kubectl create secret` plus a restart, not an
+            # edit here. The app refuses to start with a user set and an empty
+            # password rather than running with a credential that can never
+            # match, so a half-created secret fails loudly.
             - name: AUTH_USER
               valueFrom:
                 secretKeyRef: { name: hermes-webui-auth, key: user, optional: true }
@@ -179,10 +183,15 @@ spec:
 # backend must live in the Ingress's own namespace, so the Service would have to
 # move too, and a Service cannot select pods in another namespace.
 #
-# There is no TLS here and the app's only gate is single-user HTTP Basic
-# (`hermes-webui-auth`), so this is a plaintext-credential path over the public
-# VIP. Set that secret before publishing, or leave AUTH_USER empty and treat the
-# host as public.
+# Deliberately unauthenticated (decided 2026-09-04). The `hermes-webui-auth`
+# secret is not created, so AUTH_USER is empty and the app serves every path
+# without a check — see the AUTH_USER note further down. The mechanism stays in
+# place: create that secret and restart to turn Basic auth on later.
+#
+# What that means concretely, so nobody has to rediscover it: anyone who can
+# reach this host can read every session in the sidebar, start turns against
+# FreeToken, and query the corpus. There is no TLS either — the APIG serves this
+# rule on port 80.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
