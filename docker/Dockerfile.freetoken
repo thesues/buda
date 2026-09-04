@@ -57,9 +57,20 @@ FROM ${BASE_REGISTRY}${CUDA_IMAGE}
 #   APT_MIRROR     : Ubuntu apt mirror BASE URL (e.g. https://mirrors.aliyun.com).
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ARG APT_MIRROR=
-# torch for CUDA 13 is not on PyPI proper; it comes from PyTorch's own index.
-# Kept separate from PIP_INDEX_URL so a mirror can serve everything else.
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+# torch for CUDA 13 is not on PyPI proper; it comes from its own index, which is
+# why this is a separate arg from PIP_INDEX_URL.
+#
+# Mirrored, and that is not optional here. The upstream index resolves fine but
+# serves the wheels from files.pythonhosted.org, which from the CN build pool
+# crawls: a build died after 549 s of ReadTimeoutError on exactly this step
+# while every other pip call in this file was already mirrored. It is the same
+# trap the PIP_INDEX_URL comment above describes, one step further down, reached
+# because torch brings its own index and so skipped that protection.
+#
+# The mirror carries cu100 through cu132, cu130 included, with the
+# torch-2.11.0+cu130 cp310 manylinux wheel this needs (checked 2026-09-04).
+# Point the arg back at download.pytorch.org if the mirror ever lags a release.
+ARG TORCH_INDEX_URL=https://mirrors.aliyun.com/pytorch-wheels/cu130
 
 ENV PATH=/usr/local/cuda/bin:$PATH \
     RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
