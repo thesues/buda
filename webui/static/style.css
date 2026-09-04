@@ -251,7 +251,7 @@ header h1 em { color:var(--accent); font-style:italic; }
               border:1px solid var(--border); border-radius:4px; }
 
 /* Assistant prose in serif; user text and controls stay sans. */
-.msg.bot .bubble.md { font-family:var(--prose); font-size:1rem; line-height:1.9;
+.msg.bot .bubble.md { font-family:var(--prose); font-size:0.94rem; line-height:1.9;
                       font-weight:400; }
 .md code, .md pre { font-family:var(--mono); }
 .msg.user .bubble { font-family:var(--sans); }

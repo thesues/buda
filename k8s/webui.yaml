@@ -23,7 +23,13 @@ spec:
   storageClassName: ebs-ssd
   # Sessions ARE the feature. On an emptyDir every restart would present an
   # empty sidebar, which reads as data loss whether or not anyone calls it that.
-  resources: { requests: { storage: 5Gi } }
+  # 10Gi, not the 5Gi this asked for: `ebs-ssd` provisions ESSD_PL0, whose
+  # minimum volume size is above 5 GiB. The claim below it is accepted by the
+  # API server and then fails in the CSI driver with `InvalidVolumeSize`, so the
+  # PVC sits Pending and the pod with it — the smallest bound volume in this
+  # cluster is the 10Gi ftcache. Sessions are small; this is a floor, not a
+  # sizing decision.
+  resources: { requests: { storage: 10Gi } }
 ---
 apiVersion: v1
 kind: Service
