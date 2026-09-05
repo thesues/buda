@@ -432,9 +432,28 @@ class HermesACP:
         # then ended with no content AND no error, which is the worst of both.
         if isinstance(res, dict) and "_error" in res:
             err = res["_error"] or {}
+            # Keep `data`. hermes's generic ACP handler puts the exception's
+            # own message there (`data = {"details": str(exc)}`) before
+            # `raise err from None` throws the exception itself away, so on the
+            # paths that have no logging of their own it is the only place the
+            # cause survives at all. `session/new` is one: its stderr log shows
+            # the already-converted "RequestError: Internal error" and nothing
+            # underneath, so dropping `data` here left a bare "Internal error
+            # (code -32603)" with the reason recoverable from neither side.
+            # (`load_session` logs with exc_info and does show its cause -- the
+            # difference is per-path, not global.) Log the whole error object
+            # too, so a shape this code does not read still lands somewhere.
+            log.error("acp %s failed, raw error: %s", method,
+                      json.dumps(err, ensure_ascii=False)[:2000])
+            detail = err.get("data")
+            if isinstance(detail, (dict, list)):
+                detail = json.dumps(detail, ensure_ascii=False)[:800]
+            elif detail is not None:
+                detail = str(detail)[:800]
             raise RuntimeError(
                 f"hermes acp {method} failed: "
                 f"{err.get('message') or err} (code {err.get('code', '?')})"
+                + (f": {detail}" if detail else "")
             )
         return res
 
