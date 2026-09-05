@@ -175,6 +175,41 @@ assert b._SGLANG_V2_AVAILABLE, 'v2 pool types unresolved: batch_get_v2 would rai
 assert hasattr(b.AutumnKVCacheStorage, 'register_mem_host_pool_v2'), 'ABC default missing: the tier dies at construction'; \
 print('L3 adapter OK, interface from', b.HiCacheStorage.__module__)"
 
+# And that the ENGINE can actually be told to use it.
+#
+# The assertion above passed on an image that could not serve a single request
+# with the tier enabled: argparse defined every `--hicache-*` flag, the config
+# dataclass carried none of them, and `ServerArgs(**kwargs)` raised
+# `unexpected keyword argument 'hicache_storage_backend'` at startup. The
+# import check could not see that, because importing the adapter and CONFIGURING
+# the engine are different things.
+#
+# What made it invisible for so long is worth stating: `attach.py` reads the
+# setting with `getattr(config, "hicache_storage_backend", None)`, which returns
+# None for a missing attribute instead of raising. Without the flags the tier
+# quietly did not attach and every test passed; with them the server died before
+# it listened. The only configuration that could expose the gap was the only one
+# nobody ran.
+#
+# So parse the real flags through the real parser. `--help`-style checks would
+# not do: the failure is in constructing the config, which happens after
+# parsing. This is why the whole L3 flag set is passed, not just one.
+RUN python3 -c "\
+from freetoken.server.args import parse_args; \
+sa, _ = parse_args([ \
+  '--model','/nonexistent', \
+  '--hicache-storage-backend','dynamic', \
+  '--hicache-storage-backend-extra-config','{\"module_path\":\"m\",\"class_name\":\"C\"}', \
+  '--hicache-staging-pages','8', \
+  '--hicache-prefetch-deadline-s','0.5', \
+  '--hicache-max-inflight','2', \
+  '--hicache-write-queue-bytes','536870912', \
+], prog='ft serve'); \
+assert sa.hicache_storage_backend == 'dynamic', sa.hicache_storage_backend; \
+assert sa.hicache_staging_pages == 8; \
+assert sa.hicache_max_inflight == 2; \
+print('L3 server args OK:', sa.hicache_storage_backend, sa.hicache_staging_pages, sa.hicache_max_inflight)"
+
 # Trim the Rust toolchain and the build tree; ~1.5 GB and nothing at runtime
 # needs them. `/src/python/autumn_kvcache` stays — it is installed with -e.
 RUN rm -rf /root/.rustup /root/.cargo/registry /src/target /src/python/target
