@@ -92,7 +92,7 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
 #   multi-GB re-download, and the extensions would then link against a generic
 #   libtorch while the runtime uses the +cu130 build. Without isolation the
 #   build uses the torch that will actually be imported.
-ARG FREETOKEN_SPEC=freetoken@git+https://github.com/thesues/FreeToken@80f40bc
+ARG FREETOKEN_SPEC=https://codeload.github.com/thesues/FreeToken/tar.gz/80f40bc
 # setuptools is pinned BELOW 82: torch 2.11.0+cu130 declares `setuptools<82`,
 # and a bare `>=77` pulls 84 and breaks that constraint.
 #
@@ -102,8 +102,16 @@ ARG FREETOKEN_SPEC=freetoken@git+https://github.com/thesues/FreeToken@80f40bc
 # install -- silently, exit code 0, nothing built. That is what the import check
 # below caught.
 #
-# The clone is retried: the CN build pool reaches github.com intermittently
-# (build #7 died on "GnuTLS recv error (-110)" after 92 s, #8 cloned in 21 s).
+# A TARBALL, not `git+`. `git clone` over HTTPS is many round trips against
+# github.com and the CN build pool cannot hold them: three attempts in build #9
+# died at 93 s (GnuTLS recv error -110) and twice at 128 s (connect timeout).
+# A release archive is one GET against codeload.github.com, so it fails or
+# succeeds in one shot. The retry stays for the flaky case.
+# If codeload is unreachable too, the fallback is vendoring the source into
+# this repo — 4.8 MB under python/ — because the native extensions must be
+# rebuilt: the 22 commits between v0.1.2 and this branch point touch
+# cpu_moe_ext.cpp, ple_store_ext.cpp and setup.py, so the base image's
+# compiled .so files cannot be paired with this branch's Python.
 RUN python3 -m pip install --no-cache-dir "setuptools>=77,<82" wheel \
  && for i in 1 2 3; do \
       FREETOKEN_ALLOW_CUDA_MISMATCH=0 python3 -m pip install --no-cache-dir \
