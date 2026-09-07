@@ -1,5 +1,21 @@
 # A SECOND FreeToken, built from the hicache-autumn branch, for validating the
-# L3 KV tier. A separate StatefulSet rather than a change to the production one:
+# L3 KV tier.
+#
+# ── The model is DeepSeek-V4-Flash, and that is load-bearing ─────────────────
+# It is the only combination that is self-consistent, which took a wrong turn
+# through MiniMax to establish. `committed_pages` — the writeback hook's entry
+# point — is defined ONLY on the SWA radix cache, and the page codec is written
+# for DSV4's MLA layout. DSV4 is routed to `swa_radix` and matches the codec;
+# MiniMax keeps plain `radix`, which has no `committed_pages` at all, and its
+# `MHAKVCache` has none of the attributes the codec reads, so the tier refuses
+# to build ("'MHAKVCache' object has no attribute 'P'").
+#
+# The header here previously argued the opposite, on the theory that plain
+# radix was what the port targeted. It is not. Anyone extending this to another
+# model needs BOTH halves: a prefix cache carrying `committed_pages`, and a
+# codec for that model's KV layout.
+#
+# A separate StatefulSet rather than a change to the production one:
 # `freetoken-0` keeps serving throughout, on its own GPU, from its own image.
 # The node has seven idle cards.
 #
@@ -355,8 +371,7 @@ spec:
                 --tool-call-parser deepseekv32 --reasoning-parser deepseekv32 \
                 --hicache-storage-backend dynamic \
                 --hicache-storage-backend-extra-config "$L3CFG" \
-                --hicache-staging-pages 8 \
-                --hicache-prefetch-deadline-s 0.5 \
+                --hicache-prefetch-deadline-s 30 \
                 --hicache-max-inflight 2
           ports:
             - { name: http, containerPort: 1919 }
