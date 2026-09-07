@@ -3,8 +3,15 @@
 # Note what is NOT here, compared to every other workload in this repo: no
 # privileged container, no `autumn-fuse`, no `/dev/fuse`, no autumn credential,
 # no mountPropagation. This pod never talks to autumn. It talks to `memory-mcp`
-# over HTTP MCP and to `freetoken` over the OpenAI-compatible API, both plain
+# over HTTP MCP and to `freetoken-l3` over the OpenAI-compatible API, both plain
 # ClusterIP Services.
+#
+# `IMAGE_WEBUI` below is a PLACEHOLDER, not an image. Substitute it before
+# applying — `sed "s|IMAGE_WEBUI|<repo>/buda-webui:<sha>|" k8s/webui.yaml |
+# kubectl apply -f -`. A raw `kubectl apply` of this file is accepted and then
+# leaves the pod in InvalidImageName with the old one already torn down, which
+# is how the webui went down once. The same holds for `IMAGE_FREETOKEN_L3` in
+# freetoken-l3.yaml.
 #
 # The practical consequence is that this image is NOT under autumn's WIRE
 # lockstep: rolling the cluster to a new wire version does not require
@@ -116,7 +123,7 @@ spec:
             # The decoupled dependency: an HTTP URL, not a spawned process.
             - { name: MEMORY_MCP_URL, value: "http://memory-mcp:5100/mcp" }
             - { name: MEMORY_MCP_NAME, value: "memory" }
-            - { name: LLM_BASE_URL, value: "http://freetoken:1919/v1" }
+            - { name: LLM_BASE_URL, value: "http://freetoken-l3:1919/v1" }
             - { name: LLM_MODEL, value: "dsv4-flash" }
             # What this deployment is for. Appended to a session's first prompt.
             # Left unset it falls back to the same text in server.py; set it here
