@@ -38,6 +38,12 @@
 # Hub CUDA image with a pull-through cache, both images below are full paths in
 # our own registry. Prefixing them would name a repository that does not exist.
 ARG FREETOKEN_IMAGE=freetoken-autumn:latest
+# NOTE: the freetoken-l3 CP pipeline does NOT build this file. Its only source
+# is thesues/FreeToken branch `hicache-autumn`, and it builds that repo's copy
+# of docker/Dockerfile.freetoken-l3. The two copies have drifted. Editing this
+# one and rebuilding produces an identical image and looks like a build that
+# changed nothing — which is exactly how a stale embedded client survived three
+# green builds. Fix the FreeToken copy; keep this one in step.
 ARG AUTUMN_IMAGE=autumn-rs:latest
 
 # Sources only. The binaries stay where they are: `autumn-fuse` still comes out
@@ -156,10 +162,32 @@ RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p "$CARGO_HOME"; \
 #
 # `autumn_vllm_loader` is deliberately NOT installed: weights come from the FUSE
 # mount, not from `--load-format autumn`.
+# The wire version of the sources this extension was compiled from is recorded
+# into the image, because nothing else in the built artifact reveals it: the
+# module exports no version symbol, the wheel's `direct_url.json` records only a
+# path that is identical in every build, and the extension's mtime is normalised
+# by the wheel. Diagnosing a stale client without this took an hour of indirect
+# argument. `cat /usr/local/share/autumn/client-wire-version` now answers it.
+#
+# `--force-reinstall --no-deps`, and both halves matter. The crate version is a
+# constant `0.1.0`, so pip sees the requirement already satisfied and skips the
+# install — leaving the PREVIOUS build's extension in place while `/src` holds
+# the new sources. That is not a theoretical hazard: after the cluster moved to
+# wire v37 this image shipped a v35 client three builds running, each one
+# looking like a successful build, and the failure surfaced only as
+# "decode GetClusterIdResp failed" at runtime. `--no-deps` keeps the reinstall
+# from dragging the rest of the environment with it.
 RUN cd python \
  && maturin build --release --interpreter python3 \
- && python3 -m pip install --no-cache-dir target/wheels/autumn-*.whl \
- && python3 -m pip install --no-cache-dir -e autumn_kvcache
+ && python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+      target/wheels/autumn-*.whl \
+ && python3 -m pip install --no-cache-dir -e autumn_kvcache \
+ && mkdir -p /usr/local/share/autumn \
+ && grep -hoE "WIRE_VERSION_(MIN|MAX): u32 = [0-9]+" /src/crates/rpc/src/lib.rs \
+      > /usr/local/share/autumn/client-wire-version \
+ && md5sum /usr/local/lib/python3.10/dist-packages/autumn/autumn*.so \
+      >> /usr/local/share/autumn/client-wire-version \
+ && cat /usr/local/share/autumn/client-wire-version
 
 # Fail the BUILD, not the first request. `attach_l3` is written so that a tier
 # it cannot construct costs nothing — it logs one line and the engine serves

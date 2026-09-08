@@ -185,7 +185,7 @@ spec:
       # dies with it.
       initContainers:
         - name: fusebin
-          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:1e2cca496cf747a92e8d9f7626cfcc01d2d5857b
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:f754c37b9f81bffc39813dafb60de1dddd63b0c4
           command: ["sh","-c","cp /usr/local/bin/autumn-fuse /fusebin/ && chmod +x /fusebin/autumn-fuse"]
           volumeMounts:
             - { name: fusebin, mountPath: /fusebin }
