@@ -16,9 +16,25 @@ is schema-aware (it also cleans the FTS index and related tables).
 import argparse
 import ast
 import json
+import re
 import sys
 
 from hermes_state import SessionDB  # hermes venv only
+
+
+def _provisional_title(preview: str) -> str:
+    """A short name from the opening line. Empty stays empty.
+
+    The preview has already had its newlines flattened to spaces, so the break
+    between what the reader actually asked and the prompt template that follows
+    survives only as a RUN of spaces. Splitting on that recovers the question —
+    "六道", not "六道  你是佛教典籍的检索助手，工作是…".
+    """
+    head = re.split(r"\s{2,}", preview.strip(), maxsplit=1)[0].strip()
+    head = head.split("\n", 1)[0].strip()
+    if len(head) > 24:
+        head = head[:24].rstrip() + "\u2026"
+    return head
 
 
 def list_sessions(limit: int, include_empty: bool) -> list[dict]:
@@ -31,9 +47,18 @@ def list_sessions(limit: int, include_empty: bool) -> list[dict]:
         # and cannot be usefully loaded, so drop them unless asked for.
         if not include_empty and not r.get("message_count"):
             continue
+        # hermes titles a session asynchronously, so a conversation that is
+        # minutes old and fifteen messages long can still have none — and the
+        # sidebar was calling those "(未命名)" while holding the opening line in
+        # `preview`. Stand in with the first thing the reader said, which is
+        # what they would call it themselves, until the real title lands.
+        title = (r.get("title") or "").strip()
+        if not title:
+            title = _provisional_title(r.get("preview") or "")
         out.append({
             "id": r.get("id"),
-            "title": r.get("title") or "",
+            "title": title,
+            "titleProvisional": not (r.get("title") or "").strip(),
             "preview": r.get("preview") or "",
             "lastActive": r.get("last_active") or r.get("started_at") or 0,
             "messageCount": r.get("message_count") or 0,

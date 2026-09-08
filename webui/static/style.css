@@ -279,3 +279,15 @@ header h1 em { color:var(--accent); font-style:italic; }
 #about-close:hover { color:var(--text); }
 #about-body { font-family:var(--serif); font-size:0.95rem; line-height:1.85; }
 #about-body pre { font-family:var(--mono); font-size:0.72rem; line-height:1.45; }
+
+/* A streaming session carries its own stop control. With mid-turn browsing the
+   composer's button sits in front of whatever is being READ, which is not
+   necessarily what is running — so the stop that belongs to a turn lives on
+   that turn's row. Always visible, unlike the delete beside it: it is the
+   affordance for something happening right now, not a rare destructive action. */
+.sess.streaming .t::after { content:' \25CF'; color:var(--accent);
+                            animation:blink 1s steps(2) infinite; }
+.sess .stop-row { position:absolute; right:2.4rem; top:50%; transform:translateY(-50%);
+                  border:0; background:transparent; color:var(--accent);
+                  cursor:pointer; font-size:0.7rem; line-height:1; padding:0.25rem; }
+.sess .stop-row:hover { color:var(--text); }

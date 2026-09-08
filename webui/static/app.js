@@ -77,6 +77,7 @@ const S = {
   sessionId: null,
   switching: null,      // a history read in flight; sending must wait for it
   pendingNew: false,    // "new session" clicked; the ACP move happens on send
+  streamingSession: null,  // which session owns the running turn, if any
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -497,12 +498,35 @@ function endTurn(error) {
   loadSessions();   // the turn may have created or retitled a session
 }
 
+function cancelTurn() {
+  // A REQUEST, not an instant stop: the agent finishes the chunk it is on
+  // first, measured at ~12 s here. Without saying so the button reads as
+  // broken, which is exactly how it was reported.
+  if (!S.busy || S.stopping) return;        // a second click adds nothing
+  S.stopping = true;
+  $("#send").textContent = "停止中…";
+  $("#send").disabled = true;
+  status("正在停止,等 agent 收尾…");
+  fetch("/api/chat/cancel", { method: "POST" }).catch(() => {
+    // The request itself failed — re-arm so the button is usable again.
+    S.stopping = false;
+    $("#send").textContent = "停止";
+    $("#send").disabled = false;
+    status("停止请求发送失败");
+  });
+}
+
 function setBusy(b) {
   S.busy = b;
   if (!b) S.stopping = false;
+  // Only when the reader is looking AT the streaming session. Otherwise the
+  // composer would offer to stop a turn belonging to a conversation that is
+  // not on screen — which is what a global busy flag did as soon as browsing
+  // mid-turn became possible.
+  const mine = b && (!S.streamingSession || S.streamingSession === S.sessionId);
   $("#send").disabled = false;
-  $("#send").textContent = b ? "停止" : "发送";
-  $("#send").classList.toggle("stop", b);
+  $("#send").textContent = mine ? "停止" : "发送";
+  $("#send").classList.toggle("stop", !!mine);
   if (b) {
     S.startedAt = Date.now();
     if (!S.timer) S.timer = setInterval(() => { tick(); tickSlow(); }, 90);
@@ -530,12 +554,27 @@ async function loadSessions() {
   // can learn it for a conversation it did not open from the sidebar — a fresh
   // one gets its id from hermes on its first turn — and without it those
   // conversations all key their disclosure state to the same "-" bucket.
-  if (j.current) S.sessionId = j.current;
+  // `j.current` is where the AGENT is, which is no longer where the reader is
+  // looking — that is the whole point of being able to browse mid-turn. Adopt
+  // it only when the reader has no session of their own yet.
+  if (!S.sessionId && j.current) S.sessionId = j.current;
+  S.streamingSession = j.streaming || null;
   $("#sess-count").textContent = rows.length ? String(rows.length) : "";
   rows.forEach((s) => {
-    const li = el("li", s.id === j.current ? "sess cur" : "sess");
+    let cls = s.id === S.sessionId ? "sess cur" : "sess";
+    if (s.is_streaming) cls += " streaming";
+    const li = el("li", cls);
     li.append(el("div", "t", s.title || "(未命名)"), el("div", "p", s.preview || ""));
     li.onclick = () => openSession(s.id);
+    if (s.is_streaming) {
+      // The stop control belongs to the session that is actually running, not
+      // to the composer. With browsing allowed, a global stop button sits in
+      // front of whatever you happen to be READING and stops something else.
+      const stop = el("button", "stop-row", "■");
+      stop.title = "停止这个会话的回复";
+      stop.onclick = (e) => { e.stopPropagation(); cancelTurn(); };
+      li.appendChild(stop);
+    }
     const del = el("button", "del", "×");
     del.title = "删除会话";
     del.onclick = (e) => { e.stopPropagation(); removeSession(s.id); };
@@ -651,6 +690,12 @@ async function send() {
   // `attached` means a turn was ALREADY running and we joined it -- its prompt
   // is not the one we just drew, so let the echo paint it.
   if (j.attached) S.skipUserEcho = false;
+  // A brand-new conversation gets its id from hermes only now, so this is the
+  // first moment the sidebar can show it. Refreshing here rather than at the
+  // end of the turn is the difference between "it appears when you ask" and
+  // "it appears when the answer finishes".
+  if (j.sessionId) S.sessionId = j.sessionId;
+  loadSessions();
   remember(j.streamId, 0);
   showPending();
   attach(j.streamId, 0);
@@ -715,21 +760,7 @@ async function boot() {
   $("#send").onclick = (e) => {
     if (!S.busy) return;                    // not busy: let the form submit
     e.preventDefault();
-    if (S.stopping) return;                 // already asked; a second click adds nothing
-    // Cancel is a REQUEST, not an instant stop: the agent finishes the chunk it
-    // is on first, measured at ~12 s here. Without saying so the button reads as
-    // broken, which is exactly how it was reported.
-    S.stopping = true;
-    $("#send").textContent = "停止中…";
-    $("#send").disabled = true;
-    status("正在停止,等 agent 收尾…");
-    fetch("/api/chat/cancel", { method: "POST" }).catch(() => {
-      // The request itself failed — re-arm so the button is usable again.
-      S.stopping = false;
-      $("#send").textContent = "停止";
-      $("#send").disabled = false;
-      status("停止请求发送失败");
-    });
+    cancelTurn();
   };
 
   const input = $("#input");

@@ -882,3 +882,52 @@ def test_opening_a_session_is_not_gated_on_a_running_turn():
     body = body[:body.index("\nasync function ")]
     assert "S.busy" not in body, f"openSession still refuses while busy:\n{body[:400]}"
     assert "/history" in body, "openSession is not reading the read-only transcript"
+
+
+@pytest.mark.asyncio
+async def test_starting_a_turn_says_which_session_it_belongs_to(aiohttp_client, app):
+    """So the sidebar can show a new conversation the moment it is asked.
+
+    A brand-new session gets its id from hermes only when the first turn starts,
+    so without this the client has nothing to select and the row could not
+    appear until the answer finished.
+    """
+    client = await aiohttp_client(app)
+    r = await client.post("/api/chat/start", json={"text": "hello"})
+    body = await r.json()
+    assert body.get("sessionId") == "sess-1", body
+    await client.post("/api/chat/cancel")
+
+
+def test_a_new_conversation_is_listed_as_soon_as_it_is_asked():
+    """Ablation: move `loadSessions()` back to `endTurn` alone and this is red.
+
+    The list used to be refreshed only when a turn ENDED, so a question you just
+    asked had no row until the reply landed.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function send()"):]
+    # Stop at the next top-level definition of EITHER kind. Slicing only on
+    # `function ` ran past the end of send() into a later one that does call
+    # `loadSessions`, so the assertion passed with the line removed.
+    ends = [body.index(m) for m in ("\nasync function ", "\nfunction ") if m in body]
+    body = body[:min(ends)] if ends else body
+    assert "loadSessions()" in body, f"send() never refreshes the sidebar:\n{body}"
+
+
+def test_the_stop_control_belongs_to_the_session_that_is_running():
+    """Not to the composer.
+
+    Browsing mid-turn means the composer sits in front of whatever is being
+    READ, which is not necessarily what is streaming — so a global stop button
+    offers to stop someone else's turn. The streaming row carries its own, and
+    the composer only turns into a stop when the reader is looking at the
+    session that owns the turn.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    assert "stop-row" in src, "no per-session stop control is rendered"
+    busy = src[src.index("function setBusy("):]
+    busy = busy[:busy.index("\n}")]
+    assert "S.streamingSession" in busy, (
+        "the composer's stop is still driven by a global busy flag:\n" + busy
+    )

@@ -710,6 +710,7 @@ async def handle_chat_start(request: web.Request) -> web.Response:
         # the turn in flight instead of being told "busy" with no way back to it.
         cur = st.current
         return web.json_response({"streamId": cur.stream_id if cur else None,
+                                  "sessionId": cur.session_id if cur else None,
                                   "attached": True})
     try:
         body = await request.json()
@@ -785,7 +786,11 @@ async def handle_chat_start(request: web.Request) -> web.Response:
                 stream.finish(error=str(e))
 
     st.turn_task = asyncio.create_task(run())
-    return web.json_response({"streamId": stream.stream_id, "attached": False})
+    # The session id comes back because a brand-new conversation gets it from
+    # hermes only now: without it the sidebar has nothing to select, and the row
+    # would appear unattached to what the reader is looking at.
+    return web.json_response({"streamId": stream.stream_id,
+                              "sessionId": acp.session_id, "attached": False})
 
 
 async def handle_chat_stream(request: web.Request) -> web.StreamResponse:
