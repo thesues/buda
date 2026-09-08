@@ -35,6 +35,8 @@ class FakeACP:
         self.emitted: list[str] = []
         self.on_update = None
         self.cancelled = False
+        self.loads: list[str] = []
+        self.reads: list[str] = []
 
     async def prompt(self, text, on_update, on_permission):
         for i in range(3):
@@ -54,6 +56,15 @@ class FakeACP:
 
     async def new_session(self):
         self.session_id = None
+
+    async def load_session(self, sid, on_update):
+        # The move this whole design is about: it relocates the ONE agent.
+        self.session_id = sid
+        self.loads.append(sid)
+
+    async def read_history(self, sid):
+        self.reads.append(sid)
+        return [{"kind": "history_user", "text": f"hi from {sid}"}]
 
 
 @pytest.fixture
@@ -823,3 +834,51 @@ async def test_an_event_emitted_between_the_drain_and_the_park_is_not_slept_thro
     ]
     assert kinds == ["delta", "end"], kinds
     assert ": keepalive" not in body, "the reader slept through its own wakeup"
+
+
+@pytest.mark.asyncio
+async def test_reading_a_transcript_does_not_move_the_agent(aiohttp_client, app):
+    """The whole reason the UI used to refuse a mid-turn switch.
+
+    There is one ACP process and `session/load` relocates it, so reading a
+    transcript through it meant a streaming turn lost its agent. History now
+    comes from hermes' own store; this asserts the read stays off ACP.
+    """
+    acp = app["state"].acp
+    client = await aiohttp_client(app)
+    r = await client.get("/api/session/other-sess/history")
+    assert r.status == 200
+    body = await r.json()
+    assert body["history"][0]["text"] == "hi from other-sess"
+    assert acp.loads == [], "reading a transcript moved the agent"
+    assert acp.session_id == "sess-1", "the agent drifted off its session"
+
+
+@pytest.mark.asyncio
+async def test_the_agent_is_moved_when_something_is_sent(aiohttp_client, app):
+    """The other half: deferred, not skipped.
+
+    Viewing is free, so the relocation has to happen at the next send — and
+    that is safe because the server runs one turn at a time, so nothing is
+    streaming at that moment.
+    """
+    acp = app["state"].acp
+    client = await aiohttp_client(app)
+    r = await client.post("/api/chat/start",
+                          json={"text": "hello", "sessionId": "other-sess"})
+    assert r.status == 200
+    assert acp.loads == ["other-sess"], f"agent not moved: {acp.loads}"
+    await client.post("/api/chat/cancel")
+
+
+def test_opening_a_session_is_not_gated_on_a_running_turn():
+    """A reader may look wherever they like while a turn streams.
+
+    Ablation: put the `S.busy` early return back into `openSession` and this
+    goes red. The guard existed only because opening a session moved the agent.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function openSession("):]
+    body = body[:body.index("\nasync function ")]
+    assert "S.busy" not in body, f"openSession still refuses while busy:\n{body[:400]}"
+    assert "/history" in body, "openSession is not reading the read-only transcript"

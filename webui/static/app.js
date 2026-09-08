@@ -75,7 +75,8 @@ const S = {
   activity: null,        // the current turn's one activity disclosure
   actIndex: 0,           // its position in the transcript, for the open-state key
   sessionId: null,
-  switching: null,      // a session/load in flight; sending must wait for it
+  switching: null,      // a history read in flight; sending must wait for it
+  pendingNew: false,    // "new session" clicked; the ACP move happens on send
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -560,7 +561,11 @@ function paintHistory(history) {
 }
 
 async function openSession(id) {
-  if (S.busy) { status("先等待或停止当前回复"); return; }
+  // No busy guard. Reading a transcript no longer moves the agent, so a turn
+  // in flight is none of this function's business — it keeps streaming into
+  // whichever session owns it, and `send()` relocates the agent when the reader
+  // actually says something. Telling someone to "wait or stop the current
+  // reply" just to LOOK at another conversation was the whole complaint.
   $("#messages").textContent = "";
   S.tools.clear(); S.seg = null; S.activity = null; S.actIndex = 0; S.sessionId = id;
 
@@ -576,10 +581,7 @@ async function openSession(id) {
 
   let j;
   try {
-    j = await (await fetch("/api/session/load", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id }),
-    })).json();
+    j = await (await fetch(`/api/session/${encodeURIComponent(id)}/history`)).json();
   } catch (_) {
     S.switching = null; status("载入会话失败"); return;
   }
@@ -600,8 +602,10 @@ async function removeSession(id) {
 }
 
 async function newSession() {
-  if (S.busy) { status("先等待或停止当前回复"); return; }
-  await fetch("/api/session/new", { method: "POST" }).catch(() => {});
+  // Purely local. `/api/session/new` moves the one ACP process, which a turn in
+  // flight cannot survive, so the intent is recorded and acted on at the next
+  // send — where nothing is streaming by construction.
+  S.pendingNew = true;
   $("#messages").textContent = "";
   S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
   status("就绪");
@@ -632,11 +636,18 @@ async function send() {
   try {
     j = await (await fetch("/api/chat/start", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        // The agent is relocated server-side from these, not when a session was
+        // clicked. Both are no-ops when it is already in the right place.
+        sessionId: S.pendingNew ? "" : (S.sessionId || ""),
+        new: !!S.pendingNew,
+      }),
     })).json();
   } catch (_) { status("发送失败"); return; }
   if (j.error) { status(j.error); return; }
   if (!j.streamId) { status("没有可用的会话流"); return; }
+  S.pendingNew = false;
   // `attached` means a turn was ALREADY running and we joined it -- its prompt
   // is not the one we just drew, so let the echo paint it.
   if (j.attached) S.skipUserEcho = false;

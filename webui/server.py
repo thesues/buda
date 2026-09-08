@@ -384,6 +384,26 @@ class HermesACP:
                                f"{err.decode(errors='replace')[:400]}")
         return json.loads(out.decode() or "[]")
 
+    async def read_history(self, sid: str) -> list[dict]:
+        """One session's transcript WITHOUT moving the agent to it.
+
+        `load_session` is what relocates the single ACP process, so it was
+        impossible to look at another conversation while a turn was streaming —
+        the read would have yanked the agent out from under it. That is the only
+        reason the UI refused to switch, and this is what removes the reason:
+        the store already holds the transcript, and reading it costs the turn
+        nothing.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            HERMES_PY, HERMES_SESSION_API, "history", "--id", sid,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"session history failed (rc={proc.returncode}): "
+                               f"{err.decode(errors='replace')[:400]}")
+        return json.loads(out.decode() or "[]")
+
     async def load_session(self, sid: str, on_update) -> None:
         await self.ensure_proc()
         self.on_update = on_update
@@ -700,6 +720,26 @@ async def handle_chat_start(request: web.Request) -> web.Response:
         return web.json_response({"error": "empty message"}, status=400)
 
     acp = st.acp
+    # Relocate the agent HERE, not when the reader opens a session. There is one
+    # ACP process and `session/load` moves it, so doing that on a click meant a
+    # turn in flight would have the agent pulled out from under it — hence the
+    # old "wait or stop the current reply". Sending is the moment it is safe:
+    # the server runs one turn at a time, so nothing is streaming right now.
+    if body.get("new"):
+        # "New session" is recorded on the client and acted on here for the same
+        # reason: `new_session` moves the one ACP process too.
+        try:
+            await acp.new_session()
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": f"could not start a session: {e}"},
+                                     status=500)
+    want = (body.get("sessionId") or "").strip()
+    if want and want != acp.session_id:
+        try:
+            await acp.load_session(want, None)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": f"could not open {want}: {e}"},
+                                     status=500)
     stream = TurnStream(secrets.token_hex(8), acp.session_id)
     st.streams[stream.stream_id] = stream
     st.current = stream
@@ -951,12 +991,21 @@ async def handle_approval_answer(request: web.Request) -> web.Response:
 # Sessions                                                                      #
 # --------------------------------------------------------------------------- #
 async def handle_sessions(request: web.Request) -> web.Response:
-    acp = state(request).acp
+    st = state(request)
+    acp = st.acp
     try:
         rows = await acp.list_sessions()
     except Exception as e:  # noqa: BLE001
         return web.json_response({"error": str(e)}, status=500)
-    return web.json_response({"sessions": rows, "current": acp.session_id})
+    # Per session, not one global flag. A reader looking at an idle session
+    # while another one streams must see THAT session's state; deriving it from
+    # a global is how a busy session's spinner ends up on an idle one.
+    running = st.turn_task is not None and not st.turn_task.done()
+    busy_sid = acp.session_id if running else None
+    for r in rows:
+        r["is_streaming"] = bool(busy_sid and r.get("id") == busy_sid)
+    return web.json_response({"sessions": rows, "current": acp.session_id,
+                              "streaming": busy_sid})
 
 
 async def handle_session_new(request: web.Request) -> web.Response:
@@ -991,6 +1040,23 @@ async def handle_session_load(request: web.Request) -> web.Response:
     except Exception as e:  # noqa: BLE001
         return web.json_response({"error": str(e)}, status=500)
     return web.json_response({"ok": True, "current": sid, "history": history})
+
+
+async def handle_session_history(request: web.Request) -> web.Response:
+    """Read a transcript. Never touches ACP, so it is safe mid-turn.
+
+    Paired with the lazy `session/load` in `handle_chat_start`: viewing is free,
+    and the agent is relocated only when something is actually sent — at which
+    point no turn is in flight, because the server runs one at a time anyway.
+    """
+    sid = (request.match_info.get("sid") or "").strip()
+    if not sid:
+        return web.json_response({"error": "missing id"}, status=400)
+    try:
+        history = await state(request).acp.read_history(sid)
+    except Exception as e:  # noqa: BLE001
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response({"ok": True, "id": sid, "history": history})
 
 
 async def handle_session_delete(request: web.Request) -> web.Response:
@@ -1100,6 +1166,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/sessions", handle_sessions)
     app.router.add_post("/api/session/new", handle_session_new)
     app.router.add_post("/api/session/load", handle_session_load)
+    app.router.add_get(r"/api/session/{sid}/history", handle_session_history)
     app.router.add_delete(r"/api/session/{sid}", handle_session_delete)
     # `must-revalidate` with a zero max-age: the browser may keep the file, but
     # it has to ask before using it. aiohttp already sends an ETag, so a
