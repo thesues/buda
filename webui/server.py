@@ -124,12 +124,19 @@ MAX_CONCURRENT_TURNS = max(1, int(os.environ.get("MAX_CONCURRENT_TURNS", "4")))
 # nothing (EventSource ignores comments).
 SSE_HEARTBEAT_SEC = 25
 
-# asyncio's StreamReader caps a line at 64 KiB by default, and ACP frames one
-# JSON-RPC message per line. A chat reply never comes close; an MCP tool RESULT
-# does -- a corpus search returning document text blew straight past it, and
+# asyncio's StreamReader caps a line at 64 KiB by default, and BOTH pipes here
+# frame one JSON message per line -- ACP's JSON-RPC, and the session bridge's
+# request/response. A chat reply never comes close; an MCP tool RESULT does --
+# a corpus search returning document text blew straight past it, and
 # `readline()` raises rather than truncating, which killed the read loop and
 # left the turn dead with no output and no error. Sized for a tool result, not
 # for a sentence.
+#
+# The bridge hit the identical wall from the other direction and was missed for
+# longer, because its failure looked like something else: a transcript is ONE
+# line, so any conversation past ~64 KiB could not be opened at all. Measured on
+# a real session: 196,503 bytes, three times the default. Any pipe read with
+# `readline()` in this file gets this limit.
 ACP_LINE_LIMIT = 32 * 1024 * 1024
 
 # Appended to the first prompt of a session, never prepended: the session's
@@ -471,6 +478,7 @@ class HermesACP:
                             stdin=asyncio.subprocess.PIPE,
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.DEVNULL,
+                            limit=ACP_LINE_LIMIT,
                         )
                         hello = await self._bridge_proc.stdout.readline()
                         if not hello:
@@ -495,7 +503,7 @@ class HermesACP:
         try:
             return await self._bridge({"cmd": "list", "limit": 200})
         except Exception:  # noqa: BLE001
-            logger.warning("session bridge unavailable; falling back to a spawn")
+            log.warning("session bridge unavailable; falling back to a spawn", exc_info=True)
         proc = await asyncio.create_subprocess_exec(
             HERMES_PY, HERMES_SESSION_API, "list", "--limit", "200",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -524,7 +532,7 @@ class HermesACP:
         try:
             return await self._bridge({"cmd": "history", "id": sid})
         except Exception:  # noqa: BLE001
-            logger.warning("session bridge unavailable; falling back to a spawn")
+            log.warning("session bridge unavailable; falling back to a spawn", exc_info=True)
         proc = await asyncio.create_subprocess_exec(
             HERMES_PY, HERMES_SESSION_API, "history", "--id", sid,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

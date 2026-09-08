@@ -1428,3 +1428,55 @@ async def test_loading_a_session_hermes_does_not_know_says_so():
     with pytest.raises(RuntimeError, match="does not know session ghost"):
         await acp.load_session("ghost")
     assert "ghost" not in acp._known, "an unknown session was marked promptable"
+
+
+@pytest.mark.asyncio
+async def test_a_long_transcript_survives_the_session_bridge():
+    """A transcript is ONE line on the bridge pipe, and asyncio caps a line at
+    64 KiB by default. Measured on a real session: 196,503 bytes — so any
+    conversation past about 64 KiB could not be opened at all.
+
+    The ACP pipe already had this fix; the bridge, framed the same way, did not.
+    This drives the production `_bridge` against a stand-in that answers with an
+    oversized line, so removing `limit=` turns it red.
+    """
+    payload = json.dumps({"ok": [{"kind": "delta", "text": "x" * 200_000}]})
+    script = (
+        "import sys\n"
+        "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+        f"sys.stdout.write({payload!r} + '\\n'); sys.stdout.flush()\n"
+    )
+    acp = srv.HermesACP()
+    old = (srv.HERMES_PY, srv.HERMES_SESSION_API)
+    srv.HERMES_PY, srv.HERMES_SESSION_API = sys.executable, "-c"
+
+    # `_bridge` passes "serve" as a third argument, which `python -c <script>`
+    # takes as sys.argv[1] and ignores. That is what lets the real call shape
+    # run against a stand-in.
+    real_exec = asyncio.create_subprocess_exec
+
+    async def exec_with_script(py, dash_c, _serve, **kw):
+        return await real_exec(py, dash_c, script, **kw)
+
+    asyncio.create_subprocess_exec = exec_with_script
+    try:
+        got = await acp._bridge({"cmd": "history", "id": "big"})
+    finally:
+        asyncio.create_subprocess_exec = real_exec
+        srv.HERMES_PY, srv.HERMES_SESSION_API = old
+        if acp._bridge_proc and acp._bridge_proc.returncode is None:
+            acp._bridge_proc.kill()
+            await acp._bridge_proc.wait()
+
+    assert len(got[0]["text"]) == 200_000, "the oversized reply was truncated"
+
+
+def test_the_bridge_fallback_can_actually_run():
+    """It could not: the fallback logged through `logger`, which this module
+    does not define — so a bridge failure raised NameError instead of spawning,
+    and the error the reader saw named neither cause."""
+    src = (Path(__file__).resolve().parents[1] / "server.py").read_text()
+    assert "logger." not in src, (
+        "server.py logs through an undefined `logger`; the module logger is `log`"
+    )
