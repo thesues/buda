@@ -931,3 +931,18 @@ def test_the_stop_control_belongs_to_the_session_that_is_running():
     assert "S.streamingSession" in busy, (
         "the composer's stop is still driven by a global busy flag:\n" + busy
     )
+
+
+def test_deleting_a_conversation_asks_first():
+    """It did not, and the control is invisible until hover.
+
+    `.del` is `opacity:0` until the row is hovered and covers the right 2.4rem
+    at full height — the same place a hand lands to click the row. An immediate,
+    schema-aware, undoable-by-nothing delete behind an invisible target took
+    three conversations out of the store.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function removeSession("):]
+    body = body[:body.index("\n}") + 2]
+    assert "confirm(" in body, f"delete still fires with no prompt:\n{body}"
+    assert body.index("confirm(") < body.index("fetch("), "it asks after deleting"

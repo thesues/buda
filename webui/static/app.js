@@ -557,7 +557,11 @@ async function loadSessions() {
   // `j.current` is where the AGENT is, which is no longer where the reader is
   // looking — that is the whole point of being able to browse mid-turn. Adopt
   // it only when the reader has no session of their own yet.
-  if (!S.sessionId && j.current) S.sessionId = j.current;
+  // A brand-new conversation has no id at the moment `chat/start` returns —
+  // hermes assigns it as the turn begins — so the row appears unselected. If we
+  // have none of our own, the streaming session is ours by construction: we
+  // just sent to it.
+  if (!S.sessionId) S.sessionId = j.streaming || j.current || null;
   S.streamingSession = j.streaming || null;
   $("#sess-count").textContent = rows.length ? String(rows.length) : "";
   rows.forEach((s) => {
@@ -577,7 +581,7 @@ async function loadSessions() {
     }
     const del = el("button", "del", "×");
     del.title = "删除会话";
-    del.onclick = (e) => { e.stopPropagation(); removeSession(s.id); };
+    del.onclick = (e) => { e.stopPropagation(); removeSession(s.id, s.title); };
     li.appendChild(del);
     ul.appendChild(li);
   });
@@ -635,8 +639,15 @@ async function openSession(id) {
   loadSessions();
 }
 
-async function removeSession(id) {
+async function removeSession(id, title) {
+  // Ask first. This control is invisible until hover and covers the right
+  // 2.4rem of the row at full height, so it sits exactly where a hand goes to
+  // click the row itself — and the delete is immediate, schema-aware, and has
+  // no undo. Three conversations went that way.
+  const name = (title || "").trim() || id.slice(0, 8);
+  if (!confirm(`删除会话「${name}」?此操作不可撤销。`)) return;
   await fetch(`/api/session/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+  if (S.sessionId === id) S.sessionId = null;
   loadSessions();
 }
 
