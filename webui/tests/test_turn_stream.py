@@ -924,13 +924,12 @@ def test_the_stop_control_belongs_to_the_session_that_is_running():
     """Not to the composer.
 
     Browsing mid-turn means the composer sits in front of whatever is being
-    READ, which is not necessarily what is streaming — so a global stop button
-    offers to stop someone else's turn. The streaming row carries its own, and
-    the composer only turns into a stop when the reader is looking at the
-    session that owns the turn.
+    READ, which is not necessarily what is streaming — so a stop driven by a
+    global busy flag offers to stop someone else's turn. It becomes a stop only
+    when the reader is looking at the session that owns the turn; from anywhere
+    else it is a disabled 发送, and stopping means going to that session.
     """
     src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
-    assert "stop-row" in src, "no per-session stop control is rendered"
     busy = src[src.index("function setBusy("):]
     busy = busy[:busy.index("\n}")]
     assert "S.streamingSession" in busy, (

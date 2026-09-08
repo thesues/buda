@@ -650,15 +650,6 @@ function renderSessions() {
     const li = el("li", cls);
     li.append(el("div", "t", s.title || "(未命名)"), el("div", "p", s.preview || ""));
     li.onclick = () => openSession(s.id);
-    if (s.is_streaming) {
-      // The stop control belongs to the session that is actually running, not
-      // to the composer. With browsing allowed, a global stop button sits in
-      // front of whatever you happen to be READING and stops something else.
-      const stop = el("button", "stop-row", "■");
-      stop.title = "停止这个会话的回复";
-      stop.onclick = (e) => { e.stopPropagation(); cancelTurn(); };
-      li.appendChild(stop);
-    }
     const del = el("button", "del", "×");
     del.title = "删除会话";
     del.onclick = (e) => { e.stopPropagation(); removeSession(s.id, s.title); };
