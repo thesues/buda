@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -880,7 +881,11 @@ def test_opening_a_session_is_not_gated_on_a_running_turn():
     src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
     body = src[src.index("async function openSession("):]
     body = body[:body.index("\nasync function ")]
-    assert "S.busy" not in body, f"openSession still refuses while busy:\n{body[:400]}"
+    # Reading `S.busy` is fine and now necessary — the function reattaches to a
+    # live turn and reports it honestly. What must not come back is the early
+    # RETURN that refused to open the session at all.
+    guard = re.search(r"if\s*\(\s*S\.busy\s*\)\s*\{[^}]*\breturn\b", body)
+    assert guard is None, f"openSession still refuses while busy:\n{guard.group(0)}"
     assert "/history" in body, "openSession is not reading the read-only transcript"
 
 
@@ -946,3 +951,57 @@ def test_deleting_a_conversation_asks_first():
     body = body[:body.index("\n}") + 2]
     assert "confirm(" in body, f"delete still fires with no prompt:\n{body}"
     assert body.index("confirm(") < body.index("fetch("), "it asks after deleting"
+
+
+@pytest.mark.asyncio
+async def test_every_streamed_event_says_which_session_it_belongs_to(aiohttp_client, app):
+    """Without it the client cannot tell whose tokens it is drawing.
+
+    Browsing mid-turn means the reader may be looking at another conversation,
+    and an unattributed stream paints into whatever transcript is on screen —
+    which is what clicking "new session" during a reply did.
+    """
+    client = await aiohttp_client(app)
+    r = await client.post("/api/chat/start", json={"text": "hi"})
+    sid = (await r.json())["streamId"]
+    resp = await client.get(f"/api/chat/stream?stream_id={sid}&after_seq=0")
+    evs = await read_events(resp, 2)
+    assert all("session" in e for e in evs), evs
+    assert {e["session"] for e in evs} == {"sess-1"}, evs
+    await client.post("/api/chat/cancel")
+
+
+def test_a_foreign_event_is_not_drawn():
+    """Ablation: drop the `mine` check in `apply` and this goes red."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("function apply(ev) {"):]
+    body = body[:body.index("\n  switch (ev.kind)")]
+    assert "ev.session" in body and "S.sessionId" in body, (
+        "apply() draws every event regardless of whose it is:\n" + body
+    )
+
+
+def test_leaving_a_streaming_session_does_not_claim_idle():
+    """"就绪" while a reply is still running is a lie the reader acts on."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function newSession()"):]
+    body = body[:body.index("\n}") + 2]
+    assert "S.busy ?" in body, f"newSession still reports idle unconditionally:\n{body}"
+
+
+def test_a_fresh_conversation_looks_different_from_one_with_history():
+    """A blank message panel reads as "loading", not as "nothing said yet".
+
+    A new conversation gets its own shape — greeting and composer together in
+    the middle of the column — so the state is legible before typing anything.
+    Ablation: drop `showFresh()` from `newSession` and this goes red.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    css = (Path(__file__).resolve().parents[1] / "static" / "style.css").read_text()
+    body = src[src.index("async function newSession()"):]
+    body = body[:body.index("\n}") + 2]
+    assert "showFresh()" in body, f"newSession opens on a blank panel:\n{body}"
+    assert ".chat.fresh #composer" in css, "the fresh layout is not distinct"
+    # And it must give way the moment anything is said.
+    add = src[src.index("function addMsg("):]
+    assert "clearFresh()" in add[:add.index("\n}") + 2], "the hero survives the first message"

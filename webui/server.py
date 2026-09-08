@@ -192,7 +192,12 @@ class TurnStream:
         self.seq += 1
         if len(self.events) == self.events.maxlen:
             self.dropped += 1
-        self.events.append((self.seq, {"kind": kind, "seq": self.seq, **data}))
+        # Every event says which conversation it belongs to. The reader can be
+        # looking somewhere else — that is the point of browsing mid-turn — and
+        # without this the client paints one session's tokens into whatever
+        # transcript happens to be on screen.
+        self.events.append((self.seq, {"kind": kind, "seq": self.seq,
+                                       "session": self.session_id, **data}))
         self._bell.set()
         self._bell = asyncio.Event()
 
@@ -747,6 +752,11 @@ async def handle_chat_start(request: web.Request) -> web.Response:
     stream.emit("user", text=text)
 
     async def on_update(update: dict) -> None:
+        # A brand-new conversation has no id when the stream is created; hermes
+        # assigns one as the turn begins. Learn it at the first update so every
+        # event from here on can be attributed.
+        if stream.session_id is None:
+            stream.session_id = acp.session_id
         ev = _to_event(update)
         if ev:
             stream.emit(ev[0], **ev[1])
@@ -1009,8 +1019,13 @@ async def handle_sessions(request: web.Request) -> web.Response:
     busy_sid = acp.session_id if running else None
     for r in rows:
         r["is_streaming"] = bool(busy_sid and r.get("id") == busy_sid)
+    # The stream id travels with it so a reader returning to the running
+    # conversation can reattach and watch it finish, instead of seeing a
+    # transcript that stops where the store does.
+    cur = st.current if running else None
     return web.json_response({"sessions": rows, "current": acp.session_id,
-                              "streaming": busy_sid})
+                              "streaming": busy_sid,
+                              "streamingStreamId": cur.stream_id if cur else None})
 
 
 async def handle_session_new(request: web.Request) -> web.Response:

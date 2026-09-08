@@ -78,6 +78,7 @@ const S = {
   switching: null,      // a history read in flight; sending must wait for it
   pendingNew: false,    // "new session" clicked; the ACP move happens on send
   streamingSession: null,  // which session owns the running turn, if any
+  streamingStreamId: null, // and its stream, so returning to it can reattach
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -139,7 +140,32 @@ function scroll() {
 }
 
 /* ---------- messages ---------- */
+function showFresh() {
+  // A brand-new conversation looks nothing like one with history: the greeting
+  // and the composer sit together in the middle, so it is obvious at a glance
+  // that nothing has been said yet and there is no context behind it.
+  const m = $("#messages");
+  m.textContent = "";
+  const hero = el("div", "fresh-hero");
+  hero.append(
+    el("div", "fresh-mark", "✳"),
+    el("div", "fresh-title", "新的对话"),
+    el("div", "fresh-sub", "还没有任何上下文 — 问点什么开始吧"),
+  );
+  m.appendChild(hero);
+  $(".chat").classList.add("fresh");
+}
+
+function clearFresh() {
+  const c = $(".chat");
+  if (!c.classList.contains("fresh")) return;
+  c.classList.remove("fresh");
+  const hero = $(".fresh-hero");
+  if (hero) hero.remove();
+}
+
 function addMsg(role, text) {
+  clearFresh();
   const wrap = el("div", `msg ${role}`);
   const body = el("div", "bubble");
   if (text) body.textContent = text;
@@ -407,6 +433,17 @@ async function pollApprovals() {
 
 /* ---------- the stream ---------- */
 function apply(ev) {
+  // Does this belong to what the reader is looking at? Browsing mid-turn means
+  // the answer can be no, and a stream that paints regardless puts one
+  // conversation's tokens into another's transcript — which is what clicking
+  // "new session" during a reply did. The turn is untouched; only the drawing
+  // is skipped. `end` still runs, because the turn really did end and the
+  // bookkeeping it does is not about the screen.
+  const mine = !ev.session || !S.sessionId || ev.session === S.sessionId;
+  if (!mine && ev.kind !== "end") {
+    if (ev.seq) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
+    return;
+  }
   switch (ev.kind) {
     case "user":
       // We already drew this optimistically in send(), so the stream's echo of
@@ -426,7 +463,7 @@ function apply(ev) {
       break;
     case "note": finalizeSeg(); addMsg("note", ev.text); break;
     case "gap": finalizeSeg(); addMsg("note", "（断线期间有部分输出未能保留）"); break;
-    case "end": endTurn(ev.error); break;
+    case "end": endTurn(ev.error, ev.session); break;
   }
   // Only while a turn is actually live. `endTurn()` clears the saved cursor,
   // and this line runs AFTER the switch that called it — so persisting
@@ -480,8 +517,10 @@ function attach(streamId, afterSeq) {
 
 function detach() { if (S.es) { S.es.close(); S.es = null; } }
 
-function endTurn(error) {
-  // This session's transcript just grew; a cached copy would replay it short.
+function endTurn(error, owner) {
+  // The turn's own session, which is not necessarily the one on screen.
+  const shown = !owner || !S.sessionId || owner === S.sessionId;
+  if (owner) HISTORY_CACHE.delete(owner);
   if (S.sessionId) HISTORY_CACHE.delete(S.sessionId);
   detach();
   clearPending();
@@ -491,7 +530,7 @@ function endTurn(error) {
   S.tools.clear();
   S.awaitingPerm = false;
   forget();
-  if (error) addMsg("error", `⚠ ${error}`);
+  if (error && shown) addMsg("error", `⚠ ${error}`);
   const wasStopping = S.stopping;
   S.stopping = false;
   status(error ? "出错" : wasStopping ? "已停止" : "就绪");
@@ -563,6 +602,7 @@ async function loadSessions() {
   // just sent to it.
   if (!S.sessionId) S.sessionId = j.streaming || j.current || null;
   S.streamingSession = j.streaming || null;
+  S.streamingStreamId = j.streamingStreamId || null;
   $("#sess-count").textContent = rows.length ? String(rows.length) : "";
   rows.forEach((s) => {
     let cls = s.id === S.sessionId ? "sess cur" : "sess";
@@ -604,6 +644,7 @@ function paintHistory(history) {
 }
 
 async function openSession(id) {
+  clearFresh();
   // No busy guard. Reading a transcript no longer moves the agent, so a turn
   // in flight is none of this function's business — it keeps streaming into
   // whichever session owns it, and `send()` relocates the agent when the reader
@@ -635,7 +676,16 @@ async function openSession(id) {
   if (S.sessionId !== id) return;
   HISTORY_CACHE.set(id, j.history || []);
   if (!cached) paintHistory(j.history || []);
-  status("就绪");
+  if (S.busy && S.streamingSession === id && S.streamingStreamId) {
+    // Back on the conversation that is running. The store stops where the
+    // committed transcript does, so replay the live turn from the top rather
+    // than showing a reply that appears to have stopped mid-sentence.
+    S.skipUserEcho = false;
+    attach(S.streamingStreamId, 0);
+    status("回复中…");
+  } else {
+    status(S.busy ? "另一个会话仍在回复中" : "就绪");
+  }
   loadSessions();
 }
 
@@ -656,9 +706,13 @@ async function newSession() {
   // flight cannot survive, so the intent is recorded and acted on at the next
   // send — where nothing is streaming by construction.
   S.pendingNew = true;
+  // The turn in flight keeps running and keeps its stream; only the drawing
+  // stops, because `apply` now checks who each event belongs to. Detaching or
+  // calling `endTurn` here would abandon a live reply.
   $("#messages").textContent = "";
   S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
-  status("就绪");
+  showFresh();
+  status(S.busy ? "另一个会话仍在回复中" : "就绪");
   loadSessions();
 }
 
@@ -732,6 +786,10 @@ async function boot() {
         attach(id, seq);   // finished-but-unseen still needs its tail collected
       } else forget();
     } catch (_) { forget(); }
+  } else if (!$("#messages").firstChild) {
+    // Nothing to reattach and nothing on screen: this IS a fresh conversation,
+    // so say so rather than opening on a blank panel that reads as loading.
+    showFresh();
   }
 
   // The architecture note. Fetched on first open, not inlined: it is prose that

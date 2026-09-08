@@ -291,3 +291,15 @@ header h1 em { color:var(--accent); font-style:italic; }
                   border:0; background:transparent; color:var(--accent);
                   cursor:pointer; font-size:0.7rem; line-height:1; padding:0.25rem; }
 .sess .stop-row:hover { color:var(--text); }
+
+/* ---------- a brand-new conversation ---------- */
+/* Deliberately unlike a conversation with history: the greeting and the
+   composer sit together in the middle of the column rather than the composer
+   being pinned under a wall of text. The shape itself says "nothing has been
+   said here yet", which a blank message area does not — it reads as loading. */
+.chat.fresh #messages { flex:0 0 auto; margin-top:auto; overflow:visible; }
+.chat.fresh #composer { margin-bottom:auto; }
+.fresh-hero { text-align:center; padding:0 1rem 1.6rem; }
+.fresh-mark { font-size:1.6rem; color:var(--accent); line-height:1; margin-bottom:0.6rem; }
+.fresh-title { font-size:1.35rem; color:var(--text); letter-spacing:0.01em; }
+.fresh-sub { font-size:0.82rem; color:var(--text-muted); margin-top:0.35rem; }
