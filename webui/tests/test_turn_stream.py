@@ -1382,3 +1382,49 @@ def test_the_sidebar_keeps_watching_a_turn_this_page_is_not_reading():
     assert "setInterval" in body and "clearInterval" in body, (
         "the watcher never stops, or never starts:\n" + body
     )
+
+
+@pytest.mark.asyncio
+async def test_a_null_result_is_not_mistaken_for_an_error_object():
+    """hermes answers `session/load` for a session it cannot find with
+    `result: null`, not with a JSON-RPC error. `result or {"_error": ...}`
+    conflated the two, and the failure read "session/load failed: {} (code ?)"
+    — correctly loud, and impossible to act on."""
+    acp = srv.HermesACP()
+    pipe = _Pipe()
+    acp.proc = pipe
+    loop = asyncio.create_task(acp._read_loop(pipe, acp._pending))
+
+    fut = asyncio.get_running_loop().create_future()
+    acp._pending[1] = fut
+    pipe.feed({"jsonrpc": "2.0", "id": 1, "result": None})
+    assert await asyncio.wait_for(fut, timeout=5) is None, "a null result became an error"
+
+    fut2 = asyncio.get_running_loop().create_future()
+    acp._pending[2] = fut2
+    pipe.feed({"jsonrpc": "2.0", "id": 2,
+               "error": {"code": -32602, "message": "Invalid params"}})
+    assert (await asyncio.wait_for(fut2, timeout=5))["_error"]["code"] == -32602
+
+    pipe.close()
+    await asyncio.wait_for(loop, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_loading_a_session_hermes_does_not_know_says_so():
+    """And says it HERE, not at the next prompt: letting a null load through
+    would add the id to `_known` and move the failure somewhere it makes no
+    sense."""
+    acp = srv.HermesACP()
+    acp.ensure_proc = lambda: asyncio.sleep(0)
+
+    async def fake_request(method, params):
+        # What hermes actually answers for an id it cannot find: SUCCESS with an
+        # empty result, because its handler returns None and the SDK serialises
+        # that as `{}`. A real load comes back carrying `_meta`.
+        return {}
+    acp._request = fake_request
+
+    with pytest.raises(RuntimeError, match="does not know session ghost"):
+        await acp.load_session("ghost")
+    assert "ghost" not in acp._known, "an unknown session was marked promptable"

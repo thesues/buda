@@ -429,7 +429,7 @@ class HermesACP:
         res = await self._request(
             "session/new", {"cwd": WORKDIR, "mcpServers": _acp_mcp_servers()}
         )
-        sid = res.get("sessionId")
+        sid = (res or {}).get("sessionId")
         if not sid:
             raise RuntimeError("session/new returned no sessionId")
         self._known.add(sid)
@@ -507,14 +507,19 @@ class HermesACP:
         return json.loads(out.decode() or "[]")
 
     async def read_history(self, sid: str) -> list[dict]:
-        """One session's transcript WITHOUT moving the agent to it.
+        """One session's transcript, read from the store instead of through ACP.
 
-        `load_session` is what relocates the single ACP process, so it was
-        impossible to look at another conversation while a turn was streaming —
-        the read would have yanked the agent out from under it. That is the only
-        reason the UI refused to switch, and this is what removes the reason:
-        the store already holds the transcript, and reading it costs the turn
-        nothing.
+        Measured on this stack: 2.7 ms here against 1.17 s for a warm ACP
+        `session/load`, because hermes re-registers the MCP server and rebuilds
+        the agent's whole tool surface on every load regardless of how short the
+        transcript is. That factor of ~400 is what made switching conversations
+        feel slow, and it is the whole reason this path exists.
+
+        It also used to be a correctness problem, not just a speed one: back
+        when the client held a single session pointer, `load_session` relocated
+        the agent, so reading another conversation yanked it out from under a
+        streaming turn. That half is gone — sessions are addressed by id now —
+        but the cost is not, so the read still stays off ACP.
         """
         try:
             return await self._bridge({"cmd": "history", "id": sid})
@@ -545,10 +550,23 @@ class HermesACP:
         if on_update is not None:
             self._on_update[sid] = on_update
         try:
-            await self._request(
+            res = await self._request(
                 "session/load",
                 {"sessionId": sid, "cwd": WORKDIR, "mcpServers": _acp_mcp_servers()},
             )
+            # A session hermes cannot find is reported as SUCCESS with an empty
+            # result, not as a JSON-RPC error -- its handler returns None and
+            # the SDK serialises that as `{}`. Verified against 0.12 by loading
+            # a real id and a bogus one on the same process: the real one comes
+            # back carrying `_meta.hermes.sessionProvenance`, the bogus one as
+            # `{}` with "session ... not found" in the adapter's log.
+            #
+            # So the emptiness IS the signal, and it has to be acted on here:
+            # letting it through would add the id to `_known` and move the
+            # failure to the next prompt, where it reads as the agent losing a
+            # conversation it just opened.
+            if not res:
+                raise RuntimeError(f"hermes acp does not know session {sid}")
         finally:
             if on_update is not None:
                 if prev is None:
@@ -640,7 +658,15 @@ class HermesACP:
             if "id" in msg and ("result" in msg or "error" in msg):
                 fut = pending.pop(msg["id"], None)
                 if fut and not fut.done():
-                    fut.set_result(msg.get("result") or {"_error": msg.get("error")})
+                    # Distinguish an ERROR reply from a null RESULT. `result or
+                    # {"_error": ...}` conflated them, so hermes answering
+                    # `session/load` for a missing session with `result: null`
+                    # -- which it does, rather than raising -- surfaced as
+                    # "session/load failed: {} (code ?)". Loud, and unreadable.
+                    if "error" in msg:
+                        fut.set_result({"_error": msg["error"]})
+                    else:
+                        fut.set_result(msg["result"])
             elif msg.get("method") == "session/update":
                 # Drop stragglers from a superseded process.
                 if self.proc is proc:
