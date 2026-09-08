@@ -15,6 +15,16 @@ The turn runs in its own asyncio task writing into a sequence-numbered buffer.
 reload, or reconnect from another tab; the turn does not notice, and the
 reconnect replays only the delta.
 
+Turns are keyed by SESSION, and several can run at once. One `hermes acp`
+process does not mean one conversation: ACP addresses every session-scoped
+frame by `sessionId` — `session/prompt`, `session/update`, `session/cancel`,
+and `session/request_permission`, where the field is required rather than
+optional — the Python SDK dispatches each incoming request onto its own task
+instead of serialising them, and hermes' adapter keeps a `Dict[str,
+SessionState]` on a `ThreadPoolExecutor(max_workers=4)`. The limit was on this
+side: a single `session_id` field and a single pair of callbacks on the ACP
+client, which is also why `session/load` used to read as "move the agent".
+
 ```
  browser ──POST /chat/start──▶ TurnStream(seq=0)  ──▶ task: acp.prompt()
     │                              │  emit(seq++)        │
@@ -35,6 +45,10 @@ Three parts, and each exists because of a specific failure:
   exists because a push can be lost and a reloaded page never saw it.
 - **A shallow `/healthz`.** It answers while a turn runs and while `hermes acp`
   restarts. A deep probe would restart the pod in the moments this design is for.
+- **Stop escalates conditionally.** `session/cancel` cannot interrupt a running
+  tool, so Stop escalates to restarting the process — which kills every session,
+  not just the wedged one. With another turn in flight the endpoint reports the
+  cancel as unhonoured (`409 unyielding`) instead of taking a bystander down.
 
 ## What was dropped from `lerobot-agent-console`, and why that is safe
 
@@ -47,7 +61,7 @@ leak. **None can regress here, because there is no terminal.**
 
 | Depends on | How | Consequence |
 |---|---|---|
-| `hermes` | child process, ACP over stdio | one warm process; a cold `hermes chat` per turn costs ~10 s |
+| `hermes` | child process, ACP over stdio | one warm process multiplexing up to `MAX_CONCURRENT_TURNS` sessions; a cold `hermes chat` per turn costs ~10 s |
 | `memory-mcp` | **HTTP MCP** (`MEMORY_MCP_URL`) | no spawned process, no autumn credential, **not under autumn's WIRE lockstep** |
 | `freetoken` | OpenAI-compatible HTTP | set at startup via `hermes config set`, best-effort |
 
@@ -63,7 +77,7 @@ forgotten. Severity is impact-if-hit, not likelihood.
 
 | ID | Sev | Description | Status |
 |---|---|---|---|
-| W1 | med | One turn at a time, process-wide. A second `POST /chat/start` attaches to the running turn rather than queueing. Two people using one deployment will interleave. | Open — by design for a single-user UI; revisit if it becomes multi-user |
+| W1 | med | ~~One turn at a time, process-wide.~~ | **FIXED** — and the reason it was ever true is worth keeping: not the pipe, not the protocol, not hermes. This client held ONE `session_id` and ONE pair of callbacks, so a second turn had nowhere to deliver and `session/load` had to move a pointer. Both are keyed by session now; the read loop routes on the `sessionId` every frame already carried. `MAX_CONCURRENT_TURNS` defaults to 4, which is hermes' own `max_workers`. See W11 and W12. |
 | W2 | med | Turn state is in-process. A pod restart mid-turn loses the turn; the session DB keeps the history up to the last committed message, but the in-flight answer is gone. The UI now RECOVERS from it — an EventSource error asks `/api/chat/status` before claiming a reconnect, and an unknown id is reported as lost rather than reconnected-to forever. | Open — surviving the restart itself needs the turn journalled, not just buffered |
 | W3 | low | `TurnStream` backlog caps at `BACKLOG_EVENTS`; a longer turn drops its oldest events. Reported as `gap`, never silently. | Accepted |
 | W4 | med | `hermes config set model.*` runs in the pod's start script and is best-effort. If hermes renames those keys, the UI starts and chat fails at the first turn with the model unset. | Open — the failure is loud at first use, not at deploy |
@@ -73,6 +87,8 @@ forgotten. Severity is impact-if-hit, not likelihood.
 | W8 | low | `/api/session/load` replays history into the response, so a very long session's load is one large body rather than a stream. | Accepted — bounded and already complete |
 | W9 | low | The agent carries tools this UI cannot use (all `browser_*`, `delegate_task`). `acp_adapter/session.py` builds every session with a hardcoded `_expand_acp_enabled_toolsets(["hermes-acp"], ...)`; neither `agent.disabled_toolsets` nor `agent.enabled_toolsets` in config.yaml reaches it, and no env overrides it. Both were tried against 0.17. | Open — needs a patch to hermes; `HERMES_NO_DEP_INSTALL=1` at least stops the browser availability check from downloading Chromium |
 | W10 | med | An MCP server must be declared in BOTH config.yaml and the ACP `session/new` parameter. The file decides the `mcp-<name>` toolset name; the parameter makes the connection. Either alone yields an agent with no such tool — and `hermes mcp list` shows "enabled" in both cases. | Accepted — both are written, and `/api/status` reports the URL |
+| W11 | med | A Stop that the agent will not honour cannot escalate while another session is streaming: the escalation is a process restart, and the process carries every session. The endpoint answers `409 {how: "unyielding"}` and the turn keeps running until its tool returns. | Accepted — the alternative kills a bystander's reply to serve the person pressing Stop |
+| W12 | low | `MAX_CONCURRENT_TURNS` defaults to 4 because that is hermes' `ThreadPoolExecutor(max_workers=4)`. The limit BELOW it is the model: `freetoken-l3` runs `--max-running-requests 1`, so a second concurrent turn queues at the model rather than replying in parallel. Raising one without the other only moves the queue. | Accepted — queuing at the model beats being refused at the door |
 
 ## Inherited lessons (from the lerobot console, kept because they cost real time)
 
@@ -87,6 +103,8 @@ These are not bugs here; they are the reasons some code looks the way it does.
 | L5 | ACP `session/list` caches in memory, so CLI-deleted sessions kept reappearing. Read hermes' `SessionDB` directly. |
 | L6 | The steering directive is APPENDED, not prepended, or the session auto-titles itself from the directive instead of the user's words. |
 | L7 | `X-Accel-Buffering: no` — nginx buffers `text/event-stream` by default and delivers the whole "stream" at the end. |
+| L8 | A permission request was awaited INSIDE the ACP read loop. It parks on a human for up to `APPROVAL_TIMEOUT_SEC`, so with sessions multiplexed it froze every other conversation's tokens behind one person's decision. It is a detached task now — with a strong reference held, because asyncio only weakly references a task and a collected one leaves the agent waiting on an answer nobody will write. |
+| L9 | "One process" is not "one session", and reading it that way cost this UI its concurrency for months. The evidence was in the schema the whole time: `sessionId` is a REQUIRED field on `RequestPermissionRequest`, which only makes sense if two sessions can have a prompt outstanding at once. |
 
 ## Testing
 
@@ -95,6 +113,13 @@ routing and SSE framing under test are the production ones. It pins the claim
 the design rests on: a disconnect does not stop the turn, and a reconnect
 replays only the delta. Both were ablation-checked — breaking the delta logic
 turns exactly those tests red.
+
+The multiplexing has its own set, and the routing ones drive the PRODUCTION
+`_read_loop` over a fake pipe rather than a stubbed client. Ablation-checked
+together: broadcasting updates instead of routing them, escalating a Stop
+unconditionally, awaiting the permission reply inline, and dropping the
+"unnamed send continues the last conversation" rule each turn exactly the
+tests that name them red.
 
 ```
 python -m pytest tests/ -q

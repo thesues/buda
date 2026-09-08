@@ -30,16 +30,30 @@ class FakeACP:
     """
 
     def __init__(self) -> None:
-        self.session_id = "sess-1"
         self.alive = True
         self.release = asyncio.Event()
         self.emitted: list[str] = []
-        self.on_update = None
-        self.cancelled = False
+        self.cancelled: list[str] = []
+        self.created: list[str] = []
         self.loads: list[str] = []
         self.reads: list[str] = []
+        self.known: set[str] = set()
+        self._n = 0
 
-    async def prompt(self, text, on_update, on_permission):
+    async def create_session(self) -> str:
+        self._n += 1
+        sid = f"sess-{self._n}"
+        self.created.append(sid)
+        self.known.add(sid)
+        return sid
+
+    async def ensure_known(self, sid):
+        # Load ONCE, the way the real client does: a session already introduced
+        # to this process costs nothing to prompt again.
+        if sid not in self.known:
+            await self.load_session(sid)
+
+    async def prompt(self, session_id, text, on_update, on_permission):
         for i in range(3):
             await on_update({"sessionUpdate": "agent_message_chunk",
                              "content": {"type": "text", "text": f"part{i} "}})
@@ -49,18 +63,16 @@ class FakeACP:
                          "content": {"type": "text", "text": "tail"}})
         return {"stopReason": "end_turn"}
 
-    async def cancel(self):
-        self.cancelled = True
+    async def cancel(self, session_id):
+        self.cancelled.append(session_id)
 
     async def list_sessions(self):
         return []
 
-    async def new_session(self):
-        self.session_id = None
-
-    async def load_session(self, sid, on_update):
-        # The move this whole design is about: it relocates the ONE agent.
-        self.session_id = sid
+    async def load_session(self, sid, on_update=None):
+        # No longer a move — an introduction. Recorded so a test can assert how
+        # OFTEN it happens, which is the property that matters now.
+        self.known.add(sid)
         self.loads.append(sid)
 
     async def read_history(self, sid):
@@ -77,6 +89,20 @@ def app():
     a.on_startup.clear()
     a.on_cleanup.clear()
     return a
+
+
+def turn(app, sid: str | None = None) -> asyncio.Task:
+    """The task behind a running turn.
+
+    Most tests drive one conversation, so the id is optional — but it is an
+    assertion, not a shrug: if a test has somehow started two turns, saying
+    which one it meant is the point.
+    """
+    turns = app["state"].turns
+    if sid is not None:
+        return turns[sid]
+    assert len(turns) == 1, f"expected exactly one turn, got {list(turns)}"
+    return next(iter(turns.values()))
 
 
 async def read_events(resp, want: int, timeout: float = 5.0) -> list[dict]:
@@ -109,7 +135,7 @@ async def test_a_disconnect_does_not_stop_the_turn(aiohttp_client, app):
 
     # With nobody listening, let the turn finish.
     app["state"].acp.release.set()
-    await asyncio.wait_for(app["state"].turn_task, timeout=5)
+    await asyncio.wait_for(turn(app), timeout=5)
 
     # The turn ran to completion while disconnected.
     stream = app["state"].streams[sid]
@@ -129,7 +155,7 @@ async def test_a_reconnect_replays_only_the_delta(aiohttp_client, app):
     resume_from = seen[-1]["seq"]
 
     app["state"].acp.release.set()
-    await asyncio.wait_for(app["state"].turn_task, timeout=5)
+    await asyncio.wait_for(turn(app), timeout=5)
 
     # Reattach from where we left off. Nothing already delivered may repeat —
     # a replayed transcript is what a naive "resend everything" reconnect gives,
@@ -156,7 +182,7 @@ async def test_status_tells_a_reloaded_page_what_to_do(aiohttp_client, app):
     assert st["known"] and st["running"]
 
     app["state"].acp.release.set()
-    await asyncio.wait_for(app["state"].turn_task, timeout=5)
+    await asyncio.wait_for(turn(app), timeout=5)
 
     st = await (await client.get(f"/api/chat/status?stream_id={sid}")).json()
     assert st["known"] and not st["running"]
@@ -178,7 +204,7 @@ async def test_a_second_send_attaches_instead_of_starting_a_rival_turn(aiohttp_c
     assert second["streamId"] == first["streamId"]
 
     app["state"].acp.release.set()
-    await asyncio.wait_for(app["state"].turn_task, timeout=5)
+    await asyncio.wait_for(turn(app), timeout=5)
 
 
 @pytest.mark.asyncio
@@ -188,7 +214,7 @@ async def test_an_approval_is_answerable_out_of_band(aiohttp_client, app):
     able to FIND the prompt it never saw."""
     client = await aiohttp_client(app)
 
-    async def prompt_with_permission(text, on_update, on_permission):
+    async def prompt_with_permission(session_id, text, on_update, on_permission):
         choice = await on_permission({"toolCall": {"title": "rm -rf /"},
                                       "options": [{"optionId": "allow", "name": "允许"}]})
         await on_update({"sessionUpdate": "agent_message_chunk",
@@ -209,7 +235,7 @@ async def test_an_approval_is_answerable_out_of_band(aiohttp_client, app):
 
     await client.post("/api/approval/answer",
                       json={"id": pending[0]["id"], "optionId": "allow"})
-    await asyncio.wait_for(app["state"].turn_task, timeout=5)
+    await asyncio.wait_for(turn(app), timeout=5)
 
     text = "".join(e.get("text", "") for _, e in app["state"].streams[sid].events)
     assert "chose:allow" in text
@@ -388,14 +414,14 @@ async def test_a_cancel_that_is_ignored_escalates_to_a_restart(aiohttp_client, a
     acp = app["state"].acp
     acp.restarted = False
 
-    async def never_yields(text, on_update, on_permission):
+    async def never_yields(session_id, text, on_update, on_permission):
         await asyncio.sleep(30)         # a tool that will not be interrupted
         return {"stopReason": "end_turn"}
 
     async def fake_restart():
         acp.restarted = True
 
-    async def fake_load(sid, on_update):
+    async def fake_load(sid, on_update=None):
         return None
 
     acp.prompt = never_yields
@@ -455,16 +481,16 @@ async def test_a_stop_is_not_reported_as_an_error(aiohttp_client, app):
     client = await aiohttp_client(app)
     acp = app["state"].acp
 
-    async def dies_on_restart(text, on_update, on_permission):
+    async def dies_on_restart(session_id, text, on_update, on_permission):
         await asyncio.sleep(30)
         raise RuntimeError("hermes acp exited")
 
     async def fake_restart():
         # What a real restart does to the in-flight request.
-        app["state"].turn_task.cancel()
+        turn(app).cancel()
     acp.prompt = dies_on_restart
     acp.restart = fake_restart
-    acp.load_session = lambda sid, cb: asyncio.sleep(0)
+    acp.load_session = lambda sid, cb=None: asyncio.sleep(0)
 
     sid = (await (await client.post("/api/chat/start", json={"text": "go"})).json())["streamId"]
     await client.post("/api/chat/cancel")
@@ -841,9 +867,11 @@ async def test_an_event_emitted_between_the_drain_and_the_park_is_not_slept_thro
 async def test_reading_a_transcript_does_not_move_the_agent(aiohttp_client, app):
     """The whole reason the UI used to refuse a mid-turn switch.
 
-    There is one ACP process and `session/load` relocates it, so reading a
-    transcript through it meant a streaming turn lost its agent. History now
-    comes from hermes' own store; this asserts the read stays off ACP.
+    `session/load` is not free — hermes rebuilds the entire tool surface on each
+    one — so reading a transcript through ACP made viewing cost about a second
+    and, back when the client held a single session pointer, cost a streaming
+    turn its agent. History comes from hermes' own store instead; this asserts
+    the read stays off ACP entirely.
     """
     acp = app["state"].acp
     client = await aiohttp_client(app)
@@ -851,25 +879,33 @@ async def test_reading_a_transcript_does_not_move_the_agent(aiohttp_client, app)
     assert r.status == 200
     body = await r.json()
     assert body["history"][0]["text"] == "hi from other-sess"
-    assert acp.loads == [], "reading a transcript moved the agent"
-    assert acp.session_id == "sess-1", "the agent drifted off its session"
+    assert acp.loads == [], "reading a transcript went through ACP"
+    assert acp.created == [], "reading a transcript created a session"
 
 
 @pytest.mark.asyncio
-async def test_the_agent_is_moved_when_something_is_sent(aiohttp_client, app):
-    """The other half: deferred, not skipped.
+async def test_a_session_is_introduced_at_send_time_and_only_once(aiohttp_client, app):
+    """The other half of "viewing is free": the load is deferred, not skipped.
 
-    Viewing is free, so the relocation has to happen at the next send — and
-    that is safe because the server runs one turn at a time, so nothing is
-    streaming at that moment.
+    hermes' adapter keeps its session map in memory, so an id that exists in the
+    store is unknown to this process until loaded — prompting it would fail. But
+    the load is an INTRODUCTION now, not a move, so it happens once per session
+    per process instead of once per switch, and a second send into the same
+    conversation must not pay for it again.
     """
     acp = app["state"].acp
     client = await aiohttp_client(app)
     r = await client.post("/api/chat/start",
                           json={"text": "hello", "sessionId": "other-sess"})
     assert r.status == 200
-    assert acp.loads == ["other-sess"], f"agent not moved: {acp.loads}"
-    await client.post("/api/chat/cancel")
+    assert acp.loads == ["other-sess"], f"session not introduced: {acp.loads}"
+
+    acp.release.set()
+    await asyncio.wait_for(turn(app, "other-sess"), timeout=5)
+    await client.post("/api/chat/start",
+                      json={"text": "again", "sessionId": "other-sess"})
+    assert acp.loads == ["other-sess"], f"introduced twice: {acp.loads}"
+    await client.post("/api/chat/cancel", json={"sessionId": "other-sess"})
 
 
 def test_opening_a_session_is_not_gated_on_a_running_turn():
@@ -932,7 +968,7 @@ def test_the_stop_control_belongs_to_the_session_that_is_running():
     src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
     busy = src[src.index("function setBusy("):]
     busy = busy[:busy.index("\n}")]
-    assert "S.streamingSession" in busy, (
+    assert "S.streaming[S.sessionId]" in busy, (
         "the composer's stop is still driven by a global busy flag:\n" + busy
     )
 
@@ -1011,19 +1047,20 @@ async def test_the_server_reports_its_own_concurrency(aiohttp_client, app):
     """The frontend must not decide how many replies this machine can run.
 
     It used to encode the limit as "a turn exists, therefore the composer is
-    blocked" — the conclusion, not the reason. The number is a fact about the
-    ACP pool (one process, one pipe, and `session/load` moves it), so the server
-    states it and the client asks.
+    blocked" — the conclusion, not the reason — and the server then answered 1,
+    which was its own limitation rather than ACP's. Both halves are settled
+    here: the server states the number and it is no longer one.
     """
     client = await aiohttp_client(app)
     r = await client.get("/api/sessions")
     j = await r.json()
-    assert j["maxConcurrent"] == 1, j
+    assert j["maxConcurrent"] == srv.MAX_CONCURRENT_TURNS, j
+    assert j["maxConcurrent"] > 1, "the one-turn limit was this client's, not ACP's"
     assert j["running"] == 0, j
 
     await client.post("/api/chat/start", json={"text": "hi"})
     j = await (await client.get("/api/sessions")).json()
-    assert j["running"] == 1 and j["maxConcurrent"] == 1, j
+    assert j["running"] == 1, j
     await client.post("/api/chat/cancel")
 
 
@@ -1034,4 +1071,314 @@ def test_the_composer_blocks_on_reported_capacity_not_on_a_local_flag():
     body = body[:body.index("\n  if (b) {")]
     assert "S.maxConcurrent" in body and "S.running" in body, (
         "the composer still decides the limit for itself:\n" + body
+    )
+
+
+# --- Multiplexing. What "one ACP process" never actually implied. -------------
+# ACP addresses every session-scoped frame by `sessionId` -- `session/prompt`,
+# `session/update`, `session/cancel`, and `session/request_permission`, where the
+# field is REQUIRED rather than optional -- and hermes' adapter keeps a dict of
+# sessions on a four-worker pool. The single-turn limit was this client holding
+# one session pointer and one pair of callbacks. These pin that it is gone, and
+# that removing it did not cost the isolation the single version got for free.
+
+class _Pipe:
+    """Just enough of an asyncio subprocess for `_read_loop` to read from."""
+
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.returncode = None
+
+    def feed(self, obj: dict) -> None:
+        self.stdout.feed_data((json.dumps(obj) + "\n").encode())
+
+    def close(self) -> None:
+        self.stdout.feed_eof()
+
+
+@pytest.mark.asyncio
+async def test_an_update_is_delivered_to_the_session_it_names():
+    """The routing itself, against the production read loop.
+
+    Ablation: deliver to a single `self.on_update` instead of looking up
+    `params["sessionId"]` and both conversations receive both streams — which is
+    exactly what one pair of callbacks did the moment two turns overlapped.
+    """
+    acp = srv.HermesACP()
+    a, b = [], []
+    acp._on_update["s-a"] = lambda u: _collect(a, u)
+    acp._on_update["s-b"] = lambda u: _collect(b, u)
+
+    pipe = _Pipe()
+    acp.proc = pipe
+    loop = asyncio.create_task(acp._read_loop(pipe, acp._pending))
+    for sid, text in (("s-a", "alpha"), ("s-b", "beta"), ("s-a", "alpha2")):
+        pipe.feed({"jsonrpc": "2.0", "method": "session/update",
+                   "params": {"sessionId": sid, "update": {"text": text}}})
+    pipe.close()
+    await asyncio.wait_for(loop, timeout=5)
+
+    assert [u["text"] for u in a] == ["alpha", "alpha2"], a
+    assert [u["text"] for u in b] == ["beta"], b
+
+
+async def _collect(sink: list, update: dict) -> None:
+    sink.append(update)
+
+
+@pytest.mark.asyncio
+async def test_an_update_for_an_unknown_session_is_dropped_not_broadcast():
+    """A straggler from a session with no live turn must land nowhere.
+
+    With one callback there was nothing to compare against, so a late update
+    from a finished turn painted into whatever was running next.
+    """
+    acp = srv.HermesACP()
+    seen = []
+    acp._on_update["s-a"] = lambda u: _collect(seen, u)
+    pipe = _Pipe()
+    acp.proc = pipe
+    loop = asyncio.create_task(acp._read_loop(pipe, acp._pending))
+    pipe.feed({"jsonrpc": "2.0", "method": "session/update",
+               "params": {"sessionId": "s-gone", "update": {"text": "late"}}})
+    pipe.close()
+    await asyncio.wait_for(loop, timeout=5)
+    assert seen == [], seen
+
+
+@pytest.mark.asyncio
+async def test_a_permission_prompt_is_answered_by_the_session_that_was_asked():
+    """`sessionId` is required on RequestPermissionRequest, so there is always
+    something to route on — which is what lets two sessions hold a prompt at
+    once. The reply must carry the id of the request it answers, not of
+    whichever conversation registered last."""
+    acp = srv.HermesACP()
+    written: list[dict] = []
+
+    async def fake_write(obj):
+        written.append(obj)
+    acp._write = fake_write
+
+    async def pick_a(params):
+        return "from-a"
+
+    async def pick_b(params):
+        return "from-b"
+
+    acp._on_permission["s-a"] = pick_a
+    acp._on_permission["s-b"] = pick_b
+
+    pipe = _Pipe()
+    acp.proc = pipe
+    loop = asyncio.create_task(acp._read_loop(pipe, acp._pending))
+    pipe.feed({"jsonrpc": "2.0", "id": 91, "method": "session/request_permission",
+               "params": {"sessionId": "s-b", "options": [], "toolCall": {}}})
+    for _ in range(50):                    # the reply is a detached task
+        if written:
+            break
+        await asyncio.sleep(0.01)
+    # Close only now: the loop's exit cleanup drops every callback, which would
+    # race the detached reply and make this test fail for the wrong reason.
+    pipe.close()
+    await asyncio.wait_for(loop, timeout=5)
+
+    assert written, "no permission reply was written"
+    assert written[0]["id"] == 91
+    assert written[0]["result"]["outcome"]["optionId"] == "from-b", written
+
+
+@pytest.mark.asyncio
+async def test_a_permission_prompt_does_not_stall_the_read_loop():
+    """It used to be awaited inline. A prompt parks on a human for up to
+    APPROVAL_TIMEOUT_SEC, so awaiting it in the read loop froze every OTHER
+    session's tokens behind one person's decision — survivable while there was
+    only one session, and not survivable now."""
+    acp = srv.HermesACP()
+    acp._write = lambda obj: asyncio.sleep(0)
+    answered = asyncio.Event()
+    others = []
+
+    async def never_answers(params):
+        await answered.wait()
+        return None
+
+    acp._on_permission["s-a"] = never_answers
+    acp._on_update["s-b"] = lambda u: _collect(others, u)
+
+    pipe = _Pipe()
+    acp.proc = pipe
+    loop = asyncio.create_task(acp._read_loop(pipe, acp._pending))
+    pipe.feed({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission",
+               "params": {"sessionId": "s-a", "options": [], "toolCall": {}}})
+    pipe.feed({"jsonrpc": "2.0", "method": "session/update",
+               "params": {"sessionId": "s-b", "update": {"text": "still moving"}}})
+    for _ in range(50):
+        if others:
+            break
+        await asyncio.sleep(0.01)
+    assert [u["text"] for u in others] == ["still moving"], (
+        "the read loop is blocked behind an unanswered approval"
+    )
+    answered.set()
+    pipe.close()
+    await asyncio.wait_for(loop, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_two_conversations_stream_at_the_same_time(aiohttp_client, app):
+    """The whole point. Two sessions, two turns, two streams, no interleaving."""
+    client = await aiohttp_client(app)
+    one = await (await client.post("/api/chat/start", json={"text": "first"})).json()
+    two = await (await client.post(
+        "/api/chat/start", json={"text": "second", "new": True})).json()
+
+    assert two["attached"] is False, "the second send joined the first turn"
+    assert two["sessionId"] != one["sessionId"], two
+    assert two["streamId"] != one["streamId"], two
+
+    j = await (await client.get("/api/sessions")).json()
+    assert j["running"] == 2, j
+    assert set(j["streaming"]) == {one["sessionId"], two["sessionId"]}, j
+
+    # Each stream carries only its own session's events.
+    for started in (one, two):
+        resp = await client.get(
+            f"/api/chat/stream?stream_id={started['streamId']}&after_seq=0")
+        evs = await read_events(resp, 2)
+        resp.close()
+        assert {e["session"] for e in evs} == {started["sessionId"]}, evs
+
+    app["state"].acp.release.set()
+    await asyncio.wait_for(
+        asyncio.gather(turn(app, one["sessionId"]), turn(app, two["sessionId"])),
+        timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_a_send_past_the_limit_is_refused_rather_than_misattached(
+        aiohttp_client, app):
+    """At capacity there is no stream of THEIRS to hand back.
+
+    The old code answered a busy server with the running turn's id and
+    `attached: true`, which was honest only because that turn could not belong
+    to anyone else. Handing back a stranger's stream now would paint their reply
+    into this conversation.
+    """
+    old = srv.MAX_CONCURRENT_TURNS
+    srv.MAX_CONCURRENT_TURNS = 1
+    try:
+        client = await aiohttp_client(app)
+        first = await (await client.post("/api/chat/start", json={"text": "one"})).json()
+        r = await client.post("/api/chat/start", json={"text": "two", "new": True})
+        body = await r.json()
+        assert r.status == 429, body
+        assert body.get("busy") is True and "streamId" not in body, body
+        app["state"].acp.release.set()
+        await asyncio.wait_for(turn(app, first["sessionId"]), timeout=5)
+    finally:
+        srv.MAX_CONCURRENT_TURNS = old
+
+
+@pytest.mark.asyncio
+async def test_a_stop_will_not_restart_the_process_under_another_session(
+        aiohttp_client, app):
+    """The escalation kills the PROCESS, and the process now carries everyone.
+
+    Stopping a wedged turn by restarting is right when it is the only one; doing
+    it while another session streams takes a bystander's reply down to spare
+    this one. So the endpoint reports the cancel as unhonoured instead — a worse
+    answer for the person pressing Stop, a much better one for the person who
+    did not.
+    """
+    srv.CANCEL_GRACE_SEC = 0.2
+    client = await aiohttp_client(app)
+    acp = app["state"].acp
+    acp.restarted = False
+
+    async def never_yields(session_id, text, on_update, on_permission):
+        await asyncio.sleep(30)
+        return {"stopReason": "end_turn"}
+
+    async def fake_restart():
+        acp.restarted = True
+    acp.prompt = never_yields
+    acp.restart = fake_restart
+
+    stuck = await (await client.post("/api/chat/start", json={"text": "one"})).json()
+    other = await (await client.post(
+        "/api/chat/start", json={"text": "two", "new": True})).json()
+
+    r = await client.post("/api/chat/cancel",
+                          json={"sessionId": stuck["sessionId"]})
+    body = await r.json()
+    assert r.status == 409, body
+    assert body["how"] == "unyielding", body
+    assert body["blockedBy"] == [other["sessionId"]], body
+    assert not acp.restarted, "a bystander's turn was killed to stop someone else's"
+
+    # And the stuck stream says so, rather than sitting silent.
+    stream = app["state"].streams[stuck["streamId"]]
+    assert any("暂不重启" in e.get("text", "") for _s, e in stream.events), stream.events
+
+    for sid in list(app["state"].turns):
+        app["state"].turns[sid].cancel()
+
+
+@pytest.mark.asyncio
+async def test_an_unaddressed_stop_refuses_to_guess_between_two_turns(
+        aiohttp_client, app):
+    """Cancelling the wrong conversation is worse than not cancelling."""
+    client = await aiohttp_client(app)
+    await client.post("/api/chat/start", json={"text": "one"})
+    await client.post("/api/chat/start", json={"text": "two", "new": True})
+
+    r = await client.post("/api/chat/cancel")
+    body = await r.json()
+    assert r.status == 400, body
+    assert len(body["running"]) == 2, body
+    assert app["state"].acp.cancelled == [], "it cancelled something anyway"
+
+    for sid in list(app["state"].turns):
+        app["state"].turns[sid].cancel()
+
+
+@pytest.mark.asyncio
+async def test_an_unnamed_send_continues_the_last_conversation(aiohttp_client, app):
+    """A double-click on a BRAND-NEW conversation must not open two of them.
+
+    The second request has no session id to send yet — the first one's response
+    has not arrived — so without "unnamed means carry on", it reads as a second
+    request to start something new. That fell out of the single `session_id`
+    before and has to be said now.
+    """
+    client = await aiohttp_client(app)
+    first = await (await client.post("/api/chat/start", json={"text": "one"})).json()
+    second = await (await client.post("/api/chat/start", json={"text": "two"})).json()
+    assert second["attached"] is True, second
+    assert second["sessionId"] == first["sessionId"], second
+    assert app["state"].acp.created == [first["sessionId"]], app["state"].acp.created
+    app["state"].acp.release.set()
+    await asyncio.wait_for(turn(app, first["sessionId"]), timeout=5)
+
+
+def test_the_page_follows_the_stream_of_the_session_it_is_showing():
+    """Ablation: go back to a single `S.streamingStreamId` and returning to the
+    SECOND live conversation reattaches to the first one's stream."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function openSession("):]
+    body = body[:body.index("\nasync function removeSession(")]
+    assert "S.streaming[id]" in body, (
+        "openSession still reattaches to a single global stream:\n" + body
+    )
+
+
+def test_the_sidebar_keeps_watching_a_turn_this_page_is_not_reading():
+    """The page follows one stream — the conversation on screen. A turn running
+    anywhere else has no connection to this tab, so nothing would ever tell the
+    sidebar it finished."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("function watchWhileOthersRun("):]
+    body = body[:body.index("\n}") + 2]
+    assert "setInterval" in body and "clearInterval" in body, (
+        "the watcher never stops, or never starts:\n" + body
     )

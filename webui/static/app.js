@@ -81,8 +81,12 @@ const S = {
   sessionRows: [],      // last list from the server, so a click can repaint now
   maxConcurrent: null,  // replies the server can run at once — it reports it
   running: null,        // and how many it is running
-  streamingSession: null,  // which session owns the running turn, if any
-  streamingStreamId: null, // and its stream, so returning to it can reattach
+  // Which sessions are streaming, and on what stream: { sessionId: streamId }.
+  // A pair of scalars before, because the server could only ever run one turn.
+  // It can run several now, so returning to the second live conversation has to
+  // find ITS stream, not the one that happened to be recorded last.
+  streaming: {},
+  watchTimer: null,     // refreshes the sidebar while a turn runs somewhere else
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -184,6 +188,16 @@ function addMsg(role, text) {
   $("#messages").appendChild(wrap);
   scroll();
   return body;
+}
+
+function dropLastUser() {
+  // Undo the optimistic echo. `send()` draws the prompt before the server has
+  // accepted it, so a refusal leaves a message on screen that the transcript
+  // does not contain — and a reload would make it vanish, which reads as lost
+  // rather than as rejected.
+  const rows = $("#messages").querySelectorAll(".msg.user");
+  const last = rows[rows.length - 1];
+  if (last) last.remove();
 }
 
 /* ---------- the tail activity row ---------- */
@@ -573,13 +587,24 @@ function cancelTurn() {
   $("#send").textContent = "停止中…";
   $("#send").disabled = true;
   status("正在停止,等 agent 收尾…");
-  fetch("/api/chat/cancel", { method: "POST" }).catch(() => {
-    // The request itself failed — re-arm so the button is usable again.
+  const rearm = (msg) => {
     S.stopping = false;
     $("#send").textContent = "停止";
     $("#send").disabled = false;
-    status("停止请求发送失败");
-  });
+    status(msg);
+  };
+  // Name the target. The server refuses to guess between two live turns, and it
+  // should: stopping the wrong conversation is worse than not stopping.
+  fetch("/api/chat/cancel", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: S.sessionId || "", streamId: S.streamId || "" }),
+  }).then(async (r) => {
+    const j = await r.json().catch(() => ({}));
+    // 409: the agent is wedged in a tool AND another session is replying, so
+    // the server declined to restart the process out from under it. Say that,
+    // rather than leaving a button stuck on "停止中…" with no explanation.
+    if (j && j.how === "unyielding") rearm("agent 未响应停止，且另有会话在回复，暂无法强制中断");
+  }).catch(() => rearm("停止请求发送失败"));
 }
 
 function setBusy(b) {
@@ -592,7 +617,7 @@ function setBusy(b) {
   // turn left behind in another conversation. It is meaningful only while the
   // view has no id of its own yet, which is the one window ids cannot cover.
   const owns = b && (S.sessionId
-    ? S.streamingSession === S.sessionId
+    ? !!S.streaming[S.sessionId]
     : (!!S.ownStream && S.ownStream === S.streamId));
 
   // Ask the server how many replies it can run and how many it is running,
@@ -658,17 +683,39 @@ function renderSessions() {
   });
 }
 
+function watchWhileOthersRun() {
+  // The page follows ONE stream at a time — the conversation on screen. A turn
+  // running anywhere else has no connection to this tab at all, so nothing
+  // would ever tell the sidebar it finished. This is that: a slow poll, alive
+  // only while something is streaming, stopping the moment nothing is.
+  const anyLive = Object.keys(S.streaming).length > 0;
+  if (anyLive && !S.watchTimer) {
+    S.watchTimer = setInterval(loadSessions, 3000);
+  } else if (!anyLive && S.watchTimer) {
+    clearInterval(S.watchTimer);
+    S.watchTimer = null;
+  }
+}
+
 async function loadSessions() {
   let j;
   try { j = await (await fetch("/api/sessions")).json(); } catch (_) { return; }
-  // `j.current` is where the AGENT is, which is no longer where the reader is
-  // looking — that is the whole point of being able to browse mid-turn. Adopt
-  // it only when the reader has no session of their own yet, and never while a
-  // brand-new one is waiting for hermes to assign it an id.
-  if (!S.sessionId && !S.pendingNew) S.sessionId = j.streaming || j.current || null;
+  // `j.current` is the session prompted most recently, which is not where the
+  // reader is looking — that is the whole point of being able to browse
+  // mid-turn. Adopt it only when the reader has no session of their own yet,
+  // and never while a brand-new one is waiting for hermes to assign it an id.
+  const was = S.streaming;
+  S.streaming = j.streaming || {};
+  // A turn can now finish in a conversation this page is not watching, and its
+  // committed transcript only exists once it has. Drop the cached history of
+  // anything that stopped streaming, or a switch back would repaint the stale
+  // copy taken before the reply landed.
+  Object.keys(was).forEach((id) => { if (!S.streaming[id]) HISTORY_CACHE.delete(id); });
+  watchWhileOthersRun();
+  if (!S.sessionId && !S.pendingNew) {
+    S.sessionId = Object.keys(S.streaming)[0] || j.current || null;
+  }
   S.sessionRows = j.sessions || [];
-  S.streamingSession = j.streaming || null;
-  S.streamingStreamId = j.streamingStreamId || null;
   if (j.maxConcurrent != null) S.maxConcurrent = j.maxConcurrent;
   if (j.running != null) S.running = j.running;
   setBusy(S.busy);          // capacity changed under it; re-render the composer
@@ -705,11 +752,10 @@ async function openSession(id) {
   $("#messages").textContent = "";
   S.tools.clear(); S.seg = null; S.activity = null; S.actIndex = 0; S.sessionId = id;
 
-  // Paint what we already have BEFORE asking the server. The request cannot be
-  // skipped even on a hit — it is what moves the ACP process to this session,
-  // and without it the next prompt would land on the previous one — but the
-  // reader does not have to wait for it to see the transcript. Sending is
-  // blocked until it lands, so the two can never disagree.
+  // Paint what we already have BEFORE asking the server, then refresh from the
+  // store. The request moves nothing — sessions are addressed by id now, so a
+  // send lands where it is told regardless of what was read — it is only how
+  // the transcript stays honest when the cached copy predates the last turn.
   const cached = HISTORY_CACHE.get(id);
   if (cached) paintHistory(cached);
   S.switching = id;
@@ -728,15 +774,22 @@ async function openSession(id) {
   if (S.sessionId !== id) return;
   HISTORY_CACHE.set(id, j.history || []);
   if (!cached) paintHistory(j.history || []);
-  if (S.busy && S.streamingSession === id && S.streamingStreamId) {
-    // Back on the conversation that is running. The store stops where the
+  // Not gated on S.busy any more: with several turns possible, the one that
+  // matters is whether THIS conversation is streaming — which the map answers
+  // directly. The old check asked "is anything streaming, and is it this one",
+  // and its first half is no longer a useful question.
+  const liveStream = S.streaming[id];
+  if (liveStream) {
+    // Back on a conversation that is running. The store stops where the
     // committed transcript does, so replay the live turn from the top rather
     // than showing a reply that appears to have stopped mid-sentence.
     S.skipUserEcho = false;
-    attach(S.streamingStreamId, 0);
+    attach(liveStream, 0);
     status("回复中…");
   } else {
-    status(S.busy ? "另一个会话仍在回复中" : "就绪");
+    detach();
+    setBusy(false);
+    status(Object.keys(S.streaming).length ? "另一个会话仍在回复中" : "就绪");
   }
   loadSessions();
 }
@@ -754,9 +807,10 @@ async function removeSession(id, title) {
 }
 
 async function newSession() {
-  // Purely local. `/api/session/new` moves the one ACP process, which a turn in
-  // flight cannot survive, so the intent is recorded and acted on at the next
-  // send — where nothing is streaming by construction.
+  // Purely local, and deliberately creates nothing. A session made on a click
+  // is a session most readers never write into, and the store filled up with
+  // titleless zero-message rows exactly that way. The intent is recorded and
+  // the session is created by the send that gives it something to hold.
   S.pendingNew = true;
   S.ownStream = null;       // nothing on screen is ours until we send
   // The turn in flight keeps running and keeps its stream; only the drawing
@@ -782,7 +836,7 @@ async function send() {
     status("⚠ 先回答上方的确认请求");
     return;
   }
-  if (S.busy) return;
+  if (S.busy) return;   // this conversation is already replying
   if (S.switching) { status("正在切换会话，稍候"); return; }
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
@@ -795,14 +849,21 @@ async function send() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
-        // The agent is relocated server-side from these, not when a session was
-        // clicked. Both are no-ops when it is already in the right place.
+        // Which conversation this belongs to. The server addresses it by id
+        // and introduces it to the ACP process if that process has not seen it
+        // yet; nothing is "moved", so a turn running elsewhere is unaffected.
         sessionId: S.pendingNew ? "" : (S.sessionId || ""),
         new: !!S.pendingNew,
       }),
     })).json();
   } catch (_) { status("发送失败"); return; }
-  if (j.error) { status(j.error); return; }
+  if (j.error) {
+    // At capacity: the composer should already have been blocked, so this is
+    // the race backstop. Put the text back rather than eating it.
+    if (j.busy) { input.value = text; dropLastUser(); }
+    status(j.error);
+    return;
+  }
   if (!j.streamId) { status("没有可用的会话流"); return; }
   S.pendingNew = false;
   // `attached` means a turn was ALREADY running and we joined it -- its prompt

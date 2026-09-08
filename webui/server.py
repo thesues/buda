@@ -8,7 +8,10 @@ Shape (the one thing worth understanding before reading the code):
     GET  /api/chat/status  -> is that stream still running, and at what seq
 
 The agent turn runs in its own task writing into a sequence-numbered buffer. It
-is NOT bound to the connection that started it. That is the whole design, and it
+is NOT bound to the connection that started it, and it is keyed by SESSION, so
+several conversations can be replying at once over the one `hermes acp` process:
+ACP multiplexes on `sessionId`, and the single-turn limit this server used to
+report was its own — one session field, one pair of callbacks. That is the whole design, and it
 is a direct answer to how the lerobot console failed: there, the turn lived on a
 WebSocket, so a reload lost the stream id, an idle proxy timeout killed the turn,
 and "the UI stopped responding, I had to refresh" was the standard bug report.
@@ -99,6 +102,22 @@ APPROVAL_TIMEOUT_SEC = 600
 # already produced. Stop means "end this, keep what it made", so it is worth
 # waiting out the wind-down. Restart is the last resort, not the normal path.
 CANCEL_GRACE_SEC = float(os.environ.get("CANCEL_GRACE_SEC", "12"))
+
+# How many turns may be in flight at once, across all sessions.
+#
+# Four, because that is what the agent side actually offers: hermes' ACP adapter
+# runs sessions on a shared `ThreadPoolExecutor(max_workers=4)`. It is not a
+# property of the pipe -- one stdio connection multiplexes any number of
+# sessions, every session-scoped frame carrying `sessionId` -- and it was never
+# one. This server used to say 1, and that was its own limitation: a single
+# `session_id` field and a single pair of callbacks on the ACP client.
+#
+# The limit BELOW this one is the model, not the agent: `freetoken-l3` runs with
+# `--max-running-requests 1`, chosen because 4 put a 24 GB card into CUDA OOM.
+# Raising this past that does not make two replies arrive at once -- it makes the
+# second one queue at the model instead of being refused at the door, which is
+# still the better failure.
+MAX_CONCURRENT_TURNS = max(1, int(os.environ.get("MAX_CONCURRENT_TURNS", "4")))
 
 # SSE idle comment interval. Proxies and load balancers cut a silent connection;
 # a comment line is the cheapest thing that keeps it open and costs the client
@@ -276,24 +295,56 @@ class State:
         self.acp = HermesACP()
         self.streams: dict[str, TurnStream] = {}
         self.approvals: dict[str, Approval] = {}
-        self.turn_task: asyncio.Task | None = None
-        self.current: TurnStream | None = None
+        # Turns in flight, keyed by SESSION. Both used to be single-valued
+        # (`turn_task`, `current`), which is what made "one turn at a time"
+        # a property of this server rather than of anything underneath it.
+        self.turns: dict[str, asyncio.Task] = {}
+        self.live: dict[str, TurnStream] = {}
+        # The session prompted most recently. Only a default for a page that
+        # arrives with no opinion; the agent is no longer "at" a session, so
+        # there is nothing else for `current` to honestly mean.
+        self.last_session: str | None = None
         self.gc: asyncio.Task | None = None
 
+    def running(self) -> dict[str, asyncio.Task]:
+        """Turns actually still running, reaped of the ones that have finished."""
+        for sid, t in [(k, v) for k, v in self.turns.items() if v.done()]:
+            self.turns.pop(sid, None)
+            self.live.pop(sid, None)
+        return self.turns
+
 
 # --------------------------------------------------------------------------- #
-# hermes ACP — one warm process, driven over JSON-RPC on stdio                   #
+# hermes ACP — one warm process, MULTIPLEXED by sessionId over JSON-RPC on stdio #
 # --------------------------------------------------------------------------- #
 # Cold-spawning `hermes chat` per turn costs ~10 s of startup each time, so one
-# `hermes acp` process is kept alive: initialize -> session/new (once) ->
+# `hermes acp` process is kept alive: initialize -> session/new (per session) ->
 # session/prompt (per turn, streaming).
+#
+# One process does NOT mean one session. ACP addresses every session-scoped
+# message by `sessionId` -- `session/prompt`, `session/update`, `session/cancel`,
+# and `session/request_permission`, where the field is required rather than
+# optional -- and the SDK dispatches each incoming request onto its own task
+# rather than serialising them, so two prompts can be in flight on one pipe.
+# hermes' adapter is written for it too: `SessionManager._sessions` is a dict,
+# and its own comments talk about isolating writes from "other concurrent ACP
+# sessions" on a `ThreadPoolExecutor(max_workers=4)`.
+#
+# This client used to hold ONE `session_id` and ONE pair of callbacks, so
+# `session/load` read as "move the agent" and a second turn had nowhere to
+# deliver. Both are now keyed by session, which is what the wire always was.
 class HermesACP:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
         # The session-store bridge, held open. See `_bridge`.
         self._bridge_proc: asyncio.subprocess.Process | None = None
         self._bridge_lock = asyncio.Lock()
-        self.session_id: str | None = None
+        # Sessions THIS PROCESS can be prompted about. hermes' adapter keeps its
+        # session map in memory, so a session that exists in the store is
+        # unknown to a freshly spawned `hermes acp` until it is loaded, and
+        # prompting an unknown id fails. This is what makes the load lazy and
+        # once per process, instead of once per switch as it used to be.
+        self._known: set[str] = set()
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
         # Created lazily, inside the loop that will use them. On Python 3.9 an
@@ -307,8 +358,16 @@ class HermesACP:
         # Sessions already steered with CHAT_DIRECTIVE. A loaded session is
         # marked on load so the directive is never injected mid-conversation.
         self._directive_sent: set[str] = set()
-        self.on_update = None      # async fn(update)
-        self.on_permission = None  # async fn(params) -> optionId | None
+        # Per-session callbacks, NOT one pair for "the current session". The read
+        # loop routes on the `sessionId` every session-scoped frame carries; with
+        # a single pair, two concurrent turns delivered into whichever registered
+        # last, and a permission prompt was answered by the wrong conversation.
+        self._on_update: dict[str, object] = {}      # sid -> async fn(update)
+        self._on_permission: dict[str, object] = {}  # sid -> async fn(params)
+        # Strong refs for the detached permission replies. asyncio keeps only a
+        # weak reference to a task, so a bare create_task may be collected
+        # mid-flight and the agent then waits on an answer nobody is writing.
+        self._perm_tasks: set[asyncio.Task] = set()
 
     def _wl(self) -> asyncio.Lock:
         if self._write_lock is None:
@@ -323,13 +382,6 @@ class HermesACP:
     @property
     def alive(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
-
-    async def ensure(self) -> None:
-        async with self._sl():
-            if not self.alive:
-                await self._spawn()
-            if not self.session_id:
-                await self._new_locked()
 
     async def ensure_proc(self) -> None:
         async with self._sl():
@@ -362,22 +414,40 @@ class HermesACP:
         await self._request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         log.info("hermes acp ready")
 
-    async def _new_locked(self) -> str:
+    async def create_session(self) -> str:
+        """Create a session and return its id. Called at SEND time, never earlier.
+
+        Creating one on a page open is what littered the store with titleless
+        zero-message ghosts — one per open, per restart — because most never got
+        a message. So the caller arms the intent and this runs when there is
+        actually something to say.
+
+        It returns the id rather than storing it: with sessions multiplexed there
+        is no "the" session for this object to be at.
+        """
+        await self.ensure_proc()
         res = await self._request(
             "session/new", {"cwd": WORKDIR, "mcpServers": _acp_mcp_servers()}
         )
-        self.session_id = res.get("sessionId")
-        log.info("hermes acp session=%s", self.session_id)
-        return self.session_id
+        sid = res.get("sessionId")
+        if not sid:
+            raise RuntimeError("session/new returned no sessionId")
+        self._known.add(sid)
+        log.info("hermes acp session=%s created", sid)
+        return sid
 
-    async def new_session(self) -> None:
-        """Arm a new session WITHOUT creating one; the next prompt creates it.
+    async def ensure_known(self, sid: str) -> None:
+        """Make `sid` promptable, loading it once if this process has not seen it.
 
-        Creating it eagerly is what littered the store with titleless zero-message
-        ghosts — one per page open, per restart — because most never get a message.
+        `session/load` is not cheap — hermes re-registers the MCP server and
+        rebuilds the whole tool surface on every one, about a second regardless
+        of transcript length — which is exactly why this is memoised. It used to
+        run on every switch because the client had to MOVE its single session
+        pointer; now it runs once per session per process, to introduce it.
         """
-        await self.ensure_proc()
-        self.session_id = None
+        if sid in self._known:
+            return
+        await self.load_session(sid)
 
     async def _bridge(self, req: dict) -> object:
         """One request to the long-lived `hermes_session_api serve` process.
@@ -460,17 +530,32 @@ class HermesACP:
                                f"{err.decode(errors='replace')[:400]}")
         return json.loads(out.decode() or "[]")
 
-    async def load_session(self, sid: str, on_update) -> None:
+    async def load_session(self, sid: str, on_update=None) -> None:
+        """Introduce `sid` to this process, optionally collecting its replay.
+
+        This no longer MOVES anything. hermes replays the transcript as
+        `session/update` notifications carrying this sid, so a caller that wants
+        them passes a sink; a caller that only needs the session to become
+        promptable passes nothing and the replay is dropped on the floor.
+        """
         await self.ensure_proc()
-        self.on_update = on_update
+        # Save and restore rather than clear: a turn streaming into this same
+        # session would otherwise lose its sink to a concurrent load.
+        prev = self._on_update.get(sid)
+        if on_update is not None:
+            self._on_update[sid] = on_update
         try:
             await self._request(
                 "session/load",
                 {"sessionId": sid, "cwd": WORKDIR, "mcpServers": _acp_mcp_servers()},
             )
         finally:
-            self.on_update = None
-        self.session_id = sid
+            if on_update is not None:
+                if prev is None:
+                    self._on_update.pop(sid, None)
+                else:
+                    self._on_update[sid] = prev
+        self._known.add(sid)
         self._directive_sent.add(sid)  # has history — never inject the directive
 
     async def delete_session(self, sid: str) -> None:
@@ -485,8 +570,9 @@ class HermesACP:
             raise RuntimeError(f"`hermes sessions delete {sid}` failed "
                                f"(rc={proc.returncode}): {out.decode(errors='replace')[:400]}")
         self._directive_sent.discard(sid)
-        if self.session_id == sid:
-            self.session_id = None
+        self._known.discard(sid)
+        self._on_update.pop(sid, None)
+        self._on_permission.pop(sid, None)
 
     async def _write(self, obj: dict) -> None:
         async with self._wl():
@@ -557,14 +643,26 @@ class HermesACP:
                     fut.set_result(msg.get("result") or {"_error": msg.get("error")})
             elif msg.get("method") == "session/update":
                 # Drop stragglers from a superseded process.
-                if self.on_update and self.proc is proc:
-                    try:
-                        await self.on_update(msg["params"].get("update", {}))
-                    except Exception:  # noqa: BLE001
-                        log.debug("on_update failed", exc_info=True)
+                if self.proc is proc:
+                    params = msg.get("params") or {}
+                    # Route by sessionId. Delivering to "the current callback"
+                    # is what put one conversation's tokens into another's
+                    # transcript the moment two turns overlapped.
+                    cb = self._on_update.get(params.get("sessionId"))
+                    if cb:
+                        try:
+                            await cb(params.get("update", {}))
+                        except Exception:  # noqa: BLE001
+                            log.debug("on_update failed", exc_info=True)
             elif msg.get("method") == "session/request_permission":
                 if self.proc is proc:
-                    await self._reply_permission(msg)
+                    # Not awaited: a permission request parks on a human for up
+                    # to APPROVAL_TIMEOUT_SEC, and awaiting it here would stall
+                    # the read loop — every other session's tokens included.
+                    # Sequential was survivable with one session; it is not now.
+                    t = asyncio.create_task(self._reply_permission(msg))
+                    self._perm_tasks.add(t)
+                    t.add_done_callback(self._perm_tasks.discard)
             elif "id" in msg:  # a server->client request we do not implement
                 if self.proc is proc:
                     await self._write({"jsonrpc": "2.0", "id": msg["id"],
@@ -574,43 +672,53 @@ class HermesACP:
                 fut.set_exception(RuntimeError("hermes acp exited"))
         pending.clear()
         if self.proc is proc:
-            self.session_id = None
+            # Nothing this process knew survives it: the adapter's session map
+            # died with it, so every id must be re-loaded before it can be
+            # prompted again.
+            self._known.clear()
+            self._on_update.clear()
+            self._on_permission.clear()
         log.warning("hermes acp exited (rc=%s%s)", proc.returncode,
                     "" if self.proc is proc else ", superseded")
 
     async def _reply_permission(self, msg: dict) -> None:
+        params = msg.get("params") or {}
+        # `sessionId` is REQUIRED on RequestPermissionRequest, not optional, so
+        # there is always something to route on — which is what lets two
+        # sessions have a prompt outstanding at the same time.
+        cb = self._on_permission.get(params.get("sessionId"))
         option_id = None
-        if self.on_permission:
+        if cb:
             try:
-                option_id = await self.on_permission(msg.get("params", {}))
+                option_id = await cb(params)
             except Exception:  # noqa: BLE001
                 option_id = None
         outcome = ({"outcome": "selected", "optionId": option_id} if option_id
                    else {"outcome": "cancelled"})
         await self._write({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": outcome}})
 
-    async def prompt(self, text: str, on_update, on_permission):
-        await self.ensure()
-        if self.session_id not in self._directive_sent:
+    async def prompt(self, session_id: str, text: str, on_update, on_permission):
+        await self.ensure_known(session_id)
+        if session_id not in self._directive_sent:
             # APPEND, never prepend: the session's auto-title comes from the
             # user's real first words, not from the steering block.
             text = text + "\n\n" + CHAT_DIRECTIVE
-            self._directive_sent.add(self.session_id)
-        self.on_update = on_update
-        self.on_permission = on_permission
+            self._directive_sent.add(session_id)
+        self._on_update[session_id] = on_update
+        self._on_permission[session_id] = on_permission
         try:
             return await self._request(
                 "session/prompt",
-                {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]},
+                {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
             )
         finally:
-            self.on_update = None
-            self.on_permission = None
+            self._on_update.pop(session_id, None)
+            self._on_permission.pop(session_id, None)
 
-    async def cancel(self) -> None:
-        if self.alive and self.session_id:
+    async def cancel(self, session_id: str) -> None:
+        if self.alive and session_id:
             await self._write({"jsonrpc": "2.0", "method": "session/cancel",
-                               "params": {"sessionId": self.session_id}})
+                               "params": {"sessionId": session_id}})
 
     async def restart(self) -> None:
         """Kill the process and bring a fresh one up. The hard half of stop."""
@@ -631,7 +739,11 @@ class HermesACP:
                         old.kill()
                     await old.wait()
             self.proc = None
-            self.session_id = None
+            # The replacement process shares nothing with the old one: its
+            # session map is empty, so every id has to be introduced again.
+            self._known.clear()
+            self._on_update.clear()
+            self._on_permission.clear()
             self._directive_sent.clear()
             await self._spawn()
 
@@ -760,15 +872,6 @@ def _to_event(update: dict) -> tuple[str, dict] | None:
 # --------------------------------------------------------------------------- #
 async def handle_chat_start(request: web.Request) -> web.Response:
     st = state(request)
-    running = 1 if (st.turn_task and not st.turn_task.done()) else 0
-    if running >= max_concurrent_turns():
-        # At capacity. Returning the RUNNING stream id rather than an error
-        # means a double-click, or a reload that re-submits, attaches to the
-        # turn in flight instead of being told "busy" with no way back to it.
-        cur = st.current
-        return web.json_response({"streamId": cur.stream_id if cur else None,
-                                  "sessionId": cur.session_id if cur else None,
-                                  "attached": True})
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -778,37 +881,59 @@ async def handle_chat_start(request: web.Request) -> web.Response:
         return web.json_response({"error": "empty message"}, status=400)
 
     acp = st.acp
-    # Relocate the agent HERE, not when the reader opens a session. There is one
-    # ACP process and `session/load` moves it, so doing that on a click meant a
-    # turn in flight would have the agent pulled out from under it — hence the
-    # old "wait or stop the current reply". Sending is the moment it is safe:
-    # the server runs one turn at a time, so nothing is streaming right now.
-    if body.get("new"):
-        # "New session" is recorded on the client and acted on here for the same
-        # reason: `new_session` moves the one ACP process too.
-        try:
-            await acp.new_session()
-        except Exception as e:  # noqa: BLE001
-            return web.json_response({"error": f"could not start a session: {e}"},
-                                     status=500)
     want = (body.get("sessionId") or "").strip()
-    if want and want != acp.session_id:
-        try:
-            await acp.load_session(want, None)
-        except Exception as e:  # noqa: BLE001
-            return web.json_response({"error": f"could not open {want}: {e}"},
-                                     status=500)
-    stream = TurnStream(secrets.token_hex(8), acp.session_id)
+    if not want and not body.get("new"):
+        # A caller that names nothing means "carry on where I was". That used to
+        # fall out of the single `acp.session_id`; it has to be said now, and it
+        # is what keeps a double-click on a BRAND-NEW conversation from opening
+        # two of them — the second request has no id to send yet, so without
+        # this it reads as a second "start something new".
+        want = st.last_session or ""
+    fresh = bool(body.get("new")) or not want
+    running = st.running()
+
+    # Busy is now a question about THIS conversation, not about the server.
+    # Joining the turn already streaming here is what makes a double-click, or a
+    # reload that re-submits, harmless; starting a rival turn would interleave
+    # two agents into one transcript.
+    if not fresh and want in running:
+        cur = st.live.get(want)
+        return web.json_response({"streamId": cur.stream_id if cur else None,
+                                  "sessionId": want, "attached": True})
+
+    if len(running) >= MAX_CONCURRENT_TURNS:
+        # A backstop, not the normal path — the client is told the number by
+        # `/api/sessions` and blocks the composer itself. Refusing is right here
+        # because there is no stream of THEIRS to hand back: the old code could
+        # only ever return the same conversation's turn, and returning some
+        # other session's now would paint a stranger's reply into this one.
+        return web.json_response(
+            {"error": f"已有 {len(running)} 个会话在回复，达到上限 {MAX_CONCURRENT_TURNS}",
+             "busy": True, "running": len(running),
+             "maxConcurrent": MAX_CONCURRENT_TURNS},
+            status=429)
+
+    # The session id is settled BEFORE the turn starts, in both directions. It
+    # used to be learned from the first `session/update` because a new session
+    # was created lazily inside `prompt`, and that race is what could relabel a
+    # new conversation as the previous one.
+    try:
+        sid = await acp.create_session() if fresh else want
+        if not fresh:
+            # Introduce it to this process if it has not been seen. Free after
+            # the first time, and no longer "moving" anything.
+            await acp.ensure_known(sid)
+    except Exception as e:  # noqa: BLE001
+        verb = "start a session" if fresh else f"open {want}"
+        return web.json_response({"error": f"could not {verb}: {e}"}, status=500)
+
+    st.last_session = sid
+    stream = TurnStream(secrets.token_hex(8), sid)
     st.streams[stream.stream_id] = stream
-    st.current = stream
+    st.live[sid] = stream
     stream.emit("user", text=text)
 
     async def on_update(update: dict) -> None:
-        # A brand-new conversation has no id when the stream is created; hermes
-        # assigns one as the turn begins. Learn it at the first update so every
-        # event from here on can be attributed.
-        if stream.session_id is None:
-            stream.session_id = acp.session_id
         ev = _to_event(update)
         if ev:
             stream.emit(ev[0], **ev[1])
@@ -829,8 +954,7 @@ async def handle_chat_start(request: web.Request) -> web.Response:
 
     async def run() -> None:
         try:
-            res = await acp.prompt(text, on_update, on_permission)
-            stream.session_id = acp.session_id
+            res = await acp.prompt(sid, text, on_update, on_permission)
             reason = (res or {}).get("stopReason")
             if reason and reason != "end_turn":
                 stream.emit("note", text=f"stopped: {reason}")
@@ -847,12 +971,9 @@ async def handle_chat_start(request: web.Request) -> web.Response:
                 log.warning("turn failed: %s", e)
                 stream.finish(error=str(e))
 
-    st.turn_task = asyncio.create_task(run())
-    # The session id comes back because a brand-new conversation gets it from
-    # hermes only now: without it the sidebar has nothing to select, and the row
-    # would appear unattached to what the reader is looking at.
+    st.turns[sid] = asyncio.create_task(run())
     return web.json_response({"streamId": stream.stream_id,
-                              "sessionId": acp.session_id, "attached": False})
+                              "sessionId": sid, "attached": False})
 
 
 async def handle_chat_stream(request: web.Request) -> web.StreamResponse:
@@ -979,23 +1100,49 @@ async def handle_chat_status(request: web.Request) -> web.Response:
 
 
 async def handle_chat_cancel(request: web.Request) -> web.Response:
-    """End the in-flight turn for real: graceful first, restart if it will not yield.
+    """End ONE session's turn: graceful first, restart only if that is safe.
 
     `session/cancel` alone is not enough. It reaches the agent's loop, which
     notices only between steps -- so while a tool is running (a corpus search, a
     command) the turn keeps going and the button appears to do nothing for as
     long as the tool takes. The escalation is what makes Stop mean stop.
 
-    The restart costs this turn's un-flushed output, which is why the graceful
-    path gets a real grace period rather than a token one.
+    But the escalation kills the PROCESS, and the process now carries every
+    session. So it is conditional: with another turn in flight, restarting to
+    stop this one would take a bystander's reply down with it, and the honest
+    answer is to report that the cancel was not honoured. That is a worse
+    outcome for the person pressing Stop and a much better one for the person
+    who did not.
     """
     st = state(request)
-    task = st.turn_task
-    if not (task and not task.done()):
-        return web.json_response({"ok": True, "already": "idle"})
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    running = st.running()
 
-    sid = st.acp.session_id
-    await st.acp.cancel()
+    sid = (body.get("sessionId") or "").strip()
+    if not sid and body.get("streamId"):
+        owner = st.streams.get(body["streamId"])
+        sid = owner.session_id if owner else ""
+    if not sid:
+        # No target named. That was unambiguous when only one turn could exist;
+        # now it is only unambiguous when only one happens to be running, and
+        # guessing between two would stop the wrong conversation.
+        if not running:
+            return web.json_response({"ok": True, "already": "idle"})
+        if len(running) > 1:
+            return web.json_response(
+                {"error": "多个会话正在回复，停止请求必须指明 sessionId",
+                 "running": list(running)}, status=400)
+        sid = next(iter(running))
+
+    task = running.get(sid)
+    if task is None:
+        return web.json_response({"ok": True, "already": "idle"})
+    stream = st.live.get(sid)
+
+    await st.acp.cancel(sid)
     try:
         # `shield` so OUR timeout does not cancel the turn task itself -- the
         # point is to observe whether it winds down, not to tear it down here.
@@ -1007,28 +1154,33 @@ async def handle_chat_cancel(request: web.Request) -> web.Response:
         # The turn ended by failing; that is still ended.
         return web.json_response({"ok": True, "how": "graceful"})
 
+    others = [k for k in st.running() if k != sid]
+    if others:
+        log.warning("session/cancel not honoured in %.1fs on %s, and %d other "
+                    "turn(s) are live — refusing to restart", CANCEL_GRACE_SEC,
+                    sid, len(others))
+        if stream and stream.running:
+            stream.emit("note", text="停止请求已发出，但 agent 仍卡在工具调用里；"
+                                     "另有会话正在回复，暂不重启 agent")
+        return web.json_response({"ok": False, "how": "unyielding",
+                                  "blockedBy": others}, status=409)
+
     log.warning("session/cancel not honoured in %.1fs — restarting hermes acp",
                 CANCEL_GRACE_SEC)
-    if st.current and st.current.running:
-        st.current.stopped = True
-        st.current.emit("note", text="取消未被响应，已重启 agent")
+    if stream and stream.running:
+        stream.stopped = True
+        stream.emit("note", text="取消未被响应，已重启 agent")
     await st.acp.restart()
     if not task.done():
         task.cancel()
-    # Re-select the session the user was in, silently: a restart clears
-    # `session_id`, and without this the next prompt would start a NEW session
-    # and the sidebar would grow a ghost.
-    if sid:
-        async def _sink(_u: dict) -> None:
-            return None
-        try:
-            await st.acp.load_session(sid, _sink)
-        except Exception:  # noqa: BLE001
-            log.debug("re-select after restart failed", exc_info=True)
+    # No re-select. A restart empties the process's session map, and the next
+    # prompt re-introduces whatever id it names -- which is what `ensure_known`
+    # is for. The old eager reload existed only because the client held a single
+    # "where the agent is" pointer that a restart cleared.
     # run() was cancelled before it could finish the stream, so close it here or
     # the client waits forever for an `end` that is never coming.
-    if st.current and st.current.running:
-        st.current.finish(error=None)
+    if stream and stream.running:
+        stream.finish(error=None)
     return web.json_response({"ok": True, "how": "restart"})
 
 
@@ -1058,25 +1210,23 @@ async def handle_approval_answer(request: web.Request) -> web.Response:
 # Sessions                                                                      #
 # --------------------------------------------------------------------------- #
 def max_concurrent_turns() -> int:
-    """How many replies this server can have in flight.
+    """How many replies this server can have in flight, across all sessions.
 
-    One, and it is structural rather than a policy: there is a SINGLE
-    `hermes acp` subprocess behind this server, speaking over one stdin/stdout
-    pipe, and `session/load` MOVES it between conversations. A second turn would
-    contend for both the pipe and the agent's position, so the number is not a
-    knob — it is `len(the ACP pool)`, and the pool has one member.
+    It used to return 1, and the docstring called that structural — one process,
+    one pipe, `session/load` moves it. Only the first of those was true. ACP
+    multiplexes: every session-scoped frame carries `sessionId`, the SDK runs
+    each incoming request on its own task, and hermes' adapter keeps a dict of
+    sessions on a four-worker pool. The limit was this client holding a single
+    session pointer and a single pair of callbacks.
 
-    It is a function so the UI can ASK rather than assume. The frontend used to
-    encode this as "a turn is running, therefore the composer is blocked", which
-    is the conclusion, not the reason: the day this becomes a real pool, the
-    answer changes here and nothing in the client has to.
+    It stays a function so the UI can ASK rather than assume — the frontend used
+    to encode the limit as "a turn exists, therefore the composer is blocked",
+    which is the conclusion and not the reason.
 
-    Note the limit below this one: `freetoken-l3` runs with
-    `--max-running-requests 1`, chosen because 4 put a 24 GB card into CUDA OOM
-    and FreeToken cannot restart a dead worker. Raising the pool without raising
-    that only moves the queue.
+    See MAX_CONCURRENT_TURNS for where 4 comes from, and for the smaller limit
+    underneath it (the model, not the agent).
     """
-    return 1
+    return MAX_CONCURRENT_TURNS
 
 
 async def handle_sessions(request: web.Request) -> web.Response:
@@ -1088,33 +1238,44 @@ async def handle_sessions(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
     # Per session, not one global flag. A reader looking at an idle session
     # while another one streams must see THAT session's state; deriving it from
-    # a global is how a busy session's spinner ends up on an idle one.
-    running = st.turn_task is not None and not st.turn_task.done()
-    busy_sid = acp.session_id if running else None
+    # a global is how a busy session's spinner ends up on an idle one. That was
+    # already the intent — the flag was just computed from a single global.
+    running = st.running()
     for r in rows:
-        r["is_streaming"] = bool(busy_sid and r.get("id") == busy_sid)
-    # The stream id travels with it so a reader returning to the running
-    # conversation can reattach and watch it finish, instead of seeing a
-    # transcript that stops where the store does.
-    cur = st.current if running else None
-    return web.json_response({"sessions": rows, "current": acp.session_id,
-                              "streaming": busy_sid,
-                              "streamingStreamId": cur.stream_id if cur else None,
-                              "running": 1 if running else 0,
+        r["is_streaming"] = r.get("id") in running
+    # Every live turn's stream id, so a reader returning to ANY running
+    # conversation can reattach and watch it finish rather than seeing a
+    # transcript that stops where the committed store does. Singular before,
+    # which meant returning to the second one showed a truncated answer.
+    streaming = {sid: st.live[sid].stream_id for sid in running if sid in st.live}
+    return web.json_response({"sessions": rows,
+                              "current": st.last_session,
+                              "streaming": streaming,
+                              "running": len(running),
                               "maxConcurrent": max_concurrent_turns()})
 
 
 async def handle_session_new(request: web.Request) -> web.Response:
-    await state(request).acp.new_session()
+    """Arm a new conversation. Deliberately creates nothing.
+
+    Kept as an endpoint for the shape of the API, but there is no longer any
+    server state to move: a new session is created by the first send, which is
+    what stops the store filling with titleless zero-message ghosts.
+    """
     return web.json_response({"ok": True, "current": None})
 
 
 async def handle_session_load(request: web.Request) -> web.Response:
-    """Switch to an existing session and hand back its replayed history.
+    """Load an existing session through ACP and hand back its replayed history.
 
     The replay is collected into the RESPONSE rather than pushed on a stream:
     it is a bounded, already-complete transcript, so a plain request/response is
     the honest shape. Streams are for turns, which are neither.
+
+    This no longer switches anything — nothing in this server is "at" a session.
+    The UI reads transcripts through `/api/session/{sid}/history`, which never
+    touches ACP at all; this endpoint remains for the case where the ACP
+    adapter's own rendering of a session is what is wanted.
     """
     try:
         body = await request.json()
@@ -1168,13 +1329,18 @@ async def handle_session_delete(request: web.Request) -> web.Response:
 # Status / health / index                                                       #
 # --------------------------------------------------------------------------- #
 async def handle_status(request: web.Request) -> web.Response:
-    acp = state(request).acp
-    cur = state(request).current
+    st = state(request)
+    acp = st.acp
+    running = st.running()
     return web.json_response({
         "acpAlive": acp.alive,
-        "session": acp.session_id,
+        "session": st.last_session,
         "mcp": {"name": MEMORY_MCP_NAME, "url": MEMORY_MCP_URL} if MEMORY_MCP_URL else None,
-        "turn": {"streamId": cur.stream_id, "running": cur.running} if cur else None,
+        # A list, because there can be several. It was a single `turn` object
+        # for the same reason everything else here was singular.
+        "turns": [{"session": sid, "streamId": st.live[sid].stream_id}
+                  for sid in running if sid in st.live],
+        "maxConcurrent": max_concurrent_turns(),
     })
 
 
