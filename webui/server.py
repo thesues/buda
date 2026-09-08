@@ -78,6 +78,17 @@ MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://memory-mcp:5100/mcp")
 MEMORY_MCP_NAME = os.environ.get("MEMORY_MCP_NAME", "memory")
 
 
+# Tells one BROWSER from another. Not authentication -- everyone here shares
+# one credential and is trusted; this only stops two people sharing a deployment
+# from stepping on each other. Anyone can forge it, and forging it buys nothing
+# they could not already do.
+#
+# A cookie rather than a header because `EventSource` cannot set headers, and a
+# cookie rides every request including the SSE one with no call site changed.
+# The server mints it on the page load, so the client never has to think about
+# it either.
+CLIENT_COOKIE = "cid"
+
 AUTH_USER = os.environ.get("AUTH_USER", "")
 AUTH_PASS = os.environ.get("AUTH_PASS", "")
 
@@ -181,6 +192,35 @@ CHAT_DIRECTIVE = os.environ.get(
 # Auth                                                                          #
 # --------------------------------------------------------------------------- #
 @web.middleware
+async def client_cookie_middleware(request: web.Request, handler):
+    """Give every caller a browser id, on whatever it asked for first.
+
+    Minting only on `/` was not enough: anything that reaches an API endpoint
+    without having loaded the page — a second tab restored from history, a
+    client whose cookie was cleared, curl — arrives with no id, and every such
+    caller shares the SAME empty one. Two of them then read as one person, which
+    is the bug this whole mechanism exists to prevent.
+
+    The id is assigned BEFORE the handler runs, not just returned after it: a
+    caller whose very first request is an API call must be attributed to the id
+    it is about to receive, or that one request is anonymous and the next one is
+    somebody else -- which read as two people to everything downstream.
+
+    An SSE response is already on the wire by the time this returns, so it
+    cannot carry a cookie. That is fine: a stream is never a first request, and
+    the id assigned above is still what the handler saw.
+    """
+    fresh = "" if request.cookies.get(CLIENT_COOKIE) else secrets.token_hex(8)
+    if fresh:
+        request["cid"] = fresh
+    resp = await handler(request)
+    if fresh and not resp.prepared:
+        resp.set_cookie(CLIENT_COOKIE, fresh, max_age=31536000,
+                        path="/", httponly=True, samesite="Lax")
+    return resp
+
+
+@web.middleware
 async def auth_middleware(request: web.Request, handler):
     # The health endpoint stays open so a k8s probe needs no credential, and the
     # static assets are useless without the API behind them.
@@ -215,9 +255,15 @@ class TurnStream:
     all, because the turn was never reading from the connection.
     """
 
-    def __init__(self, stream_id: str, session_id: str | None) -> None:
+    def __init__(self, stream_id: str, session_id: str | None,
+                 client_id: str = "") -> None:
         self.stream_id = stream_id
         self.session_id = session_id
+        # Which browser asked for this turn. Used ONLY to tell a double-click
+        # apart from a second person typing into the same conversation; anyone
+        # may still READ this stream, which is what makes "go back to the
+        # conversation that is replying" work for whoever is looking.
+        self.client_id = client_id
         self.seq = 0
         self.events: deque[tuple[int, dict]] = deque(maxlen=BACKLOG_EVENTS)
         # Events evicted by the cap. A reader asking for a seq older than the
@@ -290,9 +336,16 @@ class Approval:
     prompt, and the push that told it about the prompt is long gone.
     """
 
-    def __init__(self, approval_id: str, stream_id: str, params: dict) -> None:
+    def __init__(self, approval_id: str, stream_id: str, params: dict,
+                 session_id: str | None = None) -> None:
         self.id = approval_id
         self.stream_id = stream_id
+        # Which conversation is asking. The pending list is filtered on it:
+        # unfiltered, a second person's poll showed them a prompt from a
+        # conversation they were not even looking at, and let them answer it.
+        # Scoping to the SESSION rather than to the browser is deliberate --
+        # whoever is reading a shared conversation should be able to answer it.
+        self.session_id = session_id
         self.params = params
         # get_running_loop, not get_event_loop: this must belong to the loop
         # that will await it, and only the running one is guaranteed to be that.
@@ -304,6 +357,7 @@ class Approval:
         return {
             "id": self.id,
             "streamId": self.stream_id,
+            "session": self.session_id,
             "title": p.get("toolCall", {}).get("title") or p.get("title") or "permission",
             "options": p.get("options") or [],
         }
@@ -327,14 +381,16 @@ class State:
         # a property of this server rather than of anything underneath it.
         self.turns: dict[str, asyncio.Task] = {}
         self.live: dict[str, TurnStream] = {}
-        # The session prompted most recently. Only a default for a page that
-        # arrives with no opinion; the agent is no longer "at" a session, so
-        # there is nothing else for `current` to honestly mean.
-        self.last_session: str | None = None
-        # The conversation most recently opened for reading, and the warming
-        # tasks watching it. The tasks are held because asyncio references a
+        # Per browser, both of them. Shared, these leaked one person's position
+        # into another's page: a fresh load adopted whatever session someone
+        # else had just prompted, and two readers opening different
+        # conversations within the debounce window cancelled each other's
+        # warm-up. Neither is about the agent; both are about where a PERSON is.
+        self.last_session: dict[str, str] = {}
+        # The conversation each browser most recently opened, and the warming
+        # tasks watching them. The tasks are held because asyncio references a
         # task only weakly; a collected one warms nothing and says nothing.
-        self.viewing: str | None = None
+        self.viewing: dict[str, str] = {}
         self.warming: set[asyncio.Task] = set()
         self.gc: asyncio.Task | None = None
 
@@ -940,6 +996,7 @@ async def handle_chat_start(request: web.Request) -> web.Response:
         return web.json_response({"error": "empty message"}, status=400)
 
     acp = st.acp
+    cid = client_id(request)
     want = (body.get("sessionId") or "").strip()
     if not want and not body.get("new"):
         # A caller that names nothing means "carry on where I was". That used to
@@ -947,18 +1004,31 @@ async def handle_chat_start(request: web.Request) -> web.Response:
         # is what keeps a double-click on a BRAND-NEW conversation from opening
         # two of them — the second request has no id to send yet, so without
         # this it reads as a second "start something new".
-        want = st.last_session or ""
+        want = st.last_session.get(cid, "")
     fresh = bool(body.get("new")) or not want
     running = st.running()
 
     # Busy is now a question about THIS conversation, not about the server.
-    # Joining the turn already streaming here is what makes a double-click, or a
-    # reload that re-submits, harmless; starting a rival turn would interleave
-    # two agents into one transcript.
     if not fresh and want in running:
         cur = st.live.get(want)
-        return web.json_response({"streamId": cur.stream_id if cur else None,
-                                  "sessionId": want, "attached": True})
+        if cur is not None and cur.client_id == cid:
+            # The same browser asking again: a double-click, or a reload that
+            # re-submits. Join the turn -- the text is the same text, and
+            # starting a rival turn would interleave two agents into one
+            # transcript.
+            return web.json_response({"streamId": cur.stream_id,
+                                      "sessionId": want, "attached": True})
+        # A DIFFERENT browser. Same shape, completely different event: someone
+        # else typed this, and joining would silently discard what they wrote
+        # while showing them a reply to a question they did not ask. That is
+        # what this branch used to do to the second person on a shared
+        # deployment -- the text was never even read. Refuse, and say so, so the
+        # client can put the message back in the composer.
+        return web.json_response(
+            {"error": "这个会话正在回复中（另一个窗口发起的），消息未发出",
+             "taken": True, "sessionId": want,
+             "streamId": cur.stream_id if cur else None},
+            status=409)
 
     if len(running) >= MAX_CONCURRENT_TURNS:
         # A backstop, not the normal path — the client is told the number by
@@ -986,8 +1056,8 @@ async def handle_chat_start(request: web.Request) -> web.Response:
         verb = "start a session" if fresh else f"open {want}"
         return web.json_response({"error": f"could not {verb}: {e}"}, status=500)
 
-    st.last_session = sid
-    stream = TurnStream(secrets.token_hex(8), sid)
+    st.last_session[cid] = sid
+    stream = TurnStream(secrets.token_hex(8), sid, cid)
     st.streams[stream.stream_id] = stream
     st.live[sid] = stream
     stream.emit("user", text=text)
@@ -998,7 +1068,7 @@ async def handle_chat_start(request: web.Request) -> web.Response:
             stream.emit(ev[0], **ev[1])
 
     async def on_permission(params: dict):
-        ap = Approval(secrets.token_hex(6), stream.stream_id, params)
+        ap = Approval(secrets.token_hex(6), stream.stream_id, params, sid)
         st.approvals[ap.id] = ap
         stream.emit("approval", **ap.brief())
         try:
@@ -1247,7 +1317,21 @@ async def handle_chat_cancel(request: web.Request) -> web.Response:
 # Approvals — pushed on the stream, and pollable because a push can be missed   #
 # --------------------------------------------------------------------------- #
 async def handle_approval_pending(request: web.Request) -> web.Response:
-    return web.json_response({"pending": [a.brief() for a in state(request).approvals.values()]})
+    """Approvals the caller is in a position to answer.
+
+    Filtered by the conversation they say they are looking at. Unfiltered, a
+    second person polling saw a prompt raised in a conversation they had never
+    opened -- and could answer it, which is not a display bug but someone else
+    approving a shell command on your behalf.
+
+    No `session` given means no filter, which is what a probe or an older client
+    gets. That is the pre-existing behaviour and it is only reachable by a
+    caller that does not say where it is.
+    """
+    want = (request.query.get("session") or "").strip()
+    pending = [a.brief() for a in state(request).approvals.values()
+               if not want or a.session_id == want]
+    return web.json_response({"pending": pending})
 
 
 async def handle_approval_answer(request: web.Request) -> web.Response:
@@ -1308,7 +1392,7 @@ async def handle_sessions(request: web.Request) -> web.Response:
     # which meant returning to the second one showed a truncated answer.
     streaming = {sid: st.live[sid].stream_id for sid in running if sid in st.live}
     return web.json_response({"sessions": rows,
-                              "current": st.last_session,
+                              "current": st.last_session.get(client_id(request)),
                               "streaming": streaming,
                               "running": len(running),
                               "maxConcurrent": max_concurrent_turns()})
@@ -1358,7 +1442,7 @@ async def handle_session_load(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "current": sid, "history": history})
 
 
-def _warm_after_debounce(st: "State", sid: str) -> None:
+def _warm_after_debounce(st: "State", cid: str, sid: str) -> None:
     """Introduce `sid` to the ACP process, later, if the reader is still there.
 
     Fire and forget, deliberately: the response this is scheduled from must not
@@ -1373,11 +1457,11 @@ def _warm_after_debounce(st: "State", sid: str) -> None:
     """
     if PREFETCH_DEBOUNCE_SEC < 0:
         return
-    st.viewing = sid
+    st.viewing[cid] = sid
 
     async def warm() -> None:
         await asyncio.sleep(PREFETCH_DEBOUNCE_SEC)
-        if st.viewing != sid:
+        if st.viewing.get(cid) != sid:
             return          # scrolled past; whoever they landed on gets warmed
         try:
             await st.acp.ensure_known(sid)
@@ -1408,18 +1492,22 @@ async def handle_session_history(request: web.Request) -> web.Response:
         history = await st.acp.read_history(sid)
     except Exception as e:  # noqa: BLE001
         return web.json_response({"error": str(e)}, status=500)
-    _warm_after_debounce(st, sid)
+    _warm_after_debounce(st, client_id(request), sid)
     return web.json_response({"ok": True, "id": sid, "history": history})
 
 
 async def handle_session_delete(request: web.Request) -> web.Response:
     sid = request.match_info["sid"]
     st = state(request)
-    if st.viewing == sid:
-        # Stop any pending warm-up for it: loading a session that is being
-        # deleted is pure waste, and on an unlucky interleaving it would put the
-        # id back into `_known` after `delete_session` took it out.
-        st.viewing = None
+    # Stop any pending warm-up for it, for EVERY browser: loading a session that
+    # is being deleted is pure waste, and on an unlucky interleaving it would
+    # put the id back into `_known` after `delete_session` took it out.
+    for cid, viewed in list(st.viewing.items()):
+        if viewed == sid:
+            st.viewing.pop(cid, None)
+    for cid, last in list(st.last_session.items()):
+        if last == sid:
+            st.last_session.pop(cid, None)
     try:
         await st.acp.delete_session(sid)
     except Exception as e:  # noqa: BLE001
@@ -1436,7 +1524,7 @@ async def handle_status(request: web.Request) -> web.Response:
     running = st.running()
     return web.json_response({
         "acpAlive": acp.alive,
-        "session": st.last_session,
+        "session": st.last_session.get(client_id(request)),
         "mcp": {"name": MEMORY_MCP_NAME, "url": MEMORY_MCP_URL} if MEMORY_MCP_URL else None,
         # A list, because there can be several. It was a single `turn` object
         # for the same reason everything else here was singular.
@@ -1453,15 +1541,18 @@ async def handle_health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def handle_index(_request: web.Request) -> web.StreamResponse:
+async def handle_index(request: web.Request) -> web.StreamResponse:
     if not PAGE_TITLE:
-        return web.FileResponse(STATIC / "index.html")
-    # Substituted per request rather than at boot: the file is the source of
-    # truth, and a served copy that drifts from it is the kind of thing nobody
-    # thinks to check.
-    html = (STATIC / "index.html").read_text()
-    html = re.sub(r"<title>.*?</title>", f"<title>{html_escape(PAGE_TITLE)}</title>", html, count=1)
-    return web.Response(text=html, content_type="text/html")
+        resp: web.StreamResponse = web.FileResponse(STATIC / "index.html")
+    else:
+        # Substituted per request rather than at boot: the file is the source of
+        # truth, and a served copy that drifts from it is the kind of thing
+        # nobody thinks to check.
+        html = (STATIC / "index.html").read_text()
+        html = re.sub(r"<title>.*?</title>",
+                      f"<title>{html_escape(PAGE_TITLE)}</title>", html, count=1)
+        resp = web.Response(text=html, content_type="text/html")
+    return resp   # the browser id is minted by `client_cookie_middleware`
 
 
 # --------------------------------------------------------------------------- #
@@ -1512,8 +1603,24 @@ def state(request: web.Request) -> "State":
     return request.app["state"]
 
 
+def client_id(request: web.Request) -> str:
+    """Which browser this is.
+
+    Every callers gets one from `client_cookie_middleware`, so "" reaches here
+    only for a request whose response could not carry a Set-Cookie -- in
+    practice the SSE stream, which never comes first. It is worth being precise
+    about what "" means: it is ONE shared anonymous identity, not "unknown".
+    Two cookie-less callers are indistinguishable and will be treated as the
+    same person, which is exactly why the cookie is minted on every entry point
+    rather than only on the page load.
+    """
+    return request.get("cid") or request.cookies.get(CLIENT_COOKIE, "")
+
+
 def build_app() -> web.Application:
-    app = web.Application(middlewares=[auth_middleware])
+    # Order matters: auth runs first (a 401 must not hand out an id), and the
+    # cookie middleware wraps whatever comes back from it.
+    app = web.Application(middlewares=[client_cookie_middleware, auth_middleware])
     app["state"] = State()
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)

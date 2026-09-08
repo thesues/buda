@@ -449,7 +449,11 @@ async function answerApproval(id, optionId, card) {
 
 async function pollApprovals() {
   try {
-    const j = await (await fetch("/api/approval/pending")).json();
+    // Say which conversation we are in. Unscoped, this poll showed a second
+    // person a permission prompt raised in a conversation they had never
+    // opened — and let them answer it.
+    const q = S.sessionId ? `?session=${encodeURIComponent(S.sessionId)}` : "";
+    const j = await (await fetch(`/api/approval/pending${q}`)).json();
     const p = (j.pending || [])[0];
     if (p) showApproval(p);
     else S.awaitingPerm = false;
@@ -858,10 +862,13 @@ async function send() {
     })).json();
   } catch (_) { status("发送失败"); return; }
   if (j.error) {
-    // At capacity: the composer should already have been blocked, so this is
-    // the race backstop. Put the text back rather than eating it.
-    if (j.busy) { input.value = text; dropLastUser(); }
+    // Two ways a send can be refused, and neither may eat what was typed:
+    // `busy` is the server at capacity (the composer should already have been
+    // blocked, so this is the race backstop), `taken` is someone else already
+    // replying in this conversation.
+    if (j.busy || j.taken) { input.value = text; dropLastUser(); }
     status(j.error);
+    if (j.taken) loadSessions();   // the sidebar did not know it was streaming
     return;
   }
   if (!j.streamId) { status("没有可用的会话流"); return; }

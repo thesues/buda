@@ -1582,3 +1582,160 @@ async def test_deleting_a_conversation_calls_off_its_warming(aiohttp_client, app
         assert acp.loads == [], f"warmed a session that was deleted: {acp.loads}"
     finally:
         srv.PREFETCH_DEBOUNCE_SEC = old
+
+
+# --- Two people, one deployment. ---------------------------------------------
+# Turn-level contention is gone, but the server still held one person's position
+# in single-valued state, and one branch read a second person's send as a
+# double-click and threw their message away without ever looking at it.
+
+def _as(client, cid):
+    """A request from a specific browser."""
+    return {"cookies": {srv.CLIENT_COOKIE: cid}}
+
+
+@pytest.mark.asyncio
+async def test_a_second_person_sending_is_refused_not_swallowed(aiohttp_client, app):
+    """The branch that makes a double-click harmless was throwing away someone
+    else's message. It returns `attached` WITHOUT READING `text` — so the second
+    person saw their own prompt drawn optimistically, then a reply to a question
+    they never asked, and what they typed was gone."""
+    client = await aiohttp_client(app)
+    first = await (await client.post("/api/chat/start", json={"text": "mine"},
+                                     cookies={srv.CLIENT_COOKIE: "alice"})).json()
+    sid = first["sessionId"]
+
+    # Same browser again: still a double-click, still joins.
+    again = await (await client.post(
+        "/api/chat/start", json={"text": "mine", "sessionId": sid},
+        cookies={srv.CLIENT_COOKIE: "alice"})).json()
+    assert again["attached"] is True, again
+
+    r = await client.post("/api/chat/start",
+                          json={"text": "theirs", "sessionId": sid},
+                          cookies={srv.CLIENT_COOKIE: "bob"})
+    body = await r.json()
+    assert r.status == 409, body
+    assert body.get("taken") is True, body
+    assert "attached" not in body, "a stranger's turn was handed back as theirs"
+
+    app["state"].acp.release.set()
+    await asyncio.wait_for(turn(app, sid), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_an_approval_does_not_leak_to_someone_in_another_conversation(
+        aiohttp_client, app):
+    """Not a display bug: the pending list is what the poll answers FROM, so an
+    unscoped one let a bystander approve a shell command on your behalf."""
+    client = await aiohttp_client(app)
+
+    async def prompt_with_permission(session_id, text, on_update, on_permission):
+        await on_permission({"toolCall": {"title": "rm -rf /"},
+                             "options": [{"optionId": "allow", "name": "允许"}]})
+        return {"stopReason": "end_turn"}
+
+    app["state"].acp.prompt = prompt_with_permission
+    started = await (await client.post("/api/chat/start", json={"text": "go"})).json()
+    sid = started["sessionId"]
+
+    for _ in range(50):
+        pending = (await (await client.get("/api/approval/pending")).json())["pending"]
+        if pending:
+            break
+        await asyncio.sleep(0.02)
+    assert pending and pending[0]["session"] == sid, pending
+
+    # Someone reading a DIFFERENT conversation must not see it.
+    away = (await (await client.get(
+        "/api/approval/pending?session=somewhere-else")).json())["pending"]
+    assert away == [], away
+
+    # Someone reading THIS one must — a shared conversation is answerable by
+    # whoever is looking at it.
+    here = (await (await client.get(
+        f"/api/approval/pending?session={sid}")).json())["pending"]
+    assert len(here) == 1 and here[0]["title"] == "rm -rf /", here
+
+    await client.post("/api/approval/answer",
+                      json={"id": here[0]["id"], "optionId": "allow"})
+    await asyncio.wait_for(turn(app, sid), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_one_persons_position_does_not_become_anothers(aiohttp_client, app):
+    """`last_session` was a single value, so a fresh page adopted whatever
+    conversation someone else had just prompted."""
+    client = await aiohttp_client(app)
+    started = await (await client.post("/api/chat/start", json={"text": "hi"},
+                                       cookies={srv.CLIENT_COOKIE: "alice"})).json()
+
+    mine = await (await client.get("/api/sessions",
+                                   cookies={srv.CLIENT_COOKIE: "alice"})).json()
+    assert mine["current"] == started["sessionId"], mine
+
+    theirs = await (await client.get("/api/sessions",
+                                     cookies={srv.CLIENT_COOKIE: "bob"})).json()
+    assert theirs["current"] is None, f"bob inherited alice's position: {theirs}"
+    # But the turn itself is public: it is one deployment and one session list.
+    assert theirs["streaming"] == mine["streaming"], theirs
+
+    app["state"].acp.release.set()
+    await asyncio.wait_for(turn(app, started["sessionId"]), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_two_readers_do_not_cancel_each_others_warming(aiohttp_client, app):
+    """`viewing` was one value, so two people opening different conversations
+    inside the debounce window left one of them unwarmed for no reason."""
+    old = srv.PREFETCH_DEBOUNCE_SEC
+    srv.PREFETCH_DEBOUNCE_SEC = 0.1
+    try:
+        acp = app["state"].acp
+        client = await aiohttp_client(app)
+        await client.get("/api/session/alice-sess/history",
+                         cookies={srv.CLIENT_COOKIE: "alice"})
+        await client.get("/api/session/bob-sess/history",
+                         cookies={srv.CLIENT_COOKIE: "bob"})
+        await asyncio.sleep(0.3)
+        assert sorted(acp.loads) == ["alice-sess", "bob-sess"], acp.loads
+    finally:
+        srv.PREFETCH_DEBOUNCE_SEC = old
+
+
+@pytest.mark.asyncio
+async def test_the_page_load_mints_a_browser_id(aiohttp_client, app):
+    """So nothing in the client has to know the concept exists, and so it is
+    already present on the first API call the page makes."""
+    client = await aiohttp_client(app)
+    r = await client.get("/")
+    assert r.status == 200
+    assert srv.CLIENT_COOKIE in r.cookies, dict(r.cookies)
+    minted = r.cookies[srv.CLIENT_COOKIE].value
+    assert minted
+
+    # A browser that already has one keeps it: re-minting would make every
+    # reload a different person.
+    r2 = await client.get("/")
+    assert srv.CLIENT_COOKIE not in r2.cookies, "the id was reissued on reload"
+
+
+def test_the_client_says_which_conversation_it_is_polling_for():
+    """Ablation: drop the query and the server has to answer unfiltered."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function pollApprovals("):]
+    body = body[:body.index("\n}") + 2]
+    assert "session=" in body, f"the poll does not say where it is:\n{body}"
+
+
+def test_a_refused_send_puts_the_message_back():
+    """Typed text is the one thing this UI cannot regenerate."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("async function send()"):]
+    ends = [body.index(m) for m in ("\nasync function ", "\nfunction ") if m in body]
+    body = body[:min(ends)] if ends else body
+    guard = body[body.index("if (j.error)"):]
+    guard = guard[:guard.index("input.value = text") + 40]
+    assert "j.taken" in guard, (
+        "a refused send still eats what was typed:\n" + guard
+    )
