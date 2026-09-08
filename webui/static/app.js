@@ -155,12 +155,20 @@ function showFresh() {
   );
   m.appendChild(hero);
   $(".chat").classList.add("fresh");
+  // The standing placeholder is a keyboard reference — right above a
+  // transcript, wrong as the one line inside an otherwise empty screen, where
+  // it reads as instructions rather than an invitation.
+  const inp = $("#input");
+  if (!inp.dataset.placeholder) inp.dataset.placeholder = inp.placeholder;
+  inp.placeholder = "问点什么…";
 }
 
 function clearFresh() {
   const c = $(".chat");
   if (!c.classList.contains("fresh")) return;
   c.classList.remove("fresh");
+  const inp = $("#input");
+  if (inp.dataset.placeholder) inp.placeholder = inp.dataset.placeholder;
   const hero = $(".fresh-hero");
   if (hero) hero.remove();
 }

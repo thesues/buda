@@ -304,7 +304,9 @@ header h1 em { color:var(--accent); font-style:italic; }
                         max-width:640px; width:100%; align-self:center;
                         gap:0.5rem; }
 .chat.fresh #input { background:var(--surface-raised); border-radius:14px;
-                     padding:0.8rem 1rem; font-size:0.88rem; }
+                     padding:0.85rem 1.05rem; font-size:0.9rem;
+                     font-family:inherit; }
+.chat.fresh #input::placeholder { font-family:inherit; }
 .chat.fresh #send { align-self:center; }
 
 .fresh-hero { text-align:center; padding:0 1rem 1.5rem; }
