@@ -310,9 +310,17 @@ header h1 em { color:var(--accent); font-style:italic; }
 .chat.fresh #send { align-self:center; }
 
 .fresh-hero { text-align:center; padding:0 1rem 1.5rem; }
-.fresh-mark { font-size:1.5rem; color:var(--accent); line-height:1;
-              margin-bottom:0.9rem; opacity:0.9; }
 .fresh-title { font-size:1.5rem; font-weight:400; color:var(--text);
                letter-spacing:0.02em; }
 .fresh-sub { font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;
              letter-spacing:0.02em; }
+
+/* One turn at a time — a single GPU, not a policy. The composer says so rather
+   than accepting a click and dropping it. */
+.chat.blocked #input { opacity:0.55; }
+.chat.blocked #send { opacity:0.4; cursor:not-allowed; }
+.chat.blocked #composer::after {
+  content:attr(data-blocked); position:absolute;
+  bottom:0.15rem; left:1rem; font-size:0.68rem; color:var(--text-muted);
+}
+#composer { position:relative; }

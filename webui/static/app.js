@@ -78,6 +78,9 @@ const S = {
   switching: null,      // a history read in flight; sending must wait for it
   pendingNew: false,    // "new session" clicked; the ACP move happens on send
   ownStream: null,      // the stream THIS view started, before it has an id
+  sessionRows: [],      // last list from the server, so a click can repaint now
+  maxConcurrent: null,  // replies the server can run at once — it reports it
+  running: null,        // and how many it is running
   streamingSession: null,  // which session owns the running turn, if any
   streamingStreamId: null, // and its stream, so returning to it can reattach
   stopping: false,
@@ -149,7 +152,6 @@ function showFresh() {
   m.textContent = "";
   const hero = el("div", "fresh-hero");
   hero.append(
-    el("div", "fresh-mark", "✳"),
     el("div", "fresh-title", "新的对话"),
     el("div", "fresh-sub", "还没有任何上下文 — 问点什么开始吧"),
   );
@@ -583,14 +585,37 @@ function cancelTurn() {
 function setBusy(b) {
   S.busy = b;
   if (!b) S.stopping = false;
-  // Only when the reader is looking AT the streaming session. Otherwise the
-  // composer would offer to stop a turn belonging to a conversation that is
-  // not on screen — which is what a global busy flag did as soon as browsing
-  // mid-turn became possible.
-  const mine = b && (!S.streamingSession || S.streamingSession === S.sessionId);
-  $("#send").disabled = false;
-  $("#send").textContent = mine ? "停止" : "发送";
-  $("#send").classList.toggle("stop", !!mine);
+  const send = $("#send");
+  // Whose turn is this? If the view has an id, the ids decide — full stop.
+  // `S.ownStream` is "the stream THIS CLIENT started", not "the stream of the
+  // session on screen", so consulting it after navigating away kept claiming a
+  // turn left behind in another conversation. It is meaningful only while the
+  // view has no id of its own yet, which is the one window ids cannot cover.
+  const owns = b && (S.sessionId
+    ? S.streamingSession === S.sessionId
+    : (!!S.ownStream && S.ownStream === S.streamId));
+
+  // Ask the server how many replies it can run and how many it is running,
+  // instead of reading "a turn exists" as "the composer is blocked". Those are
+  // the same statement only while the limit is one, and that limit is a fact
+  // about the ACP pool — not something the frontend gets to decide.
+  const atCapacity = (S.maxConcurrent != null && S.running != null)
+    ? S.running >= S.maxConcurrent
+    : b;                       // before the first list refresh, the local flag
+  const elsewhere = atCapacity && !owns;
+  const n = S.maxConcurrent || 1;
+
+  send.textContent = owns ? "停止" : "发送";
+  send.classList.toggle("stop", !!owns);
+  send.disabled = !!elsewhere;
+  send.title = elsewhere
+    ? `另一个会话正在回复。这台机器一次只跑 ${n} 轮 — 等它结束，或到那个会话里停止它。`
+    : "";
+  $(".chat").classList.toggle("blocked", !!elsewhere);
+  // The line under the composer carries the same number: a tooltip needs a
+  // hover, and the reason a button will not respond should not.
+  $("#composer").dataset.blocked = elsewhere
+    ? `另一个会话正在回复，这台机器一次只跑 ${n} 轮` : "";
   if (b) {
     S.startedAt = Date.now();
     if (!S.timer) S.timer = setInterval(() => { tick(); tickSlow(); }, 90);
@@ -608,26 +633,16 @@ function setBusy(b) {
 }
 
 /* ---------- sessions ---------- */
-async function loadSessions() {
-  let j;
-  try { j = await (await fetch("/api/sessions")).json(); } catch (_) { return; }
+function renderSessions() {
+  // Pure render from the rows we already have. Split out of `loadSessions` so a
+  // click can repaint the sidebar with no network in it at all: the fetch it
+  // used to wait on costs ~310 ms, and the highlight moving only after that —
+  // plus another ~310 ms for the transcript — is what made switching feel slow.
+  // The reference webui does the same thing for the same reason
+  // (`renderSessionListFromCache`).
   const ul = $("#sessions");
+  const rows = S.sessionRows || [];
   ul.textContent = "";
-  const rows = j.sessions || [];
-  // Adopt the id the server says is current. It is the only place the client
-  // can learn it for a conversation it did not open from the sidebar — a fresh
-  // one gets its id from hermes on its first turn — and without it those
-  // conversations all key their disclosure state to the same "-" bucket.
-  // `j.current` is where the AGENT is, which is no longer where the reader is
-  // looking — that is the whole point of being able to browse mid-turn. Adopt
-  // it only when the reader has no session of their own yet.
-  // A brand-new conversation has no id at the moment `chat/start` returns —
-  // hermes assigns it as the turn begins — so the row appears unselected. If we
-  // have none of our own, the streaming session is ours by construction: we
-  // just sent to it.
-  if (!S.sessionId && !S.pendingNew) S.sessionId = j.streaming || j.current || null;
-  S.streamingSession = j.streaming || null;
-  S.streamingStreamId = j.streamingStreamId || null;
   $("#sess-count").textContent = rows.length ? String(rows.length) : "";
   rows.forEach((s) => {
     let cls = s.id === S.sessionId ? "sess cur" : "sess";
@@ -652,6 +667,24 @@ async function loadSessions() {
   });
 }
 
+async function loadSessions() {
+  let j;
+  try { j = await (await fetch("/api/sessions")).json(); } catch (_) { return; }
+  // `j.current` is where the AGENT is, which is no longer where the reader is
+  // looking — that is the whole point of being able to browse mid-turn. Adopt
+  // it only when the reader has no session of their own yet, and never while a
+  // brand-new one is waiting for hermes to assign it an id.
+  if (!S.sessionId && !S.pendingNew) S.sessionId = j.streaming || j.current || null;
+  S.sessionRows = j.sessions || [];
+  S.streamingSession = j.streaming || null;
+  S.streamingStreamId = j.streamingStreamId || null;
+  if (j.maxConcurrent != null) S.maxConcurrent = j.maxConcurrent;
+  if (j.running != null) S.running = j.running;
+  setBusy(S.busy);          // capacity changed under it; re-render the composer
+  renderSessions();
+}
+
+
 // Transcripts already replayed in this page's lifetime. A switch back is then
 // a repaint, not a round trip — which matters because `session/load` costs
 // about a second: hermes re-registers the MCP server and rebuilds its whole
@@ -670,6 +703,9 @@ function paintHistory(history) {
 
 async function openSession(id) {
   clearFresh();
+  S.ownStream = null;       // whatever we started, we are not looking at it now
+  S.sessionId = id;
+  renderSessions();         // the selection moves NOW, not after two round trips
   // No busy guard. Reading a transcript no longer moves the agent, so a turn
   // in flight is none of this function's business — it keeps streaming into
   // whichever session owns it, and `send()` relocates the agent when the reader

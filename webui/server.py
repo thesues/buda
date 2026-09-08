@@ -290,6 +290,9 @@ class State:
 class HermesACP:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
+        # The session-store bridge, held open. See `_bridge`.
+        self._bridge_proc: asyncio.subprocess.Process | None = None
+        self._bridge_lock = asyncio.Lock()
         self.session_id: str | None = None
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -376,9 +379,53 @@ class HermesACP:
         await self.ensure_proc()
         self.session_id = None
 
+    async def _bridge(self, req: dict) -> object:
+        """One request to the long-lived `hermes_session_api serve` process.
+
+        Held open because the alternative is measured: a one-shot invocation is
+        ~310 ms, of which ~270 ms is `import hermes_state`, and a session switch
+        pays it twice. Kept here rather than in the ACP client because it is the
+        same separation for the same reason — hermes' venv, not ours.
+
+        A dead or wedged bridge falls back to spawning one, so the slow path is
+        the old behaviour rather than an error. The lock is what makes a single
+        pipe safe: replies are matched by ORDER, so two callers interleaving
+        their writes would each read the other's answer.
+        """
+        async with self._bridge_lock:
+            for attempt in (1, 2):
+                try:
+                    if self._bridge_proc is None or self._bridge_proc.returncode is not None:
+                        self._bridge_proc = await asyncio.create_subprocess_exec(
+                            HERMES_PY, HERMES_SESSION_API, "serve",
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        hello = await self._bridge_proc.stdout.readline()
+                        if not hello:
+                            raise RuntimeError("bridge died before it said ready")
+                    self._bridge_proc.stdin.write((json.dumps(req) + "\n").encode())
+                    await self._bridge_proc.stdin.drain()
+                    line = await self._bridge_proc.stdout.readline()
+                    if not line:
+                        raise RuntimeError("bridge closed mid-request")
+                    resp = json.loads(line.decode())
+                    if "error" in resp:
+                        raise RuntimeError(resp["error"])
+                    return resp["ok"]
+                except Exception:  # noqa: BLE001
+                    self._bridge_proc = None
+                    if attempt == 2:
+                        raise
+
     async def list_sessions(self) -> list[dict]:
         # hermes' own SessionDB via its venv, NOT ACP `session/list`: that caches
         # in memory, so a session deleted through the CLI kept reappearing.
+        try:
+            return await self._bridge({"cmd": "list", "limit": 200})
+        except Exception:  # noqa: BLE001
+            logger.warning("session bridge unavailable; falling back to a spawn")
         proc = await asyncio.create_subprocess_exec(
             HERMES_PY, HERMES_SESSION_API, "list", "--limit", "200",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -399,6 +446,10 @@ class HermesACP:
         the store already holds the transcript, and reading it costs the turn
         nothing.
         """
+        try:
+            return await self._bridge({"cmd": "history", "id": sid})
+        except Exception:  # noqa: BLE001
+            logger.warning("session bridge unavailable; falling back to a spawn")
         proc = await asyncio.create_subprocess_exec(
             HERMES_PY, HERMES_SESSION_API, "history", "--id", sid,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -709,10 +760,11 @@ def _to_event(update: dict) -> tuple[str, dict] | None:
 # --------------------------------------------------------------------------- #
 async def handle_chat_start(request: web.Request) -> web.Response:
     st = state(request)
-    if st.turn_task and not st.turn_task.done():
-        # One turn at a time. Returning the RUNNING stream id rather than an
-        # error means a double-click, or a reload that re-submits, attaches to
-        # the turn in flight instead of being told "busy" with no way back to it.
+    running = 1 if (st.turn_task and not st.turn_task.done()) else 0
+    if running >= max_concurrent_turns():
+        # At capacity. Returning the RUNNING stream id rather than an error
+        # means a double-click, or a reload that re-submits, attaches to the
+        # turn in flight instead of being told "busy" with no way back to it.
         cur = st.current
         return web.json_response({"streamId": cur.stream_id if cur else None,
                                   "sessionId": cur.session_id if cur else None,
@@ -1005,6 +1057,28 @@ async def handle_approval_answer(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Sessions                                                                      #
 # --------------------------------------------------------------------------- #
+def max_concurrent_turns() -> int:
+    """How many replies this server can have in flight.
+
+    One, and it is structural rather than a policy: there is a SINGLE
+    `hermes acp` subprocess behind this server, speaking over one stdin/stdout
+    pipe, and `session/load` MOVES it between conversations. A second turn would
+    contend for both the pipe and the agent's position, so the number is not a
+    knob — it is `len(the ACP pool)`, and the pool has one member.
+
+    It is a function so the UI can ASK rather than assume. The frontend used to
+    encode this as "a turn is running, therefore the composer is blocked", which
+    is the conclusion, not the reason: the day this becomes a real pool, the
+    answer changes here and nothing in the client has to.
+
+    Note the limit below this one: `freetoken-l3` runs with
+    `--max-running-requests 1`, chosen because 4 put a 24 GB card into CUDA OOM
+    and FreeToken cannot restart a dead worker. Raising the pool without raising
+    that only moves the queue.
+    """
+    return 1
+
+
 async def handle_sessions(request: web.Request) -> web.Response:
     st = state(request)
     acp = st.acp
@@ -1025,7 +1099,9 @@ async def handle_sessions(request: web.Request) -> web.Response:
     cur = st.current if running else None
     return web.json_response({"sessions": rows, "current": acp.session_id,
                               "streaming": busy_sid,
-                              "streamingStreamId": cur.stream_id if cur else None})
+                              "streamingStreamId": cur.stream_id if cur else None,
+                              "running": 1 if running else 0,
+                              "maxConcurrent": max_concurrent_turns()})
 
 
 async def handle_session_new(request: web.Request) -> web.Response:

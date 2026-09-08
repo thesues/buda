@@ -1005,3 +1005,34 @@ def test_a_fresh_conversation_looks_different_from_one_with_history():
     # And it must give way the moment anything is said.
     add = src[src.index("function addMsg("):]
     assert "clearFresh()" in add[:add.index("\n}") + 2], "the hero survives the first message"
+
+
+@pytest.mark.asyncio
+async def test_the_server_reports_its_own_concurrency(aiohttp_client, app):
+    """The frontend must not decide how many replies this machine can run.
+
+    It used to encode the limit as "a turn exists, therefore the composer is
+    blocked" — the conclusion, not the reason. The number is a fact about the
+    ACP pool (one process, one pipe, and `session/load` moves it), so the server
+    states it and the client asks.
+    """
+    client = await aiohttp_client(app)
+    r = await client.get("/api/sessions")
+    j = await r.json()
+    assert j["maxConcurrent"] == 1, j
+    assert j["running"] == 0, j
+
+    await client.post("/api/chat/start", json={"text": "hi"})
+    j = await (await client.get("/api/sessions")).json()
+    assert j["running"] == 1 and j["maxConcurrent"] == 1, j
+    await client.post("/api/chat/cancel")
+
+
+def test_the_composer_blocks_on_reported_capacity_not_on_a_local_flag():
+    """Ablation: go back to `atCapacity = b` and this goes red."""
+    src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = src[src.index("function setBusy("):]
+    body = body[:body.index("\n  if (b) {")]
+    assert "S.maxConcurrent" in body and "S.running" in body, (
+        "the composer still decides the limit for itself:\n" + body
+    )

@@ -130,6 +130,43 @@ def history(sid: str, limit: int) -> list[dict]:
     return out
 
 
+def serve() -> int:
+    """Answer JSON-line requests on stdin until it closes.
+
+    The reason this mode exists is measured: a one-shot invocation costs ~310 ms
+    of which ~270 ms is `import hermes_state`, and the webui pays that twice on
+    every session switch — once for the transcript and once for the list. Held
+    open, the import happens at startup and each answer is a SQLite query.
+
+    One request per line, `{"cmd": ..., ...}`; one response per line, either
+    `{"ok": <payload>}` or `{"error": "..."}`. Errors are returned rather than
+    raised so a bad request cannot take the process — and with it every
+    subsequent request — down with it.
+    """
+    sys.stdout.write(json.dumps({"ok": "ready"}) + "\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            cmd = req.get("cmd")
+            if cmd == "list":
+                out = list_sessions(int(req.get("limit", 200)),
+                                    bool(req.get("include_empty", False)))
+            elif cmd == "history":
+                out = history(req["id"], int(req.get("limit", 2000)))
+            else:
+                raise ValueError(f"unknown cmd {cmd!r}")
+            resp = {"ok": out}
+        except Exception as e:  # noqa: BLE001
+            resp = {"error": f"{type(e).__name__}: {e}"}
+        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -139,6 +176,7 @@ def main() -> int:
     p_hist = sub.add_parser("history", help="one session's transcript as JSON")
     p_hist.add_argument("--id", required=True)
     p_hist.add_argument("--limit", type=int, default=2000)
+    sub.add_parser("serve", help="stay open and answer JSON lines on stdin")
     args = ap.parse_args()
 
     if args.cmd == "list":
@@ -147,6 +185,8 @@ def main() -> int:
     if args.cmd == "history":
         json.dump(history(args.id, args.limit), sys.stdout, ensure_ascii=False)
         return 0
+    if args.cmd == "serve":
+        return serve()
     return 2
 
 
