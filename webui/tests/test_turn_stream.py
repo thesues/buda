@@ -974,7 +974,7 @@ async def test_every_streamed_event_says_which_session_it_belongs_to(aiohttp_cli
 def test_a_foreign_event_is_not_drawn():
     """Ablation: drop the `mine` check in `apply` and this goes red."""
     src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
-    body = src[src.index("function apply(ev) {"):]
+    body = src[src.index("function apply(ev"):]
     body = body[:body.index("\n  switch (ev.kind)")]
     assert "ev.session" in body and "S.sessionId" in body, (
         "apply() draws every event regardless of whose it is:\n" + body

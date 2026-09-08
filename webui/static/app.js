@@ -77,6 +77,7 @@ const S = {
   sessionId: null,
   switching: null,      // a history read in flight; sending must wait for it
   pendingNew: false,    // "new session" clicked; the ACP move happens on send
+  ownStream: null,      // the stream THIS view started, before it has an id
   streamingSession: null,  // which session owns the running turn, if any
   streamingStreamId: null, // and its stream, so returning to it can reattach
   stopping: false,
@@ -432,14 +433,30 @@ async function pollApprovals() {
 }
 
 /* ---------- the stream ---------- */
-function apply(ev) {
+function apply(ev, from) {
   // Does this belong to what the reader is looking at? Browsing mid-turn means
   // the answer can be no, and a stream that paints regardless puts one
-  // conversation's tokens into another's transcript — which is what clicking
-  // "new session" during a reply did. The turn is untouched; only the drawing
-  // is skipped. `end` still runs, because the turn really did end and the
-  // bookkeeping it does is not about the screen.
-  const mine = !ev.session || !S.sessionId || ev.session === S.sessionId;
+  // conversation's tokens into another's transcript. The turn is untouched;
+  // only the drawing is skipped. `end` still runs, because the turn really did
+  // end and the bookkeeping it does is not about the screen.
+  //
+  // A conversation that does not exist yet cannot be identified by session id —
+  // it has none until hermes assigns one — so for that view the question is
+  // "did MY send start this stream", not "does this id match". Asking the id
+  // there matched everything, because null matches nothing and the check let it
+  // through: another session's reply drew straight into the new one.
+  const fresh = S.pendingNew && !S.sessionId;
+  const mine = fresh
+    ? (!!S.ownStream && from === S.ownStream)
+    : (!ev.session || !S.sessionId || ev.session === S.sessionId);
+  // The stream is the authority on which conversation this turn belongs to.
+  // Reading `acp.session_id` instead raced hermes assigning it and could hand
+  // back the PREVIOUS session, relabelling the new conversation as the old one.
+  if (mine && fresh && ev.session) {
+    S.sessionId = ev.session;
+    S.pendingNew = false;
+    loadSessions();
+  }
   if (!mine && ev.kind !== "end") {
     if (ev.seq) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
     return;
@@ -484,7 +501,7 @@ function attach(streamId, afterSeq) {
   es.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch (_) { return; }
-    apply(ev);
+    apply(ev, streamId);
   };
   es.onerror = async () => {
     if (!S.busy) return;
@@ -600,7 +617,7 @@ async function loadSessions() {
   // hermes assigns it as the turn begins — so the row appears unselected. If we
   // have none of our own, the streaming session is ours by construction: we
   // just sent to it.
-  if (!S.sessionId) S.sessionId = j.streaming || j.current || null;
+  if (!S.sessionId && !S.pendingNew) S.sessionId = j.streaming || j.current || null;
   S.streamingSession = j.streaming || null;
   S.streamingStreamId = j.streamingStreamId || null;
   $("#sess-count").textContent = rows.length ? String(rows.length) : "";
@@ -706,6 +723,7 @@ async function newSession() {
   // flight cannot survive, so the intent is recorded and acted on at the next
   // send — where nothing is streaming by construction.
   S.pendingNew = true;
+  S.ownStream = null;       // nothing on screen is ours until we send
   // The turn in flight keeps running and keeps its stream; only the drawing
   // stops, because `apply` now checks who each event belongs to. Detaching or
   // calling `endTurn` here would abandon a live reply.
@@ -759,7 +777,10 @@ async function send() {
   // first moment the sidebar can show it. Refreshing here rather than at the
   // end of the turn is the difference between "it appears when you ask" and
   // "it appears when the answer finishes".
-  if (j.sessionId) S.sessionId = j.sessionId;
+  // Ours, so `apply` can tell our own turn from one still running elsewhere
+  // while this view has no id of its own yet.
+  S.ownStream = j.streamId;
+  if (j.sessionId) { S.sessionId = j.sessionId; S.pendingNew = false; }
   loadSessions();
   remember(j.streamId, 0);
   showPending();

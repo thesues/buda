@@ -293,13 +293,24 @@ header h1 em { color:var(--accent); font-style:italic; }
 .sess .stop-row:hover { color:var(--text); }
 
 /* ---------- a brand-new conversation ---------- */
-/* Deliberately unlike a conversation with history: the greeting and the
-   composer sit together in the middle of the column rather than the composer
-   being pinned under a wall of text. The shape itself says "nothing has been
-   said here yet", which a blank message area does not — it reads as loading. */
-.chat.fresh #messages { flex:0 0 auto; margin-top:auto; overflow:visible; }
-.chat.fresh #composer { margin-bottom:auto; }
-.fresh-hero { text-align:center; padding:0 1rem 1.6rem; }
-.fresh-mark { font-size:1.6rem; color:var(--accent); line-height:1; margin-bottom:0.6rem; }
-.fresh-title { font-size:1.35rem; color:var(--text); letter-spacing:0.01em; }
-.fresh-sub { font-size:0.82rem; color:var(--text-muted); margin-top:0.35rem; }
+/* Deliberately unlike a conversation with history. Everything here is about
+   making the pair (greeting, composer) read as ONE centred object rather than
+   a wall of empty panel with a toolbar welded to the bottom of it: the rule
+   above the composer goes, the composer narrows to the width of the text it
+   holds, and the two are centred together instead of being pushed apart. */
+.chat.fresh #messages { flex:0 0 auto; margin-top:auto; overflow:visible;
+                        padding-bottom:0; }
+.chat.fresh #composer { margin-bottom:auto; border-top:0; padding:0 1rem 0;
+                        max-width:640px; width:100%; align-self:center;
+                        gap:0.5rem; }
+.chat.fresh #input { background:var(--surface-raised); border-radius:14px;
+                     padding:0.8rem 1rem; font-size:0.88rem; }
+.chat.fresh #send { align-self:center; }
+
+.fresh-hero { text-align:center; padding:0 1rem 1.5rem; }
+.fresh-mark { font-size:1.5rem; color:var(--accent); line-height:1;
+              margin-bottom:0.9rem; opacity:0.9; }
+.fresh-title { font-size:1.5rem; font-weight:400; color:var(--text);
+               letter-spacing:0.02em; }
+.fresh-sub { font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;
+             letter-spacing:0.02em; }
