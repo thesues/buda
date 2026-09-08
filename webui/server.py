@@ -119,6 +119,26 @@ CANCEL_GRACE_SEC = float(os.environ.get("CANCEL_GRACE_SEC", "12"))
 # still the better failure.
 MAX_CONCURRENT_TURNS = max(1, int(os.environ.get("MAX_CONCURRENT_TURNS", "4")))
 
+# How long a reader must stay on a conversation before it is warmed on the ACP
+# process. Negative disables the warming entirely.
+#
+# The cost being moved is 1.3 s, measured, and it is NOT the cost of reading
+# history — `session/new` measures the same 1310 ms as `session/load`'s 1315 ms,
+# because both handlers rebuild the agent's whole tool surface
+# (`_register_session_mcp_servers` -> `register_mcp_servers` +
+# `get_tool_definitions`). A session with no history to load pays it too. It is
+# the price of this process touching a session for the FIRST time, once each.
+#
+# Unwarmed, that 1.3 s lands on the send path — after the reader has typed and
+# pressed enter, which is the worst place for it. Reading a transcript costs
+# 5-9 ms and a human then types for seconds, so warming on VIEW hides it
+# entirely and `ensure_known` at send time returns in ~0 ms.
+#
+# The debounce is what keeps that from being speculative work on everything the
+# reader scrolls past: warm what they are still looking at, not what they went
+# through to get there.
+PREFETCH_DEBOUNCE_SEC = float(os.environ.get("PREFETCH_DEBOUNCE_SEC", "0.4"))
+
 # SSE idle comment interval. Proxies and load balancers cut a silent connection;
 # a comment line is the cheapest thing that keeps it open and costs the client
 # nothing (EventSource ignores comments).
@@ -311,6 +331,11 @@ class State:
         # arrives with no opinion; the agent is no longer "at" a session, so
         # there is nothing else for `current` to honestly mean.
         self.last_session: str | None = None
+        # The conversation most recently opened for reading, and the warming
+        # tasks watching it. The tasks are held because asyncio references a
+        # task only weakly; a collected one warms nothing and says nothing.
+        self.viewing: str | None = None
+        self.warming: set[asyncio.Task] = set()
         self.gc: asyncio.Task | None = None
 
     def running(self) -> dict[str, asyncio.Task]:
@@ -1333,27 +1358,70 @@ async def handle_session_load(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "current": sid, "history": history})
 
 
+def _warm_after_debounce(st: "State", sid: str) -> None:
+    """Introduce `sid` to the ACP process, later, if the reader is still there.
+
+    Fire and forget, deliberately: the response this is scheduled from must not
+    wait on it. Warming takes 1.3 s and reading the transcript takes 9 ms, so
+    awaiting it here would put the cost back on the path it was moved off —
+    just at "open" instead of at "send", which is worse, not better.
+
+    The debounce is a plain staleness check rather than a cancellation: a task
+    already past its sleep is inside `session/load`, and cancelling THAT would
+    abandon a JSON-RPC request mid-flight and leave hermes having done the work
+    with nothing recording that it did. Stale tasks return instead.
+    """
+    if PREFETCH_DEBOUNCE_SEC < 0:
+        return
+    st.viewing = sid
+
+    async def warm() -> None:
+        await asyncio.sleep(PREFETCH_DEBOUNCE_SEC)
+        if st.viewing != sid:
+            return          # scrolled past; whoever they landed on gets warmed
+        try:
+            await st.acp.ensure_known(sid)
+        except Exception:  # noqa: BLE001
+            # Speculative work: a failure here must not surface anywhere. The
+            # send that needs this session will try again and report properly.
+            log.debug("warming %s failed", sid, exc_info=True)
+
+    t = asyncio.create_task(warm())
+    st.warming.add(t)
+    t.add_done_callback(st.warming.discard)
+
+
 async def handle_session_history(request: web.Request) -> web.Response:
     """Read a transcript. Never touches ACP, so it is safe mid-turn.
 
     Paired with the lazy `session/load` in `handle_chat_start`: viewing is free,
-    and the agent is relocated only when something is actually sent — at which
-    point no turn is in flight, because the server runs one at a time anyway.
+    and the session is introduced to the ACP process only when it is needed.
+    What this schedules is the same introduction, moved EARLIER — off the send
+    path, where the reader is waiting on it, into the seconds they spend typing.
+    Nothing here waits on it.
     """
     sid = (request.match_info.get("sid") or "").strip()
     if not sid:
         return web.json_response({"error": "missing id"}, status=400)
+    st = state(request)
     try:
-        history = await state(request).acp.read_history(sid)
+        history = await st.acp.read_history(sid)
     except Exception as e:  # noqa: BLE001
         return web.json_response({"error": str(e)}, status=500)
+    _warm_after_debounce(st, sid)
     return web.json_response({"ok": True, "id": sid, "history": history})
 
 
 async def handle_session_delete(request: web.Request) -> web.Response:
     sid = request.match_info["sid"]
+    st = state(request)
+    if st.viewing == sid:
+        # Stop any pending warm-up for it: loading a session that is being
+        # deleted is pure waste, and on an unlucky interleaving it would put the
+        # id back into `_known` after `delete_session` took it out.
+        st.viewing = None
     try:
-        await state(request).acp.delete_session(sid)
+        await st.acp.delete_session(sid)
     except Exception as e:  # noqa: BLE001
         return web.json_response({"error": str(e)}, status=500)
     return web.json_response({"ok": True})

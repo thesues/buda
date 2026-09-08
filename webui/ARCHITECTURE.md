@@ -45,6 +45,13 @@ Three parts, and each exists because of a specific failure:
   exists because a push can be lost and a reloaded page never saw it.
 - **A shallow `/healthz`.** It answers while a turn runs and while `hermes acp`
   restarts. A deep probe would restart the pod in the moments this design is for.
+- **Sessions are warmed on view, debounced.** A session's first contact with the
+  ACP process costs ~1.3 s — and it is not the history read: `session/new`
+  measures 1310 ms against `session/load`'s 1315 ms, because both rebuild the
+  agent's tool surface. Unwarmed it lands after the reader pressed enter, so
+  opening a conversation schedules the introduction instead and the send finds
+  it done. The debounce (`PREFETCH_DEBOUNCE_SEC`) is what keeps that from
+  spending 1.3 s on every sidebar row someone scrolled past.
 - **Stop escalates conditionally.** `session/cancel` cannot interrupt a running
   tool, so Stop escalates to restarting the process — which kills every session,
   not just the wedged one. With another turn in flight the endpoint reports the

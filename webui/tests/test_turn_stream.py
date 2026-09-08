@@ -873,14 +873,19 @@ async def test_reading_a_transcript_does_not_move_the_agent(aiohttp_client, app)
     turn its agent. History comes from hermes' own store instead; this asserts
     the read stays off ACP entirely.
     """
-    acp = app["state"].acp
-    client = await aiohttp_client(app)
-    r = await client.get("/api/session/other-sess/history")
-    assert r.status == 200
-    body = await r.json()
-    assert body["history"][0]["text"] == "hi from other-sess"
-    assert acp.loads == [], "reading a transcript went through ACP"
-    assert acp.created == [], "reading a transcript created a session"
+    old = srv.PREFETCH_DEBOUNCE_SEC
+    srv.PREFETCH_DEBOUNCE_SEC = 30      # far past this test; warming is not the subject
+    try:
+        acp = app["state"].acp
+        client = await aiohttp_client(app)
+        r = await client.get("/api/session/other-sess/history")
+        assert r.status == 200
+        body = await r.json()
+        assert body["history"][0]["text"] == "hi from other-sess"
+        assert acp.loads == [], "reading a transcript went through ACP"
+        assert acp.created == [], "reading a transcript created a session"
+    finally:
+        srv.PREFETCH_DEBOUNCE_SEC = old
 
 
 @pytest.mark.asyncio
@@ -1480,3 +1485,100 @@ def test_the_bridge_fallback_can_actually_run():
     assert "logger." not in src, (
         "server.py logs through an undefined `logger`; the module logger is `log`"
     )
+
+
+# --- Warming. Moving 1.3 s off the path where someone is waiting on it. -------
+# `session/new` measures 1310 ms and `session/load` 1315 ms, because both
+# rebuild the agent's tool surface — so the cost is "this process touching this
+# session for the first time", once each, and a new session with no history to
+# load pays it too. Unwarmed it lands after the reader pressed enter.
+
+@pytest.mark.asyncio
+async def test_a_conversation_stayed_on_is_warmed_before_the_send(aiohttp_client, app):
+    old = srv.PREFETCH_DEBOUNCE_SEC
+    srv.PREFETCH_DEBOUNCE_SEC = 0.05
+    try:
+        acp = app["state"].acp
+        client = await aiohttp_client(app)
+        await client.get("/api/session/other-sess/history")
+        for _ in range(60):
+            if acp.loads:
+                break
+            await asyncio.sleep(0.01)
+        assert acp.loads == ["other-sess"], f"never warmed: {acp.loads}"
+
+        # And the send that follows finds it already introduced.
+        await client.post("/api/chat/start",
+                          json={"text": "hi", "sessionId": "other-sess"})
+        assert acp.loads == ["other-sess"], f"warmed again on send: {acp.loads}"
+        await client.post("/api/chat/cancel", json={"sessionId": "other-sess"})
+    finally:
+        srv.PREFETCH_DEBOUNCE_SEC = old
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_scrolled_past_is_not_warmed(aiohttp_client, app):
+    """The whole point of the debounce. Without it, clicking through a sidebar
+    spends 1.3 s of agent work per row the reader did not stop on."""
+    old = srv.PREFETCH_DEBOUNCE_SEC
+    srv.PREFETCH_DEBOUNCE_SEC = 0.15
+    try:
+        acp = app["state"].acp
+        client = await aiohttp_client(app)
+        for sid in ("passed-1", "passed-2", "landed-on"):
+            await client.get(f"/api/session/{sid}/history")
+        for _ in range(60):
+            if acp.loads:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
+        assert acp.loads == ["landed-on"], f"warmed what was scrolled past: {acp.loads}"
+    finally:
+        srv.PREFETCH_DEBOUNCE_SEC = old
+
+
+@pytest.mark.asyncio
+async def test_reading_a_transcript_does_not_wait_for_the_warming(aiohttp_client, app):
+    """Ablation: `await` the warm instead of scheduling it, and this goes red.
+
+    Awaiting would put the 1.3 s back on a path someone is waiting on — at
+    "open" instead of at "send", which is worse, not better: opening is the
+    action that used to be free.
+    """
+    old = srv.PREFETCH_DEBOUNCE_SEC
+    srv.PREFETCH_DEBOUNCE_SEC = 0
+    try:
+        acp = app["state"].acp
+        started = asyncio.Event()
+
+        async def slow_load(sid, on_update=None):
+            started.set()
+            await asyncio.sleep(30)
+
+        acp.load_session = slow_load
+        client = await aiohttp_client(app)
+        r = await asyncio.wait_for(
+            client.get("/api/session/slow-sess/history"), timeout=2)
+        assert r.status == 200, "the read blocked on the warming"
+        await asyncio.wait_for(started.wait(), timeout=2)
+    finally:
+        srv.PREFETCH_DEBOUNCE_SEC = old
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_conversation_calls_off_its_warming(aiohttp_client, app):
+    """Loading a session that is being deleted is waste at best, and on an
+    unlucky interleaving it puts the id back into `_known` after the delete
+    took it out."""
+    old = srv.PREFETCH_DEBOUNCE_SEC
+    srv.PREFETCH_DEBOUNCE_SEC = 0.15
+    try:
+        acp = app["state"].acp
+        acp.delete_session = lambda sid: asyncio.sleep(0)
+        client = await aiohttp_client(app)
+        await client.get("/api/session/doomed/history")
+        await client.delete("/api/session/doomed")
+        await asyncio.sleep(0.25)
+        assert acp.loads == [], f"warmed a session that was deleted: {acp.loads}"
+    finally:
+        srv.PREFETCH_DEBOUNCE_SEC = old
