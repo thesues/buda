@@ -312,11 +312,11 @@ header h1 em { color:var(--accent); font-style:italic; }
              letter-spacing:0.02em; }
 
 /* One turn at a time — a single GPU, not a policy. The composer says so rather
-   than accepting a click and dropping it. */
-.chat.blocked #input { opacity:0.55; }
+   than accepting a click and dropping it.
+   The reason lives in the input's own placeholder, not in a line under the box:
+   a sentence hanging below the composer belongs to nothing on screen and pushes
+   the layout around as it appears. The placeholder is already where the reader
+   is looking, and the box stays exactly the same size. */
 .chat.blocked #send { opacity:0.4; cursor:not-allowed; }
-.chat.blocked #composer::after {
-  content:attr(data-blocked); position:absolute;
-  bottom:0.15rem; left:1rem; font-size:0.68rem; color:var(--text-muted);
-}
+.chat.blocked #input::placeholder { color:var(--text-muted); opacity:0.9; }
 #composer { position:relative; }

@@ -655,10 +655,19 @@ function setBusy(b) {
     ? `另一个会话正在回复。这台机器一次只跑 ${n} 轮 — 等它结束，或到那个会话里停止它。`
     : "";
   $(".chat").classList.toggle("blocked", !!elsewhere);
-  // The line under the composer carries the same number: a tooltip needs a
-  // hover, and the reason a button will not respond should not.
-  $("#composer").dataset.blocked = elsewhere
-    ? `另一个会话正在回复，这台机器一次只跑 ${n} 轮` : "";
+  // Say it in the placeholder rather than in a line under the box. A tooltip
+  // needs a hover and the reason a button will not respond should not; a line
+  // under the composer needs neither, but it belongs to nothing on screen and
+  // moves the layout when it appears. The input stays typable — waiting is a
+  // fine time to write the next message — so the placeholder is showing
+  // exactly when the reader has nothing else to read.
+  const input = $("#input");
+  if (input.dataset.idlePlaceholder === undefined) {
+    input.dataset.idlePlaceholder = input.placeholder;
+  }
+  input.placeholder = elsewhere
+    ? `另一个会话正在回复 · 这台机器一次只跑 ${n} 轮`
+    : input.dataset.idlePlaceholder;
   if (b) {
     S.startedAt = Date.now();
     if (!S.timer) S.timer = setInterval(() => { tick(); tickSlow(); }, 90);
