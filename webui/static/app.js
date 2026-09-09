@@ -81,6 +81,9 @@ const S = {
   sessionRows: [],      // last list from the server, so a click can repaint now
   maxConcurrent: null,  // replies the server can run at once — it reports it
   running: null,        // and how many it is running
+  // "a turn this view does not own is running, and the pool is full" — decided
+  // once in setBusy so the button and the status line cannot contradict.
+  blockedElsewhere: false,
   // Which sessions are streaming, and on what stream: { sessionId: streamId }.
   // A pair of scalars before, because the server could only ever run one turn.
   // It can run several now, so returning to the second live conversation has to
@@ -628,10 +631,21 @@ function setBusy(b) {
   // instead of reading "a turn exists" as "the composer is blocked". Those are
   // the same statement only while the limit is one, and that limit is a fact
   // about the ACP pool — not something the frontend gets to decide.
+  // A turn is running that this view does not own. Computed here and stored,
+  // because the status line used to decide the same thing for itself and the
+  // two disagreed: the line said another session was replying while the button
+  // stayed clickable. The button's capacity test fell back to THIS view's busy
+  // flag, which is false precisely when the turn belongs to someone else.
+  const othersLive = Object.keys(S.streaming).some((id) => id !== S.sessionId);
   const atCapacity = (S.maxConcurrent != null && S.running != null)
     ? S.running >= S.maxConcurrent
-    : b;                       // before the first list refresh, the local flag
+    // Before the first list refresh the counters are unknown. Fall back CLOSED:
+    // a composer that accepts a message the pool has no room to run is worse
+    // than one that makes the reader wait a moment for the real numbers.
+    : (b || othersLive);
   const elsewhere = atCapacity && !owns;
+  // The one fact the rest of the UI reads, so nothing recomputes it.
+  S.blockedElsewhere = !!elsewhere;
   const n = S.maxConcurrent || 1;
 
   send.textContent = owns ? "停止" : "发送";
@@ -793,7 +807,9 @@ async function openSession(id) {
   } else {
     detach();
     setBusy(false);
-    status(Object.keys(S.streaming).length ? "另一个会话仍在回复中" : "就绪");
+    // setBusy just decided this; asking it again here is how the line and the
+    // button drifted apart.
+    status(S.blockedElsewhere ? "另一个会话仍在回复中" : "就绪");
   }
   loadSessions();
 }
@@ -823,7 +839,9 @@ async function newSession() {
   $("#messages").textContent = "";
   S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
   showFresh();
-  status(S.busy ? "另一个会话仍在回复中" : "就绪");
+  setBusy(S.busy);   // recompute: the new view owns nothing, so a turn that is
+                     // still running now counts as running elsewhere
+  status(S.blockedElsewhere ? "另一个会话仍在回复中" : "就绪");
   loadSessions();
 }
 
