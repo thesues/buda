@@ -104,6 +104,18 @@ spec:
           env:
             - { name: PORT, value: "8080" }
             - { name: HERMES_HOME, value: /opt/data }
+            # Match the model, not the agent. The server defaults to 4 because
+            # ACP can carry four conversations, and it argues that a fifth
+            # queueing at the model beats being refused at the door. On THIS
+            # deployment the model behind it is freetoken-l3 with
+            # `--max-running-requests 1`, so "queueing at the model" is what a
+            # reader sees as a second conversation that says it is replying and
+            # then produces nothing for as long as the first one runs -- while
+            # its composer stays enabled, because the composer is gated on the
+            # server's limit and the server had room. One is the honest number
+            # here: the second turn is refused immediately, and every other
+            # conversation greys out while one is answering.
+            - { name: MAX_CONCURRENT_TURNS, value: "1" }
             # The browser toolset's availability check will DOWNLOAD Chromium
             # to decide it is available -- elsewhere a fresh volume grew from
             # 220 KB to 897 MB doing it. These stop that. They do NOT remove the
