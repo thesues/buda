@@ -138,10 +138,23 @@ spec:
               ls "$MP/docs/buda" >/dev/null 2>&1 || { echo "mount not serving "$MP/docs/buda" after 120s"; exit 1; }
               echo "mounted; corpus:"; ls "$MP/docs/buda" | head -5
 
+              # The vector leg comes from llama-embed (BGE-M3 on a 4090) — see
+              # k8s/llama-embed.yaml. Without --embed-url this serves BM25 only
+              # and says so; it does not fall back to something that answers
+              # vector queries with noise.
+              #
+              # NOT --reset here. It wipes mem/{tenant}/{agent}/ and rebuilds,
+              # which is right exactly once — when the embedder changes and the
+              # stored vectors were made by a different model. As a permanent
+              # flag it would re-ingest the whole corpus on every restart, and
+              # a pod that reschedules at 3am would spend that time rebuilding
+              # an index it already had.
               exec memory-mcp "$M" \
                 --no-index \
                 --docs "$MP/docs/buda" \
                 --tenant buda \
+                --embed-url http://llama-embed:8080 \
+                --embed-model bge-m3 \
                 --credential-file /etc/autumn/cred/mem.cred \
                 --host 0.0.0.0 --port 5100
           ports:
@@ -162,10 +175,21 @@ spec:
             # Chinese chunk several hundred of them. Batching made the network
             # stop being the limit, so this is now bounded by real work.
             #
-            # 10 min is ~3.5x the measured time: enough for a cold cluster or a
-            # bigger corpus, while still failing in a useful timeframe. Too
-            # small remains the worse error — the kubelet would kill an almost
-            # finished ingest and the restart starts from zero.
+            # That 30.7 chunk/s was the in-process hash embedder. Sending every
+            # chunk to a real model turned out to cost nothing: BGE-M3 on a 4090
+            # measured 7433 chunks in 163 s — 45.7 chunk/s, FASTER than the fake
+            # one, because the embedding was never the bottleneck.
+            #
+            # The same model on 6 CPU cores was ~6 chunk/s, which is ~20 min for
+            # this corpus, and that is why the budget is what it is rather than
+            # what today's number would justify: it has to survive the GPU being
+            # busy or absent. The old 10 min did the worst possible thing when
+            # ingest ran long — killed it minutes from the end, and the restart
+            # began again from zero, forever.
+            #
+            # Too small remains the worse error by a wide margin. A budget that
+            # is too large costs one slow failure; one that is too small costs
+            # an infinite loop that looks like progress.
             # /config, NOT /stats. `/stats` runs a full `reconcile()` — a
             # scan of every doc, vptr, node and edge — which takes seconds on a
             # 5k-document corpus, while a probe's default timeout is 1s. The
@@ -174,7 +198,7 @@ spec:
             # than the thing it checks. /config is static JSON.
             httpGet: { path: /config, port: 5100 }
             periodSeconds: 15
-            failureThreshold: 40      # 10 min
+            failureThreshold: 180     # 180 x 15s = 45 min
           readinessProbe:
             # /config, NOT /stats. `/stats` runs a full `reconcile()` — a
             # scan of every doc, vptr, node and edge — which takes seconds on a

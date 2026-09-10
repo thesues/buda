@@ -1,0 +1,132 @@
+# An embedding model, on CPU, reading its weights out of autumn.
+#
+# memory-mcp's vector leg needs embeddings and freetoken cannot supply them: it
+# serves /v1/chat/completions, /v1/messages and /v1/responses, and has no
+# /v1/embeddings at all. That is not an oversight to patch — an embedding model
+# pools a whole sequence into one vector, where freetoken's entire path is KV
+# cache plus autoregressive decode. Different model, different path.
+#
+# BGE-M3 rather than a smaller English model, because the corpus is Chinese.
+# The size that decides it is `MAX_CHUNK_BYTES = 2800` in memory-mcp: at 3 bytes
+# per CJK character that is ~930 characters, and Chinese tokenizes at roughly a
+# token per character. The bge-*-zh models stop at 512 tokens and would silently
+# truncate nearly half of every full chunk — findable by BM25, invisible to
+# vector search, with nothing to say so. BGE-M3 takes 8192.
+#
+# The weights come OUT of autumn at startup rather than through a FUSE mount.
+# freetoken mounts because its model is 130 GiB and copying it is not an option;
+# this one is 634 MB and `autumnfs get` pulls it in a few seconds. Mounting it
+# instead would have cost a privileged container, a FUSE daemon inside the app
+# container (a sidecar does not work here — the mount comes up PROPAGATION:
+# private and the app sees an empty directory), `--direct-read false` to survive
+# EC-converted extents, and `--no-mmap` because autumn-fuse returns
+# FOPEN_DIRECT_IO and the kernel refuses MAP_SHARED on such a file. None of that
+# buys anything at this size. The llama.cpp image also has no libfuse3.
+#
+# Applied with `kubectl apply -f`; this repo has no kustomization.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-embed
+  namespace: autumn
+  labels: { app: llama-embed }
+spec:
+  selector: { app: llama-embed }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-embed
+  namespace: autumn
+  labels: { app: llama-embed }
+spec:
+  replicas: 1
+  # The model file is read once at start over a FUSE mount that lives inside
+  # the container. A surge pod would mount a second copy while the first still
+  # holds one; Recreate keeps it to one.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: llama-embed }
+  template:
+    metadata:
+      labels: { app: llama-embed }
+    spec:
+      # The GPU box. On 6 CPU cores this saturated them (measured: 5976m of a
+      # 6000m limit) and managed ~6 chunks/s, which turned a 5k-chunk ingest
+      # into 14 minutes. A 4090 has seven idle cards next to freetoken's one.
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.3.2"
+      enableServiceLinks: false
+      initContainers:
+        # Pull the model out of autumn onto local disk. Uses `autumnfs`, the
+        # proxy path — measured at 164 MiB/s on this cluster, so ~4 s for this
+        # file — and needs no mount, no privilege and no FUSE.
+        - name: fetch-model
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:c211b626a140ddc43bd101925e3b019c7d0839f9
+          command: ["sh","-c"]
+          args:
+            - |
+              set -e
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              autumnfs --manager "$M" --credential-file /etc/autumn/cred/fs.cred \
+                get models/bge-m3/bge-m3-Q8_0.gguf /model/bge-m3-Q8_0.gguf
+              ls -l /model/bge-m3-Q8_0.gguf
+          volumeMounts:
+            - { name: model, mountPath: /model }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 512Mi }
+            limits:   { cpu: "1", memory: 512Mi }
+      containers:
+        - name: llama
+          image: ghcr.m.daocloud.io/ggml-org/llama.cpp:server-cuda
+          # -ub/-b at the context size: an embedding model is non-causal, so
+          # llama.cpp requires the physical batch to hold the whole sequence —
+          # a smaller ubatch rejects long inputs rather than splitting them, and
+          # long inputs are exactly what this exists to serve (memory-mcp chunks
+          # run to ~930 CJK tokens).
+          args:
+            - --model
+            - /model/bge-m3-Q8_0.gguf
+            - --embeddings
+            - --pooling
+            - cls
+            - --ctx-size
+            - "8192"
+            - --batch-size
+            - "8192"
+            - --ubatch-size
+            - "8192"
+            # Every layer on the card. BGE-M3 is 568M parameters — Q8_0 is
+            # ~630 MB, which is nothing against 24 GB.
+            - --n-gpu-layers
+            - "99"
+            - --threads
+            - "4"
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+          ports:
+            - { name: http, containerPort: 8080 }
+          volumeMounts:
+            - { name: model, mountPath: /model, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            # requests == limits, and the GPU on both, keeps the pod Guaranteed.
+            # This container is NOT privileged, so the device plugin's cgroup
+            # actually restricts it to the allocated card — freetoken has to
+            # re-pin CUDA_VISIBLE_DEVICES by hand precisely because privileged
+            # containers bypass that and see all eight.
+            requests: { cpu: "4", memory: 8Gi, nvidia.com/gpu: 1 }
+            limits:   { cpu: "4", memory: 8Gi, nvidia.com/gpu: 1 }
+      volumes:
+        - { name: model, emptyDir: {} }
+        - { name: cred, secret: { secretName: autumn-credential } }
