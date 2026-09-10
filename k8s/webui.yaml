@@ -95,6 +95,16 @@ spec:
                 hermes config set model.default "${LLM_MODEL:-dsv4-flash}" || true
                 # FreeToken has no auth; hermes still wants the key to be set.
                 hermes config set model.api_key "${LLM_API_KEY:-none}" || true
+                # hermes trims and compresses against this number, and an
+                # explicit config value outranks the length it probes off the
+                # server -- so it has to stay under FreeToken's real ceiling,
+                # which counts prompt AND generation against one budget. Left
+                # too high, every long conversation ends in "prompt is too
+                # long: N tokens > M maximum" after the prefill is already
+                # paid for. The gap below the ceiling is the room a reply gets
+                # to be written into.
+                hermes config set model.context_length \
+                  "${LLM_CONTEXT_LENGTH:-54000}" || true
               fi
 
               # The MCP server is written by the app at startup, not here: it
@@ -137,6 +147,11 @@ spec:
             - { name: MEMORY_MCP_NAME, value: "memory" }
             - { name: LLM_BASE_URL, value: "http://freetoken-l3:1919/v1" }
             - { name: LLM_MODEL, value: "dsv4-flash" }
+            # FreeToken's max_seq_len is 62080 (prompt + generation, derived
+            # from what is left of the 4090 after the MoE slot cache), so this
+            # leaves ~8k for the reply. Raise it only together with the KV
+            # budget on the FreeToken side.
+            - { name: LLM_CONTEXT_LENGTH, value: "54000" }
             # What this deployment is for. Appended to a session's first prompt.
             # Left unset it falls back to the same text in server.py; set it here
             # to change the agent's brief without rebuilding the image.
