@@ -539,6 +539,26 @@ def test_the_client_renders_a_loaded_transcript_in_full():
     assert r.returncode == 0, r.stderr[-400:]
 
 
+def test_the_prompt_is_painted_once():
+    """The prompt showed up twice in the transcript.
+
+    Three painters draw that row -- the optimistic echo in send(), the stream's
+    own `user` event, and the `history_user` replayed when hermes reloads the
+    session -- and skipUserEcho is one boolean, so it cancels one of them. Any
+    other pairing renders the prompt twice.
+
+    Skipped rather than failed without node: this pins client behaviour, and a
+    missing runtime is not a broken client.
+    """
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    script = Path(__file__).parent / "js" / "duplicate_user_row.mjs"
+    r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-400:]
+
+
 def test_a_tool_update_does_not_rename_the_tool():
     """ACP's `kind` is a CATEGORY (other/read/search), not a name.
 

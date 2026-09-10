@@ -193,6 +193,26 @@ function addMsg(role, text) {
   return body;
 }
 
+function addUserMsg(text) {
+  // Draw a prompt from the stream only if it is not already the last thing
+  // said. Three independent painters put this same row on screen -- send()'s
+  // optimistic echo, the stream's own `user` event, and the `history_user`
+  // replayed when hermes reloads a session -- and the one-shot skip flag can
+  // only cancel one of them, so whichever two happen to line up render the
+  // prompt twice. A conversation cannot actually contain the same prompt twice
+  // in a row with no reply between, so declining to draw it costs nothing and
+  // covers every pairing at once. The pending row is skipped: it sits at the
+  // tail while a reply is being waited for, and it is not something said.
+  const rows = $("#messages").children;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (row.id === "pending") continue;
+    if (row.classList.contains("user") && row.textContent === text) return null;
+    break;
+  }
+  return addMsg("user", text);
+}
+
 function dropLastUser() {
   // Undo the optimistic echo. `send()` draws the prompt before the server has
   // accepted it, so a refusal leaves a message on screen that the transcript
@@ -499,9 +519,9 @@ function apply(ev, from) {
       // nothing first, so there the echo is exactly what paints it.
       finalizeSeg();
       if (S.skipUserEcho) S.skipUserEcho = false;
-      else addMsg("user", ev.text);
+      else addUserMsg(ev.text);
       break;
-    case "history_user": finalizeSeg(); addMsg("user", ev.text); break;
+    case "history_user": finalizeSeg(); addUserMsg(ev.text); break;
     case "delta": ev.thought ? appendThought(ev.text) : appendToken(ev.text); break;
     case "tool": toolRow(ev.id, ev.title, ev.status, ev.detail, ev.detailFull); break;
     case "approval": showApproval(ev); break;
