@@ -1,0 +1,124 @@
+# One-off: repack the served checkpoint from raw HF safetensors into FTW.
+#
+# Why this exists. `ft serve` loads raw safetensors through torch's mmap, and an
+# mmap page fault is a SINGLE synchronous reader -- the kernel does not issue
+# concurrent FUSE reads for one, so every readahead knob measures flat and the
+# mount delivers single-stream latency, not its bandwidth. Measured on this
+# cluster: 541-1769 ms per read, ~1-16 MiB/s, which is nine hours for a 156 GiB
+# model. The same bytes through the client path read at 704-880 MiB/s, and the
+# same mount with eight concurrent readers benchmarks at 4763 MiB/s. The mount
+# is not slow; the access pattern is the worst one it has.
+#
+# FTW is the format FreeToken built for this: 4096-aligned, 8 GiB shards, read
+# with O_DIRECT 8 MiB `preadv` from a thread pool -- concurrent by construction.
+#
+# Run it, watch it, delete it:
+#   kubectl -n autumn apply -f k8s/freetoken-ftw-convert.yaml
+#   kubectl -n autumn logs -f job/freetoken-ftw-convert
+#   kubectl -n autumn delete -f k8s/freetoken-ftw-convert.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: freetoken-ftw-convert
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: ftw-convert }
+spec:
+  backoffLimit: 0          # a half-written upload should be looked at, not retried blind
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: ftw-convert }
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.3.2"
+
+      initContainers:
+        # The freetoken image carries its own `autumnfs`, but it is built at the
+        # image's commit and this cluster has moved past it -- it fails the
+        # handshake with a bare rkyv decode error. Take the binary from the
+        # cluster's own image instead, the way the serving pod takes autumn-fuse.
+        - name: tools
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:c211b626a140ddc43bd101925e3b019c7d0839f9
+          command: ["sh","-c","cp /usr/local/bin/autumnfs /tools/ && chmod +x /tools/autumnfs"]
+          volumeMounts:
+            - { name: tools, mountPath: /tools }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { cpu: "1", memory: 1Gi }
+
+      containers:
+        - name: convert
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:3c43c273a485d93903dc45bd6b3a43684f6ba152
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              SRC=models/dsv4-flash
+              DST=models/dsv4-flash-ftw
+              FS="/tools/autumnfs --credential-file /etc/autumn/cred/fs.cred --transport tcp"
+
+              # The Rust client is IP-only; it does not resolve names.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "manager = $M"
+              FS="$FS --manager $M"
+
+              # ── fetch ────────────────────────────────────────────────────
+              # 12 at a time: one stream is latency-bound, throughput here is
+              # concurrency. This is the leg that takes nine hours over FUSE.
+              mkdir -p /work/src
+              # `ls` lists directories too, with a trailing slash, and `get`
+              # refuses one with EISDIR -- which under `set -e` takes the whole
+              # job down at the end of the xargs run. The two here (encoding/,
+              # inference/) hold reference Python, not weights: the converter
+              # reads the top-level safetensors and config.json only.
+              $FS ls "$SRC" | grep -v '/$' > /work/manifest.txt
+              wc -l < /work/manifest.txt | xargs echo "source files:"
+              time xargs -a /work/manifest.txt -P 12 -I{} \
+                sh -c "$FS get '$SRC/{}' /work/src/{} >/dev/null" 
+              du -sh /work/src
+
+              # ── convert ──────────────────────────────────────────────────
+              # offload: experts are repacked into banks, which is what
+              # --moe-backend hybrid consumes at serve time.
+              time ft checkpoint --model /work/src --out /work/ftw \
+                --moe-backend offload --shard-gib 8
+              du -sh /work/ftw
+
+              # ── upload ───────────────────────────────────────────────────
+              # `put` needs the parent to exist and takes one file at a time.
+              $FS mkdir "$DST" 2>/dev/null || true
+              time (cd /work/ftw && ls | xargs -P 12 -I{} \
+                sh -c "$FS put '{}' '$DST/{}' >/dev/null")
+
+              echo "--- uploaded ---"
+              $FS ls "$DST"
+              echo "DONE: $DST"
+          env:
+            # The conversion repacks on a GPU; without this it grabs the first
+            # visible device, which on this node is one the serving pod owns.
+            - { name: CUDA_DEVICE_ORDER, value: "PCI_BUS_ID" }
+          resources:
+            requests:
+              cpu: "8"
+              memory: 128Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "8"
+              memory: 128Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: tools, mountPath: /tools }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+
+      volumes:
+        # Source + output live side by side: ~156 GiB in, ~156 GiB out, against
+        # the ~690 GiB free on this node. emptyDir, because nothing here has to
+        # survive the job -- the result goes to the cluster.
+        - { name: work, emptyDir: {} }
+        - { name: tools, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
