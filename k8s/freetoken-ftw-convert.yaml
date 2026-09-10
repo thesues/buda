@@ -87,6 +87,16 @@ spec:
               fi
               df -h "$W" | tail -1
 
+              # Make the destination FIRST, and prove it exists. This used to
+              # sit just before the upload as `mkdir ... || true`, which threw
+              # away a complete run: the cluster was mid-split and could not
+              # create the directory, the `|| true` swallowed it, and all 23
+              # shards then failed `ENOENT` after 40 minutes of download and 34
+              # of repack. A destination that cannot be made should cost
+              # seconds, so it is checked before anything expensive starts.
+              $FS mkdir "$DST" 2>&1 | grep -v "already exists" || true
+              $FS ls "$DST" > /dev/null
+
               # ── fetch ────────────────────────────────────────────────────
               # 12 at a time: one stream is latency-bound, throughput here is
               # concurrency. This is the leg that takes nine hours over FUSE.
@@ -123,8 +133,8 @@ spec:
               du -sh "$W/ftw"
 
               # ── upload ───────────────────────────────────────────────────
-              # `put` needs the parent to exist and takes one file at a time.
-              $FS mkdir "$DST" 2>/dev/null || true
+              # `put` takes one file at a time; the parent was made and checked
+              # at the top, before any of this was paid for.
               time (cd "$W/ftw" && ls | xargs -P 12 -I{} \
                 sh -c "$FS put '{}' '$DST/{}' >/dev/null")
 
