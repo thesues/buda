@@ -152,6 +152,42 @@ class TurnManager:
         ).start()
         return stream
 
+    def _install_approval(self, stream: TurnStream) -> None:
+        """Route this turn's permission prompts to this turn's reader.
+
+        hermes installs the approval hook MODULE-side rather than on the agent
+        (`tools.terminal_tool.set_approval_callback`), which would be a race
+        between concurrent turns — except the hook is a `threading.local`, and
+        each turn owns a thread. So the isolation is free here, and the ACP
+        adapter's save-and-restore dance around it is not needed.
+
+        `HERMES_INTERACTIVE` is how `tools.approval` knows an interactive
+        callback exists and the non-interactive AUTO-APPROVE path must not fire.
+        Without it a tool that should have asked simply proceeds.
+        """
+        import os
+
+        try:
+            from tools import terminal_tool
+
+            terminal_tool.set_approval_callback(
+                lambda *a, **kw: self._ask(stream, *a, **kw)
+            )
+            os.environ["HERMES_INTERACTIVE"] = "1"
+        except Exception:  # noqa: BLE001 -- a missing hook must not fail the turn
+            log.debug("could not install the approval callback", exc_info=True)
+
+    def _ask(self, stream: TurnStream, *args: Any, **kwargs: Any) -> bool:
+        """Refuse, visibly.
+
+        Until the client can answer a prompt, auto-approving would run a command
+        nobody agreed to and silently denying would leave the reader watching a
+        turn fail for no stated reason. Say so in the transcript and refuse.
+        """
+        what = next((str(a) for a in args if isinstance(a, str) and a.strip()), "")
+        stream.emit("note", text=f"需要确认，已拒绝：{what or '一个需要授权的操作'}")
+        return False
+
     def _run_turn(
         self, stream: TurnStream, session_id: str, text: str, endpoint: Endpoint
     ) -> None:
@@ -159,6 +195,7 @@ class TurnManager:
         try:
             agent = self._pool.acquire(session_id, endpoint)
             self._pool.note_running(stream.stream_id, agent)
+            self._install_approval(stream)
             from hermes_agent import bind_callbacks
 
             # EVERY turn, cached agent or fresh: a reused agent still carries the

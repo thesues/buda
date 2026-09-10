@@ -201,3 +201,45 @@ def test_finished_streams_are_eventually_dropped(monkeypatch):
         ids.append(s.stream_id)
     m.forget_finished(keep=2)
     assert [i for i in ids if m.stream(i) is not None] == ids[-2:]
+
+
+# ── approvals ───────────────────────────────────────────────────────────────
+
+
+def test_a_permission_prompt_is_refused_visibly_rather_than_auto_approved(monkeypatch):
+    """Two silent outcomes are both wrong until the client can answer.
+
+    Auto-approving runs a command nobody agreed to; denying without a word
+    leaves the reader watching a turn fail for no stated reason.
+    """
+    m = _mgr(monkeypatch)
+    s = m.start(session_id="s1", text="x", endpoint=_ep())
+    assert _wait_done(s)
+    assert m._ask(s, "rm -rf /tmp/x") is False
+    note = [e for e in s.after(0) if e["kind"] == "note"][-1]
+    assert "rm -rf /tmp/x" in note["text"] and "拒绝" in note["text"]
+
+
+def test_the_approval_hook_is_installed_per_turn(monkeypatch):
+    """hermes installs it module-side, which would be a race between concurrent
+    turns — except the hook is a `threading.local` and each turn owns a thread.
+    Assert the interactive flag is set, or `tools.approval` takes the
+    non-interactive AUTO-APPROVE path and a tool that should have asked runs."""
+    import os
+    import sys
+    import types
+
+    installed = {}
+    fake = types.ModuleType("tools.terminal_tool")
+    fake.set_approval_callback = lambda cb: installed.setdefault("cb", cb)
+    pkg = types.ModuleType("tools")
+    pkg.terminal_tool = fake
+    monkeypatch.setitem(sys.modules, "tools", pkg)
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool", fake)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    m = _mgr(monkeypatch)
+    s = m.start(session_id="s1", text="x", endpoint=_ep())
+    assert _wait_done(s)
+    assert callable(installed.get("cb")), "the turn must install its own approval callback"
+    assert os.environ.get("HERMES_INTERACTIVE") == "1"
