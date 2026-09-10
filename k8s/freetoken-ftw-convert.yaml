@@ -13,13 +13,17 @@
 # with O_DIRECT 8 MiB `preadv` from a thread pool -- concurrent by construction.
 #
 # Run it, watch it, delete it:
-#   kubectl -n autumn apply -f k8s/freetoken-ftw-convert.yaml
-#   kubectl -n autumn logs -f job/freetoken-ftw-convert
-#   kubectl -n autumn delete -f k8s/freetoken-ftw-convert.yaml
+#   sed 's/MODEL_NAME/dsv4-flash/g' k8s/freetoken-ftw-convert.yaml | kubectl -n autumn apply -f -
+#   kubectl -n autumn logs -f job/ftw-convert-dsv4-flash
+#   kubectl -n autumn delete job ftw-convert-dsv4-flash
+#
+# Run one model at a time. The node's root disk saturates at ~180 MiB/s
+# aggregate (98% util, measured), and this reads and writes the whole
+# checkpoint on it -- two at once would not go faster and would not fit.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: freetoken-ftw-convert
+  name: ftw-convert-MODEL_NAME
   namespace: autumn
   labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: ftw-convert }
 spec:
@@ -54,8 +58,8 @@ spec:
           args:
             - |
               set -euo pipefail
-              SRC=models/dsv4-flash
-              DST=models/dsv4-flash-ftw
+              SRC=models/MODEL_NAME
+              DST=models/MODEL_NAME-ftw
               FS="/tools/autumnfs --credential-file /etc/autumn/cred/fs.cred --transport tcp"
 
               # The Rust client is IP-only; it does not resolve names.
@@ -67,13 +71,26 @@ spec:
               # 12 at a time: one stream is latency-bound, throughput here is
               # concurrency. This is the leg that takes nine hours over FUSE.
               mkdir -p /work/src
-              # `ls` lists directories too, with a trailing slash, and `get`
-              # refuses one with EISDIR -- which under `set -e` takes the whole
-              # job down at the end of the xargs run. The two here (encoding/,
-              # inference/) hold reference Python, not weights: the converter
-              # reads the top-level safetensors and config.json only.
-              $FS ls "$SRC" | grep -v '/$' > /work/manifest.txt
+              # `ls` lists directories with a trailing slash, and `get` refuses
+              # one with EISDIR -- which under `set -e` takes the job down at the
+              # end of the xargs run. So walk them instead of skipping them: the
+              # converter reads `inference/config.json` for the DeepSeek-V4
+              # ModelArgs and fails without it, which is not something the file
+              # names tell you.
+              walk() {
+                $FS ls "$SRC/$1" | while read -r e; do
+                  case "$e" in
+                    */) walk "$1${e}" ;;
+                    *)  echo "$1$e" ;;
+                  esac
+                done
+              }
+              walk "" > /work/manifest.txt
               wc -l < /work/manifest.txt | xargs echo "source files:"
+              # Directories must exist before the parallel get lands in them.
+              sed -n 's#/[^/]*$##p' /work/manifest.txt | sort -u | while read -r d; do
+                [ -n "$d" ] && mkdir -p "/work/src/$d"
+              done
               time xargs -a /work/manifest.txt -P 12 -I{} \
                 sh -c "$FS get '$SRC/{}' /work/src/{} >/dev/null" 
               du -sh /work/src
