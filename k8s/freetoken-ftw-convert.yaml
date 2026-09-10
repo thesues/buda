@@ -67,10 +67,30 @@ spec:
               echo "manager = $M"
               FS="$FS --manager $M"
 
+              # Where the two ~150 GiB copies of scratch live. Empty
+              # WORK_DEVICE keeps them on the pod's emptyDir, i.e. the node's
+              # root disk. A device puts this run on its own spindle instead,
+              # so a second conversion is not fighting the first for one disk.
+              # The mount lands in THIS container's namespace only; the host's
+              # mount table is not touched. Everything we create lives under
+              # one subdirectory, which the EXIT trap takes away -- that
+              # filesystem holds other people's checkpoints.
+              W=/work
+              if [ -n "${WORK_DEVICE:-}" ]; then
+                mkdir -p /scratch
+                mount "$WORK_DEVICE" /scratch
+                W=/scratch/ftw-MODEL_NAME
+                trap 'rm -rf -- "$W"' EXIT
+                rm -rf -- "$W"
+                mkdir -p "$W"
+                echo "scratch: $WORK_DEVICE -> $W"
+              fi
+              df -h "$W" | tail -1
+
               # ── fetch ────────────────────────────────────────────────────
               # 12 at a time: one stream is latency-bound, throughput here is
               # concurrency. This is the leg that takes nine hours over FUSE.
-              mkdir -p /work/src
+              mkdir -p "$W/src"
               # `ls` lists directories with a trailing slash, and `get` refuses
               # one with EISDIR -- which under `set -e` takes the job down at the
               # end of the xargs run. So walk them instead of skipping them: the
@@ -85,27 +105,27 @@ spec:
                   esac
                 done
               }
-              walk "" > /work/manifest.txt
-              wc -l < /work/manifest.txt | xargs echo "source files:"
+              walk "" > "$W/manifest.txt"
+              wc -l < "$W/manifest.txt" | xargs echo "source files:"
               # Directories must exist before the parallel get lands in them.
-              sed -n 's#/[^/]*$##p' /work/manifest.txt | sort -u | while read -r d; do
-                [ -n "$d" ] && mkdir -p "/work/src/$d"
+              sed -n 's#/[^/]*$##p' "$W/manifest.txt" | sort -u | while read -r d; do
+                [ -n "$d" ] && mkdir -p "$W/src/$d"
               done
-              time xargs -a /work/manifest.txt -P 12 -I{} \
-                sh -c "$FS get '$SRC/{}' /work/src/{} >/dev/null" 
-              du -sh /work/src
+              time xargs -a "$W/manifest.txt" -P 12 -I{} \
+                sh -c "$FS get '$SRC/{}' $W/src/{} >/dev/null" 
+              du -sh "$W/src"
 
               # ── convert ──────────────────────────────────────────────────
               # offload: experts are repacked into banks, which is what
               # --moe-backend hybrid consumes at serve time.
-              time ft checkpoint --model /work/src --out /work/ftw \
+              time ft checkpoint --model "$W/src" --out "$W/ftw" \
                 --moe-backend offload --shard-gib 8
-              du -sh /work/ftw
+              du -sh "$W/ftw"
 
               # ── upload ───────────────────────────────────────────────────
               # `put` needs the parent to exist and takes one file at a time.
               $FS mkdir "$DST" 2>/dev/null || true
-              time (cd /work/ftw && ls | xargs -P 12 -I{} \
+              time (cd "$W/ftw" && ls | xargs -P 12 -I{} \
                 sh -c "$FS put '{}' '$DST/{}' >/dev/null")
 
               echo "--- uploaded ---"
@@ -115,6 +135,11 @@ spec:
             # The conversion repacks on a GPU; without this it grabs the first
             # visible device, which on this node is one the serving pod owns.
             - { name: CUDA_DEVICE_ORDER, value: "PCI_BUS_ID" }
+            - { name: WORK_DEVICE, value: "WORK_DEVICE_VALUE" }
+          securityContext:
+            # Only so the script can `mount` WORK_DEVICE, and only into this
+            # container's own namespace. Drop it if you never set that.
+            privileged: true
           resources:
             requests:
               cpu: "8"
