@@ -79,7 +79,13 @@ spec:
               if [ -n "${WORK_DEVICE:-}" ]; then
                 mkdir -p /scratch
                 mount "$WORK_DEVICE" /scratch
-                W=/scratch/ftw-MODEL_NAME
+                # Keyed on the SOURCE bucket, not the output name. Two
+                # variants of one model (MiniMax-M2.5 and -NVFP4) share a
+                # MODEL_NAME, and sharing a scratch dir meant the second run
+                # inherited the first's 216 GiB `src` -- which the space it
+                # needed was sitting in, and which `find ... config.json` would
+                # happily have converted instead.
+                W=/scratch/ftw-BUCKET_MODEL
                 # Clean up ONLY after a successful run. This used to be a bare
                 # EXIT trap, which fires on failure too — and an upload that
                 # fails after the repack has finished is precisely when the
@@ -132,6 +138,50 @@ spec:
               (apt-get update -qq >/dev/null 2>&1 || true)
               command -v jq >/dev/null || apt-get install -y -qq jq >/dev/null 2>&1
               command -v jq >/dev/null || { echo "jq missing; oniond cannot run"; exit 1; }
+
+              # The expert quantization, checked against the providers this FreeToken
+              # build actually has, BEFORE the download. A MiniMax-M2.5 run reached
+              # `load_expert_banks` after fetching 216 GiB and died on
+              #   ValueError: no expert-bank provider for expert_quant='fp8'
+              # The answer was one HTTP GET away: `detect_expert_quant` reads
+              # `quant_algo`/`quant_method` out of config.json, and the whole verdict
+              # is decidable from that file alone.
+              CFG_ID="HF_REPO_ID"
+              if [ "$CFG_ID" != "HF_""REPO_ID" ]; then
+                curl -sfL "https://hf-mirror.com/$CFG_ID/resolve/main/config.json" -o /tmp/cfg.json \
+                  || { echo "cannot read config.json for $CFG_ID"; exit 1; }
+                python3 <<'PYEOF' || { echo "expert-quant precheck FAILED"; exit 1; }
+              import json, sys
+              q = json.load(open("/tmp/cfg.json")).get("quantization_config") or {}
+              algo = q.get("quant_algo") or q.get("quant_method")
+              fmt = str(q.get("format") or "").lower()
+              if algo is None:
+                  eq = "none"
+              elif "fp4" in str(algo).lower() or "nvfp4" in fmt:
+                  eq = "nvfp4"
+              else:
+                  eq = str(algo).lower()
+              known = {"ds_fp4", "none", "nvfp4", "q4_0"}
+              print("expert_quant =", eq)
+              if eq not in known:
+                  print("NOT a provider this build has %s; ft checkpoint will refuse it" % sorted(known))
+                  sys.exit(1)
+              print("expert-quant precheck OK")
+              PYEOF
+              fi
+
+              # Free space, against what THIS model needs: the source plus the FTW
+              # output, both of them full copies, plus slack. `oniond inspect`
+              # answers in bytes and costs one round trip, while running out of room
+              # costs the download. A NVFP4 run started with 226 GiB free against the
+              # ~280 it needed, and nothing in the script knew.
+              NEED_B=$(oniond inspect model "BUCKET_MODEL" 2>/dev/null | grep -i "Used Storage" | grep -oE "[0-9]+" | head -1)
+              if [ -n "$NEED_B" ]; then
+                need_g=$(( NEED_B / 1024 / 1024 / 1024 * 22 / 10 ))   # source + output + 10%
+                free_g=$(df -BG --output=avail "$W" | tail -1 | tr -dc 0-9)
+                echo "space: ${free_g}G free, ~${need_g}G needed for BUCKET_MODEL"
+                [ "${free_g:-0}" -ge "$need_g" ] || { echo "not enough room on the scratch device"; df -h "$W"; exit 1; }
+              fi
 
               mkdir -p "$W/src"
               echo "downloading BUCKET_MODEL from the bucket"

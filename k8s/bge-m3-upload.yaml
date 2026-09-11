@@ -1,0 +1,144 @@
+# One-off: put the bge-m3 embedding GGUF back into autumn.
+#
+# This is NOT a checkpoint conversion. `llama-embed` is llama.cpp and reads one
+# GGUF file directly; `ft checkpoint` would reject it. Its init container does:
+#
+#   autumnfs get models/bge-m3/bge-m3-Q8_0.gguf /model/bge-m3-Q8_0.gguf
+#
+# so that exact key is the contract this job has to satisfy -- capital Q
+# included. Upstream spells the same file `bge-m3-q8_0.gguf`, lowercase, and the
+# rename happens here rather than in the Deployment because the serving pod's
+# arg is the thing with a live process behind it.
+#
+# Not oniond: the in-network TOS mirror carries `bge-m3`, which is the PyTorch
+# repo and holds no GGUF. `oniond inspect` answers for `bge-m3-gguf` anyway
+# because it reads HuggingFace metadata, and only `download` finds out the
+# mirror has no such bucket. One 606 MiB file over hf-mirror is under a minute;
+# it is not worth mirroring a repo for.
+#
+# Every value this job infers is asserted in the prologue, before the download:
+# the handshake, the destination, the free space, jq. The FTW job learned that
+# the expensive way -- four runs, each dying on an inferred value only after
+# paying for a download or a repack.
+#
+#   kubectl -n autumn apply -f k8s/bge-m3-upload.yaml
+#   kubectl -n autumn logs -f job/bge-m3-upload
+#   kubectl -n autumn delete job bge-m3-upload
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bge-m3-upload
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: model-upload }
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: model-upload }
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      nodeSelector:
+        # Only because both images are already cached here. Nothing in this job
+        # needs the GPU node.
+        kubernetes.io/hostname: "192.168.3.2"
+
+      initContainers:
+        # The freetoken image's own autumnfs is built at that image's commit and
+        # fails this cluster's handshake with a bare rkyv decode error. Take the
+        # binary from the cluster's own image.
+        - name: tools
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:c211b626a140ddc43bd101925e3b019c7d0839f9
+          command: ["sh","-c","cp /usr/local/bin/autumnfs /tools/ && chmod +x /tools/autumnfs"]
+          volumeMounts:
+            - { name: tools, mountPath: /tools }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { cpu: "1", memory: 1Gi }
+
+      containers:
+        - name: upload
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:3c43c273a485d93903dc45bd6b3a43684f6ba152
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              REPO=vonjack/bge-m3-gguf
+              SRCFILE=bge-m3-q8_0.gguf        # as upstream spells it
+              DST=models/bge-m3
+              DSTFILE=bge-m3-Q8_0.gguf        # as llama-embed's init container asks for it
+              W=/work
+              FS="/tools/autumnfs --credential-file /etc/autumn/cred/fs.cred --transport tcp"
+
+              # ---- prologue: everything cheap, before anything expensive -----
+              # The Rust client is IP-only; it does not resolve names.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "manager = $M"
+              FS="$FS --manager $M"
+
+              # 1. The handshake. A wire mismatch is the failure this job is
+              #    most likely to hit, and it costs one round trip to find.
+              $FS ls models/ >/dev/null || { echo "autumnfs cannot talk to $M"; exit 1; }
+              echo "handshake OK"
+
+              # 2. The destination, made and proven writable with a real file.
+              #    The probe name is unique per run and removed immediately:
+              #    `put` refuses an existing key, so a fixed name turns a
+              #    previous run's leftover into a false "not writable".
+              $FS mkdir "$DST" 2>/dev/null || true
+              PROBE=".probe.$$"
+              echo probe > "$W/$PROBE"
+              $FS put "$W/$PROBE" "$DST/$PROBE" || { echo "$DST is not writable"; exit 1; }
+              $FS rm "$DST/$PROBE" >/dev/null 2>&1 || true
+              echo "destination OK: $DST"
+
+              # 3. Room for the file with margin.
+              avail=$(df -BG --output=avail "$W" | tail -1 | tr -dc 0-9)
+              [ "${avail:-0}" -ge 10 ] || { echo "only ${avail}G free at $W, need 10G"; exit 1; }
+              echo "space OK: ${avail}G"
+
+              # 4. The source resolves, before we ask for 606 MiB of it.
+              URL="https://hf-mirror.com/$REPO/resolve/main/$SRCFILE"
+              code=$(curl -sIL -o /dev/null -w '%{http_code}' "$URL")
+              [ "$code" = "200" ] || { echo "$URL -> HTTP $code"; exit 1; }
+              echo "source OK: $URL"
+
+              # ---- download ---------------------------------------------------
+              SRC="$W/$SRCFILE"
+              time curl -fL --retry 3 --retry-delay 5 -o "$SRC" "$URL"
+
+              # A GGUF starts with the four bytes "GGUF". Checking it here turns
+              # a mirror serving an HTML error page into a failure now rather
+              # than a model that will not load on the next pod restart.
+              [ -s "$SRC" ] || { echo "downloaded nothing"; exit 1; }
+              magic=$(head -c4 "$SRC")
+              [ "$magic" = "GGUF" ] || { echo "not a GGUF (magic=$magic)"; head -c200 "$SRC"; exit 1; }
+              echo "source = $SRC ($(stat -c%s "$SRC") bytes)"
+
+              # ---- upload -----------------------------------------------------
+              # Same reason as the probe: `put` refuses an existing key, so a
+              # retry has to clear whatever the last attempt left behind.
+              $FS rm "$DST/$DSTFILE" >/dev/null 2>&1 || true
+              time $FS put "$SRC" "$DST/$DSTFILE"
+
+              # ---- verify: read it back and compare, byte for byte ------------
+              $FS get "$DST/$DSTFILE" "$W/readback.gguf"
+              a=$(sha256sum "$SRC" | cut -d' ' -f1)
+              b=$(sha256sum "$W/readback.gguf" | cut -d' ' -f1)
+              [ "$a" = "$b" ] || { echo "MISMATCH: put $a, read back $b"; exit 1; }
+              echo "verified: $DST/$DSTFILE sha256=$a"
+
+              echo "DONE: $DST/$DSTFILE"
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits:   { cpu: "4", memory: 8Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: tools, mountPath: /tools }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+
+      volumes:
+        - { name: work, emptyDir: {} }
+        - { name: tools, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }
