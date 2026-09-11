@@ -1,0 +1,174 @@
+# Wan2.2 text-to-video on the H20 node, reading its weights from autumn.
+#
+# Config is the one vLLM-Omni's own dashboard measured, so the number this
+# produces is comparable: cfg-parallel 2 x ulysses 2 = 4 GPUs, VAE patch
+# parallel 4, HSDP on. Their reference for 1280x720 / 80 frames @16fps (= 5 s)
+# at 6 steps is 117-125 s on 4x A100-80GB. H20 has roughly half an A100's dense
+# BF16 throughput and video diffusion is compute-bound, so expect slower; the
+# point of this manifest is to find out by how much.
+#
+# No image is built for this. `vllm/vllm-openai:v0.28.0` comes from the Volces
+# hub cache (Docker Hub itself is unreachable from these nodes) and vllm-omni
+# goes on at start from PyPI. That pairing is not a coincidence: vllm-omni's
+# version tracks vLLM's release for release, and the wheel carries no vllm pin
+# of its own -- the base image IS the pin. Bake an image before this serves
+# anything real; a startup pip install is fine for a measurement and nothing
+# else.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wan22-t2v
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: a surge-first rollout asks for 4 more GPUs
+  # while the old pod still holds its 4, and deadlocks on a node with 8.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+    spec:
+      enableServiceLinks: false   # k8s injects <SVC>_PORT=tcp://... which collides with the entrypoint's own names
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.1.2"   # the 8x H20 node
+
+      # `autumn-fuse` is LIFTED here, not baked in: it keeps this image off
+      # autumn's WIRE lockstep, and picking the version is then a deploy edit.
+      #
+      # An initContainer and NOT a sidecar, and the mount runs in the APP
+      # container. This is freetoken-l3's hard-won shape (see its manifest):
+      # a privileged sidecar measured `PROPAGATION: private` here, so the app
+      # container saw an empty directory and --model silently did not exist;
+      # and `mountPropagation: Bidirectional`, which is what would have made it
+      # work, is exactly what lets a FUSE mount escape into the host namespace
+      # and outlive the pod -- a leaked mount with no server puts every stat()
+      # that crosses it into uninterruptible sleep, and the runtime stats mount
+      # points on every sandbox create, so one leak stops the NODE. Five went
+      # that way in an afternoon. One container, one mount namespace, mount
+      # dies with it.
+      initContainers:
+        - name: fusebin
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:c211b626a140ddc43bd101925e3b019c7d0839f9
+          command: ["sh","-c","cp /usr/local/bin/autumn-fuse /fusebin/ && chmod +x /fusebin/autumn-fuse"]
+          volumeMounts:
+            - { name: fusebin, mountPath: /fusebin }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { cpu: "1", memory: 1Gi }
+
+      containers:
+        - name: serve
+          image: hub-cache-cn-beijing.cr.volces.com/vllm/vllm-openai:v0.28.0
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              MP=/mnt/autumn
+              MODEL="$MP/models/wan22-t2v-a14b"
+
+              # fuse3 for fusermount3, which autumn-fuse needs to unmount. The
+              # `|| true` on update is load-bearing: the image carries an apt
+              # source whose index goes stale independently of us, and a
+              # non-zero `update` would short-circuit the install.
+              (apt-get update -qq >/dev/null 2>&1 || true)
+              command -v fusermount3 >/dev/null || apt-get install -y -qq fuse3 >/dev/null 2>&1
+              command -v fusermount3 >/dev/null || { echo "fuse3 missing; autumn-fuse cannot unmount"; exit 1; }
+
+              # The Rust client is IP-only; it does not resolve names.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "manager = $M"
+
+              mkdir -p "$MP"
+              # --direct-read true: EC extents serve direct reads since the
+              # ec direct-read commit, so there is no reason to take the slow
+              # path on weights that may have been converted.
+              /opt/fusebin/autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+                --direct-read true --credential-file /etc/autumn/cred/fs.cred &
+              FUSE_PID=$!
+              trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
+
+              # Wait for a real READ, not for the mount entry. The kernel adds
+              # the entry BEFORE it sends FUSE INIT, and `ls` on a bare
+              # mountpoint succeeds because listing an empty directory is a
+              # success -- both go true while the handshake is outstanding, and
+              # if INIT then times out everything after this hits a dead mount.
+              for i in $(seq 1 120); do
+                ls "$MODEL/model_index.json" >/dev/null 2>&1 && break
+                kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
+                sleep 1
+              done
+              ls "$MODEL/model_index.json" >/dev/null 2>&1 || { echo "mount not serving $MODEL after 120s"; exit 1; }
+              echo "mounted after ${i}s:"; ls "$MODEL" | head -8
+
+              # vllm-omni at start. Aliyun, not the default index: the default
+              # resolves pypi.org but pulls wheels from files.hosted, which
+              # stalls from this pool with no output rather than failing.
+              pip install -q --no-cache-dir \
+                --index-url https://mirrors.aliyun.com/pypi/simple/ \
+                "vllm-omni==0.28.0" || { echo "vllm-omni install failed"; exit 1; }
+              python3 -c "import vllm, vllm_omni; print('vllm', vllm.__version__, '+ omni', getattr(vllm_omni,'__version__','?'))"
+
+              # cfg 2 x ulysses 2 = 4 GPUs; VAE patch parallel 4 across the same
+              # four. HSDP shards the weights so no single card holds the pair
+              # of A14B transformers.
+              exec vllm serve "$MODEL" \
+                --omni \
+                --served-model-name wan22-t2v \
+                --host 0.0.0.0 --port 8000 \
+                --use-hsdp \
+                --cfg-parallel-size 2 \
+                --ulysses-degree 2 \
+                --vae-patch-parallel-size 4 \
+                --vae-use-tiling
+          env:
+            - { name: CUDA_DEVICE_ORDER, value: "PCI_BUS_ID" }
+            - { name: VLLM_LOGGING_LEVEL, value: "INFO" }
+          securityContext:
+            # privileged for the FUSE mount (/dev/fuse + SYS_ADMIN). The whole
+            # container, because the mount lives in it.
+            privileged: true
+          resources:
+            requests:
+              cpu: "16"
+              memory: 200Gi
+              nvidia.com/gpu: 4
+            limits:
+              cpu: "16"
+              memory: 200Gi
+              nvidia.com/gpu: 4
+          volumeMounts:
+            - { name: mnt, mountPath: /mnt/autumn }
+            - { name: fusebin, mountPath: /opt/fusebin }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+          startupProbe:
+            # Mount, pip install, then load ~126 GiB of weights through FUSE.
+            # Generous on purpose: measuring that load is the point, and a probe
+            # that kills the pod mid-load destroys the measurement.
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 160     # 40 minutes
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 20
+
+      volumes:
+        - { name: mnt, emptyDir: {} }
+        - { name: fusebin, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 32Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wan22-t2v
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+spec:
+  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }

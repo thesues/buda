@@ -1,0 +1,187 @@
+# Put a raw checkpoint into autumn `fs/` unchanged. No repack.
+#
+# Separate from freetoken-ftw-convert.yaml on purpose: that job exists because
+# `ft serve` reads safetensors through torch's mmap, which is one synchronous
+# reader and turns a mount's bandwidth into its single-stream latency. A
+# diffusers pipeline is not loaded that way and has no FTW form to be repacked
+# into, so the repack -- the GPU, the 256Gi, the second full copy on scratch --
+# would all be paid for nothing.
+#
+#   sed -e 's/MODEL_NAME/wan22-t2v-a14b/g' \
+#       -e 's/BUCKET_MODEL/Wan2.2-T2V-A14B-Diffusers/g' \
+#       -e 's#WORK_DEVICE_VALUE#/dev/nvme0n1p1#g' \
+#       k8s/model-upload.yaml | kubectl -n autumn apply -f -
+#   kubectl -n autumn logs -f job/model-upload-MODEL_NAME
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-upload-MODEL_NAME
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: model-upload }
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: model-upload }
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      # For the disk, not the GPU: the autumn-node pool has 37.7 GB of
+      # ephemeral storage, which a 117 GiB checkpoint cannot land in at all.
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.3.2"
+
+      initContainers:
+        # The freetoken image's own autumnfs is built at that image's commit and
+        # fails this cluster's handshake with a bare rkyv decode error. Take the
+        # binary from the cluster's own image.
+        - name: tools
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:c211b626a140ddc43bd101925e3b019c7d0839f9
+          command: ["sh","-c","cp /usr/local/bin/autumnfs /tools/ && chmod +x /tools/autumnfs"]
+          volumeMounts:
+            - { name: tools, mountPath: /tools }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { cpu: "1", memory: 1Gi }
+
+      containers:
+        - name: upload
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/freetoken-l3:3c43c273a485d93903dc45bd6b3a43684f6ba152
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -uo pipefail
+              # NOT named BUCKET. `oniond` reads $BUCKET from the environment
+              # as the TOS bucket to fetch from (its own `[ -z "$BUCKET" ]`
+              # guard is what triggers region auto-detection), so a variable of
+              # that name here makes it look for a bucket named after the model
+              # and fail with "Model not found in TOS
+              # http://<model>.tos-cn-beijing.ivolces.com" -- in 31 ms, before
+              # any endpoint it would have worked against is tried.
+              SRC_MODEL=BUCKET_MODEL
+              DST=models/MODEL_NAME
+              FS="/tools/autumnfs --credential-file /etc/autumn/cred/fs.cred --transport tcp"
+
+              # The Rust client is IP-only; it does not resolve names.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              FS="$FS --manager $M"
+              echo "manager = $M"
+
+              W=/work
+              if [ -n "${WORK_DEVICE:-}" ]; then
+                mkdir -p /scratch && mount "$WORK_DEVICE" /scratch
+                # Keyed on the SOURCE bucket. Two checkpoints that share a
+                # destination name must not share a download directory.
+                W="/scratch/dl-$SRC_MODEL"
+                mkdir -p "$W"
+                # Only on success: a failed run's download is the expensive
+                # thing to keep, and `oniond download` resumes into it.
+                trap '[ "${UPLOAD_OK:-0}" = 1 ] && rm -rf -- "$W"' EXIT
+                echo "scratch: $WORK_DEVICE -> $W"
+              fi
+
+              # ── prologue: everything cheap, before anything expensive ────
+              # 1. The handshake. A wire mismatch is the likeliest failure and
+              #    costs one round trip to find.
+              $FS ls models/ >/dev/null || { echo "autumnfs cannot talk to $M"; exit 1; }
+              echo "handshake OK"
+
+              # 2. The destination, proven writable with a real file. The probe
+              #    name is unique per run and removed immediately: `put` refuses
+              #    an existing key, so a fixed name turns a previous run's
+              #    leftover into a false "not writable".
+              $FS mkdir "$DST" 2>/dev/null || true
+              PROBE=".probe.$$"
+              echo probe > "$W/$PROBE"
+              $FS put "$W/$PROBE" "$DST/$PROBE" || { echo "$DST is not writable"; exit 1; }
+              $FS rm "$DST/$PROBE" >/dev/null 2>&1 || true
+              echo "destination OK: $DST"
+
+              # 3. Room for the checkpoint. One copy, not two -- nothing is
+              #    repacked here -- plus 20%. `oniond inspect` answers in bytes.
+              command -v jq >/dev/null || { (apt-get update -qq >/dev/null 2>&1 || true); apt-get install -y -qq jq >/dev/null 2>&1; }
+              command -v jq >/dev/null || { echo "jq missing; oniond cannot run"; exit 1; }
+              NEED_B=$(oniond inspect model "$SRC_MODEL" 2>&1 | grep -i "Used Storage" | grep -oE "[0-9]+" | head -1)
+              if [ -n "$NEED_B" ]; then
+                need_g=$(( NEED_B / 1024 / 1024 / 1024 * 12 / 10 ))
+                free_g=$(df -BG --output=avail "$W" | tail -1 | tr -dc 0-9)
+                echo "space: ${free_g}G free, ~${need_g}G needed for $SRC_MODEL"
+                [ "${free_g:-0}" -ge "$need_g" ] || { echo "not enough room"; df -h "$W"; exit 1; }
+              fi
+
+              # ── download ─────────────────────────────────────────────────
+              mkdir -p "$W/src"
+              time oniond download model "$SRC_MODEL" --dir "$W/src" --turbo
+
+              # oniond may land the repo a directory deep, and lays zero-byte
+              # placeholders at the top level besides. Find the real root by
+              # the non-empty model_index.json, shallowest first.
+              SRCDIR=""
+              for c in $(find "$W/src" -maxdepth 3 -name model_index.json -size +0c -printf '%d %p\n' | sort -n | cut -d' ' -f2-); do
+                SRCDIR="$(dirname "$c")"; break
+              done
+              [ -n "$SRCDIR" ] || { echo "no non-empty model_index.json under $W/src"; find "$W/src" -maxdepth 3 -name '*.json' -printf '%s %p\n' | head; exit 1; }
+              echo "source = $SRCDIR ($(du -sh "$SRCDIR" | cut -f1), $(find "$SRCDIR" -type f | wc -l) files)"
+
+              # ── upload ───────────────────────────────────────────────────
+              (cd "$SRCDIR" && find . -type f -printf '%P\n' | sort) > "$W/want.txt"
+              dst_walk() {
+                $FS ls "$DST/$1" 2>/dev/null | while read -r e; do
+                  case "$e" in
+                    */) dst_walk "$1${e}";;
+                    "") ;;
+                    *)  echo "$1$e";;
+                  esac
+                done
+              }
+              dst_walk "" | sort > "$W/have.txt" || : > "$W/have.txt"
+              comm -23 "$W/want.txt" "$W/have.txt" > "$W/todo.txt"
+              echo "upload: $(wc -l < "$W/todo.txt") of $(wc -l < "$W/want.txt") files"
+              sed -n 's#/[^/]*$##p' "$W/todo.txt" | sort -u | while read -r d; do
+                [ -n "$d" ] && $FS mkdir "$DST/$d" 2>/dev/null || true
+              done
+
+              # `|| true`, and the loop re-checks rather than trusting one pass.
+              # xargs exits 123 when ANY invocation failed, which under `set -e`
+              # kills PID 1 and takes the download with it. It is also not
+              # hypothetical that a pass fails: a 34-file upload of 8 GiB shards
+              # lost 12 of them on attempt 1 at -P 12 and took every one of them
+              # on attempt 2, so the retry is the mechanism, not a safety net.
+              for attempt in 1 2 3; do
+                remaining=$(wc -l < "$W/todo.txt")
+                [ "$remaining" -eq 0 ] && break
+                echo "upload attempt $attempt: $remaining file(s)"
+                time (cd "$SRCDIR" && xargs -a "$W/todo.txt" -P 8 -I{} \
+                  sh -c "$FS put '{}' '$DST/{}' >/dev/null 2>&1 || echo FAIL {}") || true
+                dst_walk "" | sort > "$W/have.txt" || : > "$W/have.txt"
+                comm -23 "$W/want.txt" "$W/have.txt" > "$W/todo.txt"
+              done
+
+              left=$(wc -l < "$W/todo.txt")
+              echo "--- uploaded: $(wc -l < "$W/have.txt") of $(wc -l < "$W/want.txt"), $left missing ---"
+              if [ "$left" -ne 0 ]; then
+                echo "INCOMPLETE: $left file(s) missing — the download is KEPT at $W"
+                sed -n '1,10p' "$W/todo.txt"
+                sleep infinity
+              fi
+              export UPLOAD_OK=1
+              echo "DONE: $DST"
+          env:
+            - { name: WORK_DEVICE, value: "WORK_DEVICE_VALUE" }
+          securityContext:
+            # Only so the script can `mount` WORK_DEVICE, into this container's
+            # own namespace. Drop it if you never set that.
+            privileged: true
+          resources:
+            requests: { cpu: "8", memory: 32Gi }
+            limits:   { cpu: "8", memory: 32Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: tools, mountPath: /tools }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+
+      volumes:
+        - { name: work, emptyDir: {} }
+        - { name: tools, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }

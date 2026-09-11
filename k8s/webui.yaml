@@ -107,6 +107,28 @@ spec:
                   "${LLM_CONTEXT_LENGTH:-54000}" || true
               fi
 
+              # hermes' AIAgent refuses any model whose context window is under
+              # MINIMUM_CONTEXT_LENGTH = 64_000, a constant in its `agent`
+              # package. FreeToken's real ceiling here is 62,080 counting
+              # prompt AND generation, so NO value satisfies both that floor
+              # and the ceiling: 64000 clears the check and brings straight
+              # back the "prompt is too long: N > 62080" failures the 54000
+              # above exists to prevent. Lower the floor rather than lie about
+              # the window -- the floor is an arbitrary guard, the ceiling is
+              # physics.
+              #
+              # This only appeared with the library path. The ACP subprocess
+              # never ran the check, so the same deployment worked until
+              # `run_agent.AIAgent` was driven in process.
+              MM=$("${HERMES_PY:-/opt/hermes/.venv/bin/python}" -c \
+                    'import agent.model_metadata as m; print(m.__file__)' 2>/dev/null)
+              if [ -n "$MM" ] && grep -q '^MINIMUM_CONTEXT_LENGTH' "$MM"; then
+                sed -i "s/^MINIMUM_CONTEXT_LENGTH = .*/MINIMUM_CONTEXT_LENGTH = ${HERMES_MIN_CONTEXT:-32000}/" "$MM"
+                echo "hermes floor: $(grep '^MINIMUM_CONTEXT_LENGTH' "$MM") in $MM"
+              else
+                echo "WARN: MINIMUM_CONTEXT_LENGTH not found; a short-context model will be refused" >&2
+              fi
+
               # The MCP server is written by the app at startup, not here: it
               # merges into config.yaml idempotently and reports what it did on
               # /api/status, so there is one owner of that block.
