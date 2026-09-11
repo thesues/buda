@@ -810,7 +810,10 @@ async function openSession(id) {
 
   let j;
   try {
-    j = await (await fetch(`/api/session/${encodeURIComponent(id)}/history`)).json();
+    // Query string, not a path segment. The server's router is an exact
+  // (method, path) dict with no parameter support, so an id interpolated into
+  // the path matches no route and 404s.
+  j = await (await fetch(`/api/session/history?id=${encodeURIComponent(id)}`)).json();
   } catch (_) {
     S.switching = null; status("载入会话失败"); return;
   }

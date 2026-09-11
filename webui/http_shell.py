@@ -40,6 +40,11 @@ from urllib.parse import parse_qs, urlparse
 
 log = logging.getLogger("buda.http")
 
+# The URL namespace the static assets live under. `index.html` and `app.js`
+# reference `/static/...`, and the aiohttp server this module replaced mounted
+# them with `add_static("/static/", STATIC)`.
+STATIC_PREFIX = "/static/"
+
 # Tells one BROWSER from another. Not authentication — everyone here shares one
 # credential; this only separates two people's cursors and double-click
 # detection. A cookie rather than a header because `EventSource` cannot set
@@ -179,7 +184,15 @@ class App:
         return json_response({"error": "not found"}, status=404)
 
     def serve_static(self, path: str) -> Response | None:
-        """Files under `static_dir`, and nothing else.
+        """Files under `static_dir`, addressed under `/static/`, nothing else.
+
+        The prefix is part of the contract, not decoration. `index.html` asks
+        for `/static/style.css`, `/static/app.js` and the two vendor scripts,
+        and the aiohttp server this replaced mounted them with
+        `add_static("/static/", STATIC)`. Serving the same bytes at the URL
+        root instead answers every one of those with 404 while `/` itself
+        still returns 200 — so the page loads, blank and unstyled, with a
+        working API behind it and nothing but console errors to say why.
 
         The traversal guard is `resolve()` + `is_relative_to`, not a scan for
         "..": a symlink inside the directory reaches outside it without the
@@ -187,7 +200,9 @@ class App:
         """
         if self.static_dir is None:
             return None
-        rel = path.lstrip("/")
+        if not path.startswith(STATIC_PREFIX):
+            return None
+        rel = path[len(STATIC_PREFIX):]
         if not rel:
             return None
         try:

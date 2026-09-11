@@ -253,3 +253,75 @@ def test_a_refused_send_puts_the_message_back():
     assert "j.taken" in guard, (
         "a refused send still eats what was typed:\n" + guard
     )
+
+
+# ── the client/server contract ──────────────────────────────────────────────
+
+# URLs `app.js` builds that the server does NOT serve, each because the feature
+# behind it was never built -- not because a route was mislaid:
+#
+#   /api/approval/*   `TurnManager._ask` refuses visibly rather than
+#                     auto-approving, so there is nothing to answer yet.
+#   DELETE a session  the session store (`hermes_session_api.py`) exposes
+#                     `list_sessions` and `history` and no delete at all.
+#
+# They are listed verbatim so that building the feature -- or deleting the dead
+# UI that calls it -- has to come past these tests, instead of going on 404ing
+# in a browser while the suite stays green.
+KNOWN_UNBUILT = {
+    "/api/approval/pending${q}",
+    "/api/approval/answer",
+    "/api/session/${encodeURIComponent(id)}",
+}
+
+
+def _client_api_urls() -> set[str]:
+    js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    urls = set(re.findall(r"[\"\'`](/api/[^\"\'`]*)", js))
+    assert urls, "no /api/ URLs found -- this test is not looking where it thinks"
+    return urls
+
+
+def test_every_api_path_the_client_builds_is_a_path_the_router_can_match():
+    """The router is an exact `(method, path)` dict -- `http_shell.App.handle`
+    looks up `self.routes[(method, path)]` and has no parameter support at all.
+    An `/api/...` URL with an interpolated PATH segment therefore matches no
+    route, however the server spells it.
+
+    This is the check that was missing. The refactor to `main.py` +
+    `http_shell.py` left five client URLs the server does not serve -- four API
+    paths and the whole `/static/` prefix -- and the suite stayed green through
+    every one, because the server tests asserted the server's shape and the
+    client tests only scanned the client's source. Nothing compared the two.
+
+    Ablation: put `${encodeURIComponent(id)}` back into the PATH of the history
+    fetch and this goes red.
+
+    A query string is exempt -- `?id=${...}` is interpolation the router never
+    sees, because `Request.__init__` splits the query off before dispatch.
+    """
+    bad = sorted(
+        u for u in _client_api_urls() - KNOWN_UNBUILT
+        if "${" in u.split("?", 1)[0]
+    )
+    assert not bad, (
+        "these client URLs interpolate into the PATH, which the exact-match "
+        f"router can never serve: {bad}"
+    )
+
+
+def test_the_client_only_calls_api_paths_the_server_registers():
+    """The other half: a literal path the client asks for must be registered.
+
+    The server side is read from the `@app.route("METHOD", "PATH")` decorators
+    rather than by constructing the app, which keeps this symmetrical with the
+    client half and free of `build_app`'s dependencies.
+    """
+    root = Path(__file__).resolve().parents[1]
+    routes_src = (root / "app_routes.py").read_text()
+    registered = set(re.findall(r'@app\.route\("[A-Z]+",\s*"([^"]+)"\)', routes_src))
+    assert registered, "no @app.route decorators found -- this test misreads the server"
+
+    asked = {u.split("?", 1)[0] for u in _client_api_urls() - KNOWN_UNBUILT}
+    missing = sorted(a for a in asked if "${" not in a and a not in registered)
+    assert not missing, f"client calls paths the server does not register: {missing}"

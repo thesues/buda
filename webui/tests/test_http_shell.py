@@ -173,12 +173,40 @@ def test_an_unknown_path_is_a_json_404(server):
 # ── static ──────────────────────────────────────────────────────────────────
 
 
-def test_static_files_are_served_from_the_directory(server, tmp_path):
+def test_static_files_are_served_under_the_static_prefix(server, tmp_path):
+    """The prefix is the contract the page is written against.
+
+    `index.html` asks for `/static/style.css`, `/static/app.js` and two vendor
+    scripts; the aiohttp server this module replaced mounted them with
+    `add_static("/static/", STATIC)`. Serving them at the URL root instead
+    404s every one while `/` still returns 200 — the page renders blank and
+    unstyled, with a working API behind it and only console errors to say so.
+    Ablation: drop the prefix handling from `serve_static` and this goes red
+    while every other test in this file stays green, which is exactly how it
+    reached a browser.
+    """
     (tmp_path / "app.js").write_text("console.log(1)")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "marked.min.js").write_text("//marked")
     base = server(_app(tmp_static=tmp_path))
-    r = _get(base + "/app.js")
+
+    r = _get(base + "/static/app.js")
     assert r.read() == b"console.log(1)"
     assert "javascript" in r.headers.get("Content-Type", "")
+
+    # Nested, because the vendor scripts live one level down.
+    assert _get(base + "/static/vendor/marked.min.js").read() == b"//marked"
+
+
+def test_a_file_outside_the_static_prefix_is_not_served(server, tmp_path):
+    """Only `/static/` reaches the directory. A bare `/app.js` is not an alias
+    for it — one file, one URL, so a cache header or a CDN rule written for the
+    prefix cannot be sidestepped by addressing the same bytes another way."""
+    (tmp_path / "app.js").write_text("console.log(1)")
+    base = server(_app(tmp_static=tmp_path))
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _get(base + "/app.js")
+    assert e.value.code == 404
 
 
 def test_a_path_escaping_the_static_directory_is_refused(server, tmp_path):
@@ -188,7 +216,7 @@ def test_a_path_escaping_the_static_directory_is_refused(server, tmp_path):
     secret.write_text("private")
     (tmp_path / "link.txt").symlink_to(secret)
     base = server(_app(tmp_static=tmp_path))
-    for path in ("/../secret.txt", "/link.txt"):
+    for path in ("/static/../secret.txt", "/static/link.txt"):
         with pytest.raises(urllib.error.HTTPError) as e:
             _get(base + path)
         assert e.value.code == 404, f"{path} must not be served"
