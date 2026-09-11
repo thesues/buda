@@ -110,7 +110,15 @@ spec:
               # The MCP server is written by the app at startup, not here: it
               # merges into config.yaml idempotently and reports what it did on
               # /api/status, so there is one owner of that block.
-              exec python server.py
+              #
+              # HERMES' interpreter, not the image's. The app imports
+              # `run_agent.AIAgent` and drives it in process — there is no
+              # `hermes acp` subprocess any more — and that import only resolves
+              # inside hermes' venv. Everything the app itself adds is stdlib,
+              # so nothing of ours competes with hermes' dependency tree, which
+              # is the reason the session-store bridge used to run in a second
+              # interpreter; it is gone with the ACP client.
+              exec "${HERMES_PY:-/opt/hermes/.venv/bin/python}" main.py
           env:
             - { name: PORT, value: "8080" }
             - { name: HERMES_HOME, value: /opt/data }
@@ -126,6 +134,18 @@ spec:
             # here: the second turn is refused immediately, and every other
             # conversation greys out while one is answering.
             - { name: MAX_CONCURRENT_TURNS, value: "1" }
+            # Every endpoint the picker offers, first one the default. The limit
+            # is per entry because the ceiling is the MODEL behind it: one
+            # global number can only be right for one of them, and it is the
+            # reason MAX_CONCURRENT_TURNS above could only ever describe
+            # freetoken-l3. Adding a model is a line here — the agent cache
+            # signature carries base_url and provider, so a session that
+            # switches misses the cache and is rebuilt against the new one,
+            # with no separate switch-model path to keep correct.
+            - name: BUDA_ENDPOINTS
+              value: |
+                [{"key":"dsv4","label":"DSV4-Flash","model":"dsv4-flash",
+                  "base_url":"http://freetoken-l3:1919/v1","maxConcurrent":1}]
             # The browser toolset's availability check will DOWNLOAD Chromium
             # to decide it is available -- elsewhere a fresh volume grew from
             # 220 KB to 897 MB doing it. These stop that. They do NOT remove the
