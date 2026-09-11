@@ -149,12 +149,23 @@ spec:
               # `inference/config.json`, which is its ModelArgs file, not an HF
               # model config — pointing the converter at it fails with
               # "Unrecognized model ... should have a model_type key".
-              SRCDIR="$W/src"
-              if [ ! -f "$SRCDIR/config.json" ]; then
-                SRCDIR="$(find "$W/src" -maxdepth 3 -name config.json -printf '%d %h\n' \
-                  | sort -n | head -1 | cut -d' ' -f2-)"
-              fi
-              [ -f "$SRCDIR/config.json" ] || { echo "no model config.json under $W/src"; exit 1; }
+              # Take the shallowest NON-EMPTY config.json.
+              #
+              # Two traps, one per model seen so far. A DeepSeek-V4 repo ships
+              # `inference/config.json` — its ModelArgs, not an HF config — so
+              # "the first one find returns" is wrong. And oniond lays some
+              # repos out at BOTH levels: MiniMax-M2.5 arrived with a tree of
+              # zero-byte placeholders at the top (config.json, README.md,
+              # chat_template.jinja …) and the real 216 GiB one directory down,
+              # so "the shallowest" is wrong too — it picks the empty shell and
+              # the converter dies with "not a valid JSON file".
+              # Non-empty plus shallowest is what actually identifies it.
+              SRCDIR=""
+              for c in $(find "$W/src" -maxdepth 3 -name config.json -size +0c -printf '%d %p\n' \
+                         | sort -n | cut -d' ' -f2-); do
+                SRCDIR="$(dirname "$c")"; break
+              done
+              [ -n "$SRCDIR" ] || { echo "no non-empty config.json under $W/src"; exit 1; }
               echo "converting from $SRCDIR"
               time ft checkpoint --model "$SRCDIR" --out "$W/ftw" \
                 --moe-backend offload --shard-gib 8
