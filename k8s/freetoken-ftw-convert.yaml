@@ -87,13 +87,22 @@ spec:
                 # retry could upload in minutes. It has cost that twice now,
                 # 131 GiB and 147 GiB.
                 trap '[ "${CONVERT_OK:-0}" = 1 ] && rm -rf -- "$W"' EXIT
-                # Do NOT wipe at start. Keeping the work dir across a failed run
-                # is the entire point of the conditional trap above, and an
-                # unconditional wipe here undoes it on the retry — which is the
-                # only run that could have used it. The download is resumable
-                # and the upload skips what is already there, so a retry picks
-                # up where the last one stopped instead of re-paying for it.
+                # Keep the SOURCE across a failed run, drop a partial OUTPUT.
+                #
+                # Those are opposite calls because the two legs resume
+                # differently: `oniond download` is resumable and the upload
+                # skips what is already uploaded, so a kept source saves the
+                # whole download. `ft checkpoint` has no resume — no --resume,
+                # no --skip-existing, nothing — so it re-runs from zero every
+                # time, and a kept partial output is never read: it just sits
+                # on the scratch device competing with the run that will
+                # overwrite it. After the 128Gi OOM that cost 170 GB of
+                # headroom on a device that needs ~270.
                 mkdir -p "$W"
+                if [ -d "$W/ftw" ]; then
+                  echo "dropping $(du -sh "$W/ftw" | cut -f1) of partial output (the converter cannot resume)"
+                  rm -rf -- "$W/ftw"
+                fi
                 echo "scratch: $WORK_DEVICE -> $W"
               fi
               df -h "$W" | tail -1
@@ -225,11 +234,17 @@ spec:
           resources:
             requests:
               cpu: "8"
-              memory: 128Gi
+              # 128Gi OOM-killed the repack at 81% of the expert banks (117 of
+              # 143 GB). `ft checkpoint` loads experts in PARALLEL when the
+              # source is on local disk -- the old flow fetched file-by-file
+              # from autumn, which kept the peak down by accident. The node has
+              # 687Gi allocatable and sits at 35%, so give the peak room rather
+              # than forcing serial loading, which is much slower.
+              memory: 256Gi
               nvidia.com/gpu: 1
             limits:
               cpu: "8"
-              memory: 128Gi
+              memory: 256Gi
               nvidia.com/gpu: 1
           volumeMounts:
             - { name: work, mountPath: /work }
