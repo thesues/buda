@@ -80,8 +80,19 @@ spec:
                 mkdir -p /scratch
                 mount "$WORK_DEVICE" /scratch
                 W=/scratch/ftw-MODEL_NAME
-                trap 'rm -rf -- "$W"' EXIT
-                rm -rf -- "$W"
+                # Clean up ONLY after a successful run. This used to be a bare
+                # EXIT trap, which fires on failure too — and an upload that
+                # fails after the repack has finished is precisely when the
+                # output is most worth keeping: ~75 minutes of GPU work that a
+                # retry could upload in minutes. It has cost that twice now,
+                # 131 GiB and 147 GiB.
+                trap '[ "${CONVERT_OK:-0}" = 1 ] && rm -rf -- "$W"' EXIT
+                # Do NOT wipe at start. Keeping the work dir across a failed run
+                # is the entire point of the conditional trap above, and an
+                # unconditional wipe here undoes it on the retry — which is the
+                # only run that could have used it. The download is resumable
+                # and the upload skips what is already there, so a retry picks
+                # up where the last one stopped instead of re-paying for it.
                 mkdir -p "$W"
                 echo "scratch: $WORK_DEVICE -> $W"
               fi
@@ -98,48 +109,109 @@ spec:
               $FS ls "$DST" > /dev/null
 
               # ── fetch ────────────────────────────────────────────────────
-              # 12 at a time: one stream is latency-bound, throughput here is
-              # concurrency. This is the leg that takes nine hours over FUSE.
+              # Straight from the in-network TOS bucket, not from autumn. The
+              # source no longer has to be staged in the cluster first: this is
+              # the conversion INPUT and nothing else reads it, so a round trip
+              # through autumn only bought a second copy to keep consistent.
+              #
+              # oniond, not HuggingFace: measured 180 MiB/s vs ~22 MiB/s, and
+              # HF died mid-transfer twice. `HF_ENDPOINT=hf-mirror` only
+              # redirects metadata; the blobs still come from a US CDN.
+              # oniond needs jq, which this image lacks — and a bare
+              # `apt-get update` returns non-zero on a stale CUDA index, so the
+              # `|| true` is load-bearing or the install is silently skipped.
+              (apt-get update -qq >/dev/null 2>&1 || true)
+              command -v jq >/dev/null || apt-get install -y -qq jq >/dev/null 2>&1
+              command -v jq >/dev/null || { echo "jq missing; oniond cannot run"; exit 1; }
+
               mkdir -p "$W/src"
-              # `ls` lists directories with a trailing slash, and `get` refuses
-              # one with EISDIR -- which under `set -e` takes the job down at the
-              # end of the xargs run. So walk them instead of skipping them: the
-              # converter reads `inference/config.json` for the DeepSeek-V4
-              # ModelArgs and fails without it, which is not something the file
-              # names tell you.
-              walk() {
-                $FS ls "$SRC/$1" | while read -r e; do
-                  case "$e" in
-                    */) walk "$1${e}" ;;
-                    *)  echo "$1$e" ;;
-                  esac
-                done
-              }
-              walk "" > "$W/manifest.txt"
-              wc -l < "$W/manifest.txt" | xargs echo "source files:"
-              # Directories must exist before the parallel get lands in them.
-              sed -n 's#/[^/]*$##p' "$W/manifest.txt" | sort -u | while read -r d; do
-                [ -n "$d" ] && mkdir -p "$W/src/$d"
-              done
-              time xargs -a "$W/manifest.txt" -P 12 -I{} \
-                sh -c "$FS get '$SRC/{}' $W/src/{} >/dev/null" 
+              echo "downloading BUCKET_MODEL from the bucket"
+              time oniond download model "BUCKET_MODEL" --dir "$W/src" --turbo
+              echo "source files: $(find "$W/src" -type f | wc -l)"
               du -sh "$W/src"
 
               # ── convert ──────────────────────────────────────────────────
               # offload: experts are repacked into banks, which is what
               # --moe-backend hybrid consumes at serve time.
-              time ft checkpoint --model "$W/src" --out "$W/ftw" \
+              # oniond may land the repo one directory deep; point the
+              # converter at whatever actually holds config.json.
+              # Take the SHALLOWEST config.json, not the first one `find`
+              # happens to return: a DeepSeek-V4 repo also ships
+              # `inference/config.json`, which is its ModelArgs file, not an HF
+              # model config — pointing the converter at it fails with
+              # "Unrecognized model ... should have a model_type key".
+              SRCDIR="$W/src"
+              if [ ! -f "$SRCDIR/config.json" ]; then
+                SRCDIR="$(find "$W/src" -maxdepth 3 -name config.json -printf '%d %h\n' \
+                  | sort -n | head -1 | cut -d' ' -f2-)"
+              fi
+              [ -f "$SRCDIR/config.json" ] || { echo "no model config.json under $W/src"; exit 1; }
+              echo "converting from $SRCDIR"
+              time ft checkpoint --model "$SRCDIR" --out "$W/ftw" \
                 --moe-backend offload --shard-gib 8
               du -sh "$W/ftw"
 
               # ── upload ───────────────────────────────────────────────────
               # `put` takes one file at a time; the parent was made and checked
               # at the top, before any of this was paid for.
-              time (cd "$W/ftw" && ls | xargs -P 12 -I{} \
-                sh -c "$FS put '{}' '$DST/{}' >/dev/null")
+              #
+              # Walk, do not `ls`: the converter copies the source's non-weight
+              # files into the output, and since the fetch became recursive that
+              # includes its SUBDIRECTORIES (inference/, encoding/). `put` on a
+              # directory fails "Is a directory" — after the repack is already
+              # paid for.
+              #
+              # Skip what is already uploaded. A previous attempt that died
+              # part-way leaves shards behind and `put` refuses to overwrite,
+              # so without this every retry of a partly-uploaded model fails on
+              # the files that actually succeeded last time.
+              # Both sides must be walked the SAME way. `ls` is not recursive,
+              # so a flat listing against a recursive `find` reports every
+              # already-uploaded file under encoding/ or inference/ as missing,
+              # and each retry re-`put`s them for a guaranteed "destination
+              # already exists" -- the exact failure this skip is here to avoid.
+              (cd "$W/ftw" && find . -type f -printf "%P\n" | sort) > "$W/want.txt"
+              dst_walk() {
+                $FS ls "$DST/$1" 2>/dev/null | while read -r e; do
+                  case "$e" in
+                    */) dst_walk "$1${e}" ;;
+                    *)  echo "$1$e" ;;
+                  esac
+                done
+              }
+              dst_walk "" | sort > "$W/have.txt" || : > "$W/have.txt"
+              comm -23 "$W/want.txt" "$W/have.txt" > "$W/todo.txt"
+              echo "upload: $(wc -l < "$W/todo.txt") of $(wc -l < "$W/want.txt") files"
+              # Directories must exist before the parallel put lands in them.
+              sed -n 's#/[^/]*$##p' "$W/todo.txt" | sort -u | while read -r d; do
+                [ -n "$d" ] && $FS mkdir "$DST/$d" 2>/dev/null || true
+              done
+              # `|| true`, and the loop re-checks instead of trusting one pass.
+              #
+              # xargs exits 123 when ANY invocation failed, and under `set -e`
+              # that killed PID 1 — which ended the container, which deleted the
+              # emptyDir holding the finished repack. One failed file cost the
+              # whole 147 GiB. The output is expensive and the destination is
+              # not: a failure here must leave the bytes on disk and let a retry
+              # upload only what is missing.
+              for attempt in 1 2 3; do
+                remaining=$(wc -l < "$W/todo.txt")
+                [ "$remaining" -eq 0 ] && break
+                echo "upload attempt $attempt: $remaining file(s)"
+                time (cd "$W/ftw" && xargs -a "$W/todo.txt" -P 12 -I{} \
+                  sh -c "$FS put '{}' '$DST/{}' >/dev/null 2>&1 || echo FAIL {}") || true
+                dst_walk "" | sort > "$W/have.txt" || : > "$W/have.txt"
+                comm -23 "$W/want.txt" "$W/have.txt" > "$W/todo.txt"
+              done
 
-              echo "--- uploaded ---"
-              $FS ls "$DST"
+              left=$(wc -l < "$W/todo.txt")
+              echo "--- uploaded: $(wc -l < "$W/have.txt") of $(wc -l < "$W/want.txt"), $left missing ---"
+              if [ "$left" -ne 0 ]; then
+                echo "INCOMPLETE: $left file(s) still missing — the repack is KEPT at $W"
+                echo "retry by re-running the upload loop in this pod; do not delete it"
+                sleep infinity
+              fi
+              export CONVERT_OK=1
               echo "DONE: $DST"
           env:
             # The conversion repacks on a GPU; without this it grabs the first
