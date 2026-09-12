@@ -20,10 +20,15 @@
 #   kubectl -n autumn get sts autumn-ps \
 #     -o jsonpath='{.spec.template.spec.containers[0].image}'   # the tag to pass
 
-# Must name the commit the cluster is running; see the note at the top.
-ARG AUTUMN_IMAGE=autumn-rs:latest
-# crates.io mirror for the wheel build, e.g. sparse+https://rsproxy.cn/index/
-ARG CARGO_MIRROR=
+# Must name the commit the cluster is running; see the note at the top. This is
+# a real tag and not `:latest` on purpose — the build pipeline passes no
+# build-args, and a default that cannot be pulled fails the build while a
+# default that CAN be pulled but is the wrong commit builds a client that
+# decodes garbage. Update it in the same change that bumps the cluster.
+ARG AUTUMN_IMAGE=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:947bae0396481fe9e8586aae7eefa98852d2247d
+# crates.io mirror for the wheel build. Defaulted, not empty: the CN build pool
+# reaches crates.io slowly enough that the wheel step times out without it.
+ARG CARGO_MIRROR=sparse+https://rsproxy.cn/index/
 
 ARG BASE_REGISTRY=
 # `library/` spelled out, not the bare `python:` Docker Hub lets you write.
