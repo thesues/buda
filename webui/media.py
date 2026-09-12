@@ -158,19 +158,32 @@ def _split(path: str) -> list[str]:
     return [p for p in path.split("/") if p and p not in (".", "..")]
 
 
+# The Fs API's return shapes, which are not uniform and are worth naming once:
+#   resolve(path)        -> int | None          (the inode, or nothing there)
+#   lookup(parent, name) -> (ino, kind) | None  (a TUPLE, not a dict)
+#   mkdir/create(...)    -> int
+#   getattr(ino)         -> dict with ino/size/type/mode/...
+#   read(ino, off, n)    -> bytes
+ROOT_INO = 1
+
+
 def _mkdirs(fs, path: str) -> int:
     """`mkdir -p`, returning the leaf inode.
 
     Each level is create-or-lookup: two callers uploading at once both try to
     make `media/<session>` and one of them loses, which is not an error.
     """
-    ino = fs.resolve("/")["ino"] if isinstance(fs.resolve("/"), dict) else fs.resolve("/")
+    ino = fs.resolve("/")
+    if ino is None:
+        ino = ROOT_INO
     for name in _split(path):
         try:
             ino = fs.mkdir(ino, name, 0o755)
         except Exception:  # noqa: BLE001 -- already exists, or lost the race
             got = fs.lookup(ino, name)
-            ino = got["ino"] if isinstance(got, dict) else got
+            if got is None:
+                raise
+            ino = got[0]
     return ino
 
 
@@ -215,10 +228,10 @@ def get(media_id: str) -> Tuple[bytes, str]:
         raise ValueError(f"unsupported media type: {ext!r}")
 
     fs = _connect()
-    got = fs.resolve(f"/{ROOT}/{sess}/{name}")
-    ino = got["ino"] if isinstance(got, dict) else got
-    meta = fs.getattr(ino)
-    size = int(meta["size"] if isinstance(meta, dict) else meta)
+    ino = fs.resolve(f"/{ROOT}/{sess}/{name}")
+    if ino is None:
+        raise FileNotFoundError(media_id)
+    size = int(fs.getattr(ino)["size"])
     if size > MAX_BYTES:
         raise ValueError(f"{media_id} is {size} bytes, over the serving limit")
 
