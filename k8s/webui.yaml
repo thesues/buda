@@ -133,6 +133,12 @@ spec:
                 fi
               done
 
+              # The autumn client is IP-only — it does not resolve names — so
+              # the address is resolved here and exported, the same way every
+              # other autumn consumer in this cluster does it.
+              export AUTUMN_MANAGER="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "autumn manager = $AUTUMN_MANAGER"
+
               # A user plugin is discovered but NOT loaded unless it is in
               # `plugins.enabled` — discovery logs "Skipping 'wan22' (not in
               # plugins.enabled)" and otherwise says nothing, so the symptom is
@@ -267,6 +273,7 @@ spec:
             - { name: http, containerPort: 8080 }
           volumeMounts:
             - { name: data, mountPath: /opt/data }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
           resources:
             requests: { cpu: "200m", memory: 512Mi }
             limits: { cpu: "2", memory: 2Gi }
@@ -286,6 +293,10 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim: { claimName: hermes-webui-data }
+        # Media storage talks to autumn directly through the PyO3 client, so
+        # this pod now holds an fs credential where it used to hold none.
+        - name: cred
+          secret: { secretName: autumn-credential }
 ---
 # Published through the cluster's existing Volcengine APIG instance, the same
 # one `dataverse`, `rlinf` and the lerobot console go through. The two

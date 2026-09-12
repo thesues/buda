@@ -59,8 +59,35 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     node.setAttribute("rel", "noopener noreferrer");
   }
 });
-const renderMD = (src) =>
-  DOMPurify.sanitize(marked.parse(src || "", { gfm: true, breaks: true }));
+// Media stored in autumn comes back as a link to our own endpoint. Markdown
+// renders that as an <a>; turn the ones that point at media into the element
+// that actually shows it. Done after sanitising, on the parsed DOM, so nothing
+// here re-introduces markup the sanitiser just removed.
+const MEDIA_HREF = /^\/api\/media\?id=/;
+const VIDEO_EXT = /\.(mp4|webm)(?:$|[?&])/i;
+
+function inlineMedia(root) {
+  root.querySelectorAll('a[href^="/api/media"]').forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    if (!MEDIA_HREF.test(href)) return;
+    const el = VIDEO_EXT.test(href)
+      ? Object.assign(document.createElement("video"), {
+          src: href, controls: true, loop: true, playsInline: true, preload: "metadata",
+        })
+      : Object.assign(document.createElement("img"), { src: href, loading: "lazy" });
+    el.className = "media";
+    a.replaceWith(el);
+  });
+  return root;
+}
+
+const renderMD = (src) => {
+  const box = document.createElement("div");
+  box.innerHTML = DOMPurify.sanitize(
+    marked.parse(src || "", { gfm: true, breaks: true }),
+  );
+  return inlineMedia(box).innerHTML;
+};
 
 const S = {
   streamId: null,
@@ -878,10 +905,91 @@ async function newSession() {
 }
 
 /* ---------- sending ---------- */
+// ── attachments ────────────────────────────────────────────────────────────
+//
+// The bytes go to autumn the moment a file is picked, and what reaches the
+// message is the URL they came back as. The version this replaces pasted a
+// data URL into the text, which is the transcript — so it was re-sent to the
+// model on every later turn of the conversation, filled the reader's screen,
+// and hermes' own vision tool died on it with "File name too long". A 5 KB
+// PNG is small enough that doing it the wrong way looks fine.
+
+const PENDING = [];   // { id, url, name, kind }
+
+function renderAttachments() {
+  const box = $("#attachments");
+  box.innerHTML = "";
+  box.hidden = PENDING.length === 0;
+  PENDING.forEach((a, i) => {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    const thumb = document.createElement("img");
+    thumb.src = a.url; thumb.alt = a.name; thumb.loading = "lazy";
+    const x = document.createElement("button");
+    x.type = "button"; x.textContent = "×"; x.title = "移除";
+    x.onclick = () => { PENDING.splice(i, 1); renderAttachments(); };
+    chip.append(thumb, x);
+    box.append(chip);
+  });
+}
+
+async function attach(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  const ok = ["png", "jpg", "jpeg", "webp", "gif"];
+  if (!ok.includes(ext)) { status(`不支持的图片格式：${ext || "?"}`); return; }
+  // The server reads at most 8 MiB of body and does not report truncation, so
+  // a larger file would be stored short and look corrupt only when rendered.
+  if (file.size > 8 * 1024 * 1024) {
+    status(`图片 ${Math.round(file.size / 1048576)} MB，超过 8 MB 上限`);
+    return;
+  }
+  status(`上传 ${file.name}…`);
+  try {
+    const q = new URLSearchParams({ ext, session: S.session || "shared" });
+    const r = await fetch(`/api/media?${q}`, { method: "POST", body: file });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    PENDING.push({ id: j.id, url: j.url, name: file.name, kind: "image" });
+    renderAttachments();
+    status("");
+  } catch (e) {
+    status(`上传失败：${e.message}`);
+  }
+}
+
+function wireAttachments() {
+  const input = $("#input");
+  $("#attach").onclick = () => $("#file-input").click();
+  $("#file-input").onchange = (e) => {
+    [...e.target.files].forEach(attach);
+    e.target.value = "";             // same file twice in a row must still fire
+  };
+  // Paste. A screenshot arrives as a file with no name, so give it one.
+  input.addEventListener("paste", (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (!files.length) return;
+    e.preventDefault();
+    files.forEach((f) => attach(f.name ? f : new File([f], `pasted.${(f.type.split("/")[1] || "png")}`, { type: f.type })));
+  });
+  // Drop, on the whole composer rather than the textarea alone — aiming at a
+  // one-line input is a worse target than the box around it.
+  const form = $("#composer");
+  ["dragenter", "dragover"].forEach((t) =>
+    form.addEventListener(t, (e) => { e.preventDefault(); form.classList.add("dropping"); }));
+  ["dragleave", "drop"].forEach((t) =>
+    form.addEventListener(t, () => form.classList.remove("dropping")));
+  form.addEventListener("drop", (e) => {
+    e.preventDefault();
+    [...(e.dataTransfer?.files || [])].forEach(attach);
+  });
+}
+
 async function send() {
   const input = $("#input");
-  const text = input.value.trim();
-  if (!text) return;
+  let text = input.value.trim();
+  // An image with no words is a real message here -- "make this move" is often
+  // the whole intent -- so only refuse when there is neither.
+  if (!text && !PENDING.length) return;
   if (S.awaitingPerm) {
     // Never a silent return: you type, press Enter, nothing happens, and the
     // reason (an approval is blocking the agent) is invisible. Point at it.
@@ -892,6 +1000,14 @@ async function send() {
   }
   if (S.busy) return;   // this conversation is already replying
   if (S.switching) { status("正在切换会话，稍候"); return; }
+  if (PENDING.length) {
+    // Markdown image syntax, so the transcript shows the picture and the model
+    // receives a URL it can hand straight to a tool. Never the bytes.
+    const refs = PENDING.map((a) => `![${a.name}](${a.url})`).join("\n");
+    text = text ? `${text}\n\n${refs}` : refs;
+    PENDING.length = 0;
+    renderAttachments();
+  }
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
   S.seg = null;
@@ -992,6 +1108,7 @@ async function boot() {
   });
 
   $("#new-session").onclick = newSession;
+  wireAttachments();
   // Cmd/Ctrl+K from anywhere, including the composer -- the shortcut is useless
   // if you have to leave the box you are typing in to reach it.
   document.addEventListener("keydown", (e) => {

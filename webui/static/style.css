@@ -320,3 +320,52 @@ header h1 em { color:var(--accent); font-style:italic; }
 .chat.blocked #send { opacity:0.4; cursor:not-allowed; }
 .chat.blocked #input::placeholder { color:var(--text-muted); opacity:0.9; }
 #composer { position:relative; }
+
+/* ── attachments ───────────────────────────────────────────────────────────
+   Above the textarea, not inside it: what the composer sends is a URL, and
+   the thumbnail is there so you can see what you attached and take it back
+   off before sending. */
+#attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  padding: .4rem .2rem 0;
+  width: 100%;
+}
+#attachments .chip {
+  position: relative;
+  display: inline-flex;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .14);
+  background: rgba(255, 255, 255, .04);
+}
+#attachments .chip img { height: 56px; width: auto; display: block; }
+#attachments .chip button {
+  position: absolute; top: 2px; right: 2px;
+  width: 18px; height: 18px; line-height: 16px;
+  padding: 0; border: 0; border-radius: 50%;
+  background: rgba(0, 0, 0, .65); color: #fff;
+  font-size: 13px; cursor: pointer;
+}
+#attachments .chip button:hover { background: rgba(0, 0, 0, .85); }
+
+#attach { padding: .35rem .55rem; font-size: 1.05rem; line-height: 1; }
+
+/* The whole composer is the drop target; a one-line textarea is too small a
+   thing to aim a file at. */
+#composer.dropping {
+  outline: 2px dashed rgba(230, 180, 90, .7);
+  outline-offset: 3px;
+}
+
+/* Media inside a message. Bounded, because a 720p frame would otherwise set
+   the width of the whole column. */
+.msg .media, .bubble .media, .media {
+  max-width: min(520px, 100%);
+  max-height: 380px;
+  border-radius: 10px;
+  display: block;
+  margin: .45rem 0;
+  background: rgba(0, 0, 0, .25);
+}

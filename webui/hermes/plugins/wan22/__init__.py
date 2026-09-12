@@ -202,9 +202,24 @@ class Wan22VideoGenProvider(VideoGenProvider):
             )
 
         # The body IS the mp4. Metadata rides in headers.
-        path = save_bytes_video(r.content, prefix="wan22", extension="mp4")
+        #
+        # Into autumn, beside the image it was made from, so the webui can serve
+        # it back by URL and it survives this pod. `save_bytes_video` writes to
+        # `$HERMES_HOME/cache/videos/`, which is a cache in the pod: a URL
+        # handed to a browser from there is a path the browser cannot fetch and
+        # a file the next pod will not have. Fall back to it only if autumn is
+        # unreachable, so a generation that cost minutes is not simply lost.
+        try:
+            import media  # noqa: PLC0415 -- the webui's store, same process
+
+            mid = media.put(r.content, "mp4", session=kwargs.get("session") or "video")
+            where = f"/api/media?id={mid}"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not store the clip in autumn (%s); keeping it local", exc)
+            where = str(save_bytes_video(r.content, prefix="wan22", extension="mp4"))
+
         return success_response(
-            video=str(path), model=mdl, prompt=prompt, modality=modality,
+            video=where, model=mdl, prompt=prompt, modality=modality,
             aspect_ratio=aspect_ratio, duration=secs, provider=self.name,
             extra={
                 "inference_time_s": r.headers.get("X-Inference-Time-S"),

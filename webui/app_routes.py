@@ -21,12 +21,18 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import media
 from http_shell import App, Request, Response, Streaming, json_response
 from hermes_agent import Endpoint
 from sse import SSE_HEADERS, write_stream
 from turns import Refused, TurnManager
 
 log = logging.getLogger("buda.routes")
+
+# `Request` reads at most this much body and does not say when it truncated
+# (`http_shell.Request.__init__`), so an upload past it must be refused rather
+# than stored short. Keep the two numbers together or they drift apart.
+BODY_LIMIT = 8 << 20
 
 
 def build_app(
@@ -173,6 +179,60 @@ def build_app(
         if sid:
             last_session[req.client_id] = sid
         return json_response({"ok": True, "current": sid or None})
+
+    # ── media ──────────────────────────────────────────────────────────────
+
+    @app.route("POST", "/api/media")
+    def _media_put(req: Request) -> Response:
+        """Store an upload in autumn, answer with the URL to reach it by.
+
+        Raw body, not multipart: the client already has the bytes and there is
+        exactly one file, so a boundary parser would be a parser to get wrong
+        for nothing. The type comes from `?ext=`, which is also what decides
+        the Content-Type on the way back out.
+
+        `Request` reads at most 8 MiB of body (`http_shell.Request.__init__`)
+        and does NOT report that it truncated, so a larger upload would be
+        stored silently short — a corrupt image nobody finds until it is
+        rendered. Check the declared length and refuse, rather than store it.
+        """
+        ext = (req.query.get("ext") or "").lower().lstrip(".")
+        declared = int(req.headers.get("Content-Length") or 0)
+        if declared > BODY_LIMIT:
+            return json_response(
+                {"error": f"file is {declared} bytes; the limit is {BODY_LIMIT}"},
+                status=413,
+            )
+        try:
+            mid = media.put(req.body, ext, session=req.query.get("session", "shared"))
+        except ValueError as e:
+            return json_response({"error": str(e)}, status=400)
+        except Exception as e:  # noqa: BLE001
+            log.exception("media upload failed")
+            return json_response({"error": f"could not store: {e}"}, status=503)
+        return json_response({"id": mid, "url": f"/api/media?id={mid}"})
+
+    @app.route("GET", "/api/media")
+    def _media_get(req: Request) -> Response:
+        """Serve a stored file. Query string, because the router matches paths
+        exactly and has no parameter support."""
+        mid = req.query.get("id", "")
+        if not mid:
+            return json_response({"error": "id is required"}, status=400)
+        try:
+            data, ctype = media.get(mid)
+        except ValueError as e:
+            return json_response({"error": str(e)}, status=400)
+        except Exception as e:  # noqa: BLE001
+            log.info("media %s not served: %s", mid, e)
+            return json_response({"error": "not found"}, status=404)
+        return Response(200, [
+            ("Content-Type", ctype),
+            # Stored bytes never change under a given id -- the id is random and
+            # minted per upload -- so this is safe to cache hard, and it keeps a
+            # re-rendered transcript from refetching every image.
+            ("Cache-Control", "public, max-age=31536000, immutable"),
+        ], data)
 
     # ── the page ───────────────────────────────────────────────────────────
 

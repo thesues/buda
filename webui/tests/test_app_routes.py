@@ -257,3 +257,128 @@ def test_status_advertises_the_endpoints_the_client_can_pick(app_server):
     assert body["defaultEndpoint"] == "dsv4"
     assert {e["key"]: e["maxConcurrent"] for e in body["endpoints"]} == {"dsv4": 1, "vision": 1}
     assert body["mcp"]["name"] == "memory"
+
+
+# ── media ───────────────────────────────────────────────────────────────────
+#
+# `media` is stubbed rather than mocked at the autumn boundary: these tests are
+# about the route's contract — what it refuses, what status it maps a failure
+# to, what headers it sets — and wiring a real cluster in would test neither
+# that nor autumn.
+
+
+class _FakeStore:
+    """Stands in for `media`, recording what the route handed it."""
+
+    def __init__(self):
+        self.put_calls = []
+        self.blobs = {}
+        self.fail_put = None
+        self.fail_get = None
+
+    def put(self, data, ext, session="shared"):
+        self.put_calls.append((len(data), ext, session))
+        if self.fail_put:
+            raise self.fail_put
+        mid = f"{session}/deadbeef.{ext}"
+        self.blobs[mid] = (data, f"image/{ext}")
+        return mid
+
+    def get(self, media_id):
+        if self.fail_get:
+            raise self.fail_get
+        if media_id not in self.blobs:
+            raise KeyError(media_id)
+        return self.blobs[media_id]
+
+
+@pytest.fixture
+def media_server(app_server, monkeypatch):
+    import app_routes
+
+    base, _mgr, _state = app_server     # the fixture yields a 3-tuple
+    store = _FakeStore()
+    monkeypatch.setattr(app_routes, "media", store)
+    return base, store
+
+
+def _raw_post(base, path, body: bytes, extra=None):
+    req = urllib.request.Request(base + path, data=body, method="POST")
+    for k, v in (extra or {}).items():
+        req.add_header(k, v)
+    try:
+        r = urllib.request.urlopen(req, timeout=5)
+        return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers)
+
+
+def test_an_upload_is_stored_and_answered_with_a_url(media_server):
+    base, store = media_server
+    code, body, _ = _raw_post(base, "/api/media?ext=png&session=s1", b"\x89PNG fake")
+    assert code == 200
+    j = json.loads(body)
+    assert j["id"] == "s1/deadbeef.png"
+    assert j["url"] == "/api/media?id=s1/deadbeef.png"
+    assert store.put_calls == [(9, "png", "s1")]
+
+
+def test_an_upload_over_the_body_limit_is_refused_not_truncated(media_server, monkeypatch):
+    """`Request` reads at most 8 MiB and says nothing when it cuts.
+
+    Without this check the route would store a short file that looks fine
+    until someone renders it. The limit is lowered here rather than sending a
+    real 8 MiB: the server replies without draining the rest of the request, so
+    a genuinely oversized POST desynchronises the connection and the test hangs
+    on a response that is already written. Same code path, no dead socket.
+
+    Ablation: drop the Content-Length check in `_media_put` and this returns
+    200 with the store having been handed the bytes.
+    """
+    import app_routes
+
+    base, store = media_server
+    monkeypatch.setattr(app_routes, "BODY_LIMIT", 100)
+    code, body, _ = _raw_post(base, "/api/media?ext=png", b"x" * 200)
+    assert code == 413, body
+    assert "limit" in json.loads(body)["error"]
+    assert store.put_calls == [], "an oversized upload must not reach the store"
+
+
+def test_an_unsupported_type_is_a_400_and_never_reaches_the_store(media_server):
+    base, store = media_server
+    store.fail_put = ValueError("unsupported media type: 'exe'")
+    code, body, _ = _raw_post(base, "/api/media?ext=exe", b"MZ")
+    assert code == 400
+    assert "unsupported" in json.loads(body)["error"]
+
+
+def test_a_store_that_is_down_is_503_not_400(media_server):
+    """A caller can fix a 400 by sending something else; a 503 says the file was
+    fine and the cluster was not. Collapsing them hides an outage as user error."""
+    base, store = media_server
+    store.fail_put = RuntimeError("AUTUMN_MANAGER is unset")
+    code, body, _ = _raw_post(base, "/api/media?ext=png", b"\x89PNG")
+    assert code == 503
+    assert "could not store" in json.loads(body)["error"]
+
+
+def test_a_stored_file_is_served_back_with_its_type_and_cached_hard(media_server):
+    base, store = media_server
+    _raw_post(base, "/api/media?ext=png&session=s1", b"\x89PNG fake")
+    r = urllib.request.urlopen(base + "/api/media?id=s1/deadbeef.png", timeout=5)
+    assert r.read() == b"\x89PNG fake"
+    assert r.headers.get("Content-Type") == "image/png"
+    # The id is minted per upload and its bytes never change, so this is safe —
+    # and without it a re-rendered transcript refetches every image.
+    assert "immutable" in (r.headers.get("Cache-Control") or "")
+
+
+def test_fetching_without_an_id_is_400_and_an_unknown_id_is_404(media_server):
+    base, _ = media_server
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(base + "/api/media", timeout=5)
+    assert e.value.code == 400
+    with pytest.raises(urllib.error.HTTPError) as e2:
+        urllib.request.urlopen(base + "/api/media?id=s1/nope.png", timeout=5)
+    assert e2.value.code == 404

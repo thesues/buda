@@ -34,7 +34,13 @@
       </div>
       <div id="messages"></div>
       <form id="composer">
-        <textarea id="input" rows="1" placeholder="发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
+        <!-- Attachments sit ABOVE the textarea, not inside the text. What goes
+             into the message is a short URL; the bytes went to autumn when the
+             file was picked. -->
+        <div id="attachments" hidden></div>
+        <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+        <button id="attach" type="button" class="btn ghost" title="添加图片（也可直接粘贴或拖入）">📎</button>
+        <textarea id="input" rows="1" placeholder="发消息…  Enter 发送 · Shift+Enter 换行 · 图片可粘贴或拖入"></textarea>
         <button id="send" type="submit" class="btn">发送</button>
       </form>
     </section>

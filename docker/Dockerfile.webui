@@ -5,11 +5,25 @@
 # wanted and quietly break the other. `hermes_session_api.py` is executed by
 # HERMES' interpreter for exactly the same reason.
 #
-# There is no autumn client in this image and no `autumn-fuse`. This app reaches
-# retrieval through `memory-mcp` over HTTP MCP, so it holds no autumn credential
-# and — the part that actually matters — is NOT bound by autumn's WIRE lockstep.
-# A cluster wire bump does not require rebuilding this image, which is the whole
-# reason the MCP server grew an HTTP transport.
+# Retrieval still goes through `memory-mcp` over HTTP MCP. Media does not: the
+# app stores images and generated video in autumn through the PyO3 client,
+# built here from the autumn-rs image's own sources.
+#
+# That client IS the wire format, so this image is now bound to autumn's WIRE
+# lockstep: AUTUMN_IMAGE must name the same commit as the running cluster, and
+# a wire bump requires rebuilding this image with it. A mismatch does not fail
+# the handshake — it decodes garbage. The alternative was a FUSE mount, which
+# keeps the image unbound but puts the kernel in the path of every byte for a
+# whole-file read that wants one round trip; measured on this cluster, a FUSE
+# read costs ~2 ms of round trip plus the kernel's own overhead either way.
+#
+#   kubectl -n autumn get sts autumn-ps \
+#     -o jsonpath='{.spec.template.spec.containers[0].image}'   # the tag to pass
+
+# Must name the commit the cluster is running; see the note at the top.
+ARG AUTUMN_IMAGE=autumn-rs:latest
+# crates.io mirror for the wheel build, e.g. sparse+https://rsproxy.cn/index/
+ARG CARGO_MIRROR=
 
 ARG BASE_REGISTRY=
 # `library/` spelled out, not the bare `python:` Docker Hub lets you write.
@@ -19,6 +33,10 @@ ARG BASE_REGISTRY=
 # Dockerfile builds fine on a laptop. Docker Hub accepts both spellings, so the
 # explicit one is the one that works in both places.
 ARG PYTHON_IMAGE=library/python:3.12-slim-bookworm
+
+# Sources only; nothing from this stage ships except the built wheel.
+FROM ${AUTUMN_IMAGE} AS autumncore
+
 FROM ${BASE_REGISTRY}${PYTHON_IMAGE}
 
 ARG APT_MIRROR=
@@ -60,6 +78,26 @@ RUN set -eux; \
 # a failed patch must not fail the build, the image just keeps the tools it had.
 COPY webui/scripts/patch_acp_toolsets.py /tmp/patch_acp_toolsets.py
 RUN /opt/hermes/.venv/bin/python /tmp/patch_acp_toolsets.py && rm /tmp/patch_acp_toolsets.py
+
+# --- autumn's PyO3 client --------------------------------------------------- #
+# Sources come from the autumn-rs image, which ships them at
+# /usr/local/share/autumn/src precisely so consumers need not vendor a copy.
+# The wheel goes into HERMES' venv, not the system one: `main.py` runs under
+# that interpreter, so that is where `import autumn` has to resolve.
+COPY --from=autumncore /usr/local/share/autumn/src/ /autumn-src/
+RUN set -eux; \
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
+    . /root/.cargo/env; \
+    if [ -n "${CARGO_MIRROR}" ]; then \
+      mkdir -p /root/.cargo; \
+      printf '[source.crates-io]\nreplace-with = "m"\n[source.m]\nregistry = "%s"\n' "${CARGO_MIRROR}" > /root/.cargo/config.toml; \
+    fi; \
+    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir "maturin>=1,<2"; \
+    cd /autumn-src/python; \
+    /opt/hermes/.venv/bin/maturin build --release --interpreter /opt/hermes/.venv/bin/python --out /wheels; \
+    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir /wheels/*.whl; \
+    /opt/hermes/.venv/bin/python -c "import autumn; print('autumn client ok')"; \
+    rm -rf /root/.cargo /root/.rustup /autumn-src /wheels
 
 # --- the app ---------------------------------------------------------------- #
 RUN python -m pip install --no-cache-dir "aiohttp>=3.9"
