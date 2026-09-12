@@ -10,7 +10,7 @@
 # built here from the autumn-rs image's own sources.
 #
 # That client IS the wire format, so this image is now bound to autumn's WIRE
-# lockstep: AUTUMN_IMAGE must name the same commit as the running cluster, and
+# lockstep: AUTUMN_SHA must name the same commit as the running cluster, and
 # a wire bump requires rebuilding this image with it. A mismatch does not fail
 # the handshake — it decodes garbage. The alternative was a FUSE mount, which
 # keeps the image unbound but puts the kernel in the path of every byte for a
@@ -24,11 +24,11 @@
 # cluster runs; see the note at the top.
 #
 # Sources from codeload, not `FROM <private registry>/autumn-rs:<sha>`. The
-# image carries them at /usr/local/share/autumn/src and pulling that way is how
-# Dockerfile.freetoken-l3 does it — but that one is built by hand with
-# credentials, and this pipeline's builder has none for the private registry:
-# it PUSHES there, it does not pull. One GET against codeload either works or
-# fails loudly, and it makes the wire pin a git sha you can check out.
+# autumn image does carry them at /usr/local/share/autumn/src, and
+# Dockerfile.freetoken-l3 pulls them that way — but that one is built by hand
+# with credentials, and this pipeline's builder has none for the private
+# registry: it PUSHES there, it does not pull. One GET against codeload either
+# works or fails loudly, and it makes the wire pin a git sha you can check out.
 ARG AUTUMN_SHA=947bae0396481fe9e8586aae7eefa98852d2247d
 ARG AUTUMN_SPEC=https://codeload.github.com/journeymidnight/autumn-rs/tar.gz/${AUTUMN_SHA}
 # crates.io mirror for the wheel build. Defaulted, not empty: the CN build pool
@@ -43,6 +43,49 @@ ARG BASE_REGISTRY=
 # Dockerfile builds fine on a laptop. Docker Hub accepts both spellings, so the
 # explicit one is the one that works in both places.
 ARG PYTHON_IMAGE=library/python:3.12-slim-bookworm
+
+# The Rust toolchain, taken from the same Hub cache as everything else rather
+# than downloaded. `curl https://sh.rustup.rs | sh` is one more network call
+# that can fail inside a build whose logs this pipeline only returns the tail
+# of; an image either pulls or it does not, and BASE_REGISTRY is an arg the
+# pipeline actually passes.
+FROM ${BASE_REGISTRY}library/rust:1.93-bookworm AS rusttool
+
+# The wheel is built against the SAME interpreter the runtime uses — a
+# cp312 wheel does not install into a cp311 venv and vice versa — so this
+# stage starts from the runtime's own base and borrows only the toolchain.
+FROM ${BASE_REGISTRY}${PYTHON_IMAGE} AS wheel
+ARG APT_MIRROR=
+ARG PIP_INDEX_URL=https://pypi.org/simple/
+ARG CARGO_MIRROR=
+ARG AUTUMN_SPEC
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH \
+    PIP_INDEX_URL=${PIP_INDEX_URL}
+COPY --from=rusttool /usr/local/cargo /usr/local/cargo
+COPY --from=rusttool /usr/local/rustup /usr/local/rustup
+RUN set -eux; \
+    if [ -n "${APT_MIRROR}" ]; then \
+      sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources || true; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config; \
+    rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    mkdir -p /autumn-src; \
+    curl -fsSL "${AUTUMN_SPEC}" | tar xz --strip-components=1 -C /autumn-src; \
+    test -f /autumn-src/python/Cargo.toml
+RUN set -eux; \
+    if [ -n "${CARGO_MIRROR}" ]; then \
+      printf '[source.crates-io]\nreplace-with = "m"\n[source.m]\nregistry = "%s"\n' "${CARGO_MIRROR}" \
+        > ${CARGO_HOME}/config.toml; \
+    fi; \
+    python -m pip install --no-cache-dir "maturin>=1,<2"; \
+    cd /autumn-src/python; \
+    maturin build --release --interpreter python3 --out /wheels; \
+    ls -l /wheels
+
 FROM ${BASE_REGISTRY}${PYTHON_IMAGE}
 
 ARG APT_MIRROR=
@@ -86,29 +129,11 @@ COPY webui/scripts/patch_acp_toolsets.py /tmp/patch_acp_toolsets.py
 RUN /opt/hermes/.venv/bin/python /tmp/patch_acp_toolsets.py && rm /tmp/patch_acp_toolsets.py
 
 # --- autumn's PyO3 client --------------------------------------------------- #
-# The wheel goes into HERMES' venv, not the system one: `main.py` runs under
-# that interpreter, so that is where `import autumn` has to resolve.
-#
-# `test -f` right after the untar, because a codeload 404 for a bad sha returns
-# a valid gzip of an error page and `tar xz` is happy with it — the build would
-# then fail thousands of lines later inside cargo, about a missing manifest.
-ARG AUTUMN_SPEC
-RUN set -eux; \
-    mkdir -p /autumn-src; \
-    curl -fsSL "${AUTUMN_SPEC}" | tar xz --strip-components=1 -C /autumn-src; \
-    test -f /autumn-src/python/Cargo.toml; \
-    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
-    . /root/.cargo/env; \
-    if [ -n "${CARGO_MIRROR}" ]; then \
-      mkdir -p /root/.cargo; \
-      printf '[source.crates-io]\nreplace-with = "m"\n[source.m]\nregistry = "%s"\n' "${CARGO_MIRROR}" > /root/.cargo/config.toml; \
-    fi; \
-    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir "maturin>=1,<2"; \
-    cd /autumn-src/python; \
-    /opt/hermes/.venv/bin/maturin build --release --interpreter /opt/hermes/.venv/bin/python --out /wheels; \
-    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir /wheels/*.whl; \
-    /opt/hermes/.venv/bin/python -c "import autumn; print('autumn client ok')"; \
-    rm -rf /root/.cargo /root/.rustup /autumn-src /wheels
+# Built in its own stage; only the wheel crosses into the runtime image.
+COPY --from=wheel /wheels/ /wheels/
+RUN /opt/hermes/.venv/bin/python -m pip install --no-cache-dir /wheels/*.whl \
+ && /opt/hermes/.venv/bin/python -c "import autumn; print('autumn client ok')" \
+ && rm -rf /wheels
 
 # --- the app ---------------------------------------------------------------- #
 RUN python -m pip install --no-cache-dir "aiohttp>=3.9"
