@@ -131,7 +131,10 @@ RUN /opt/hermes/.venv/bin/python /tmp/patch_acp_toolsets.py && rm /tmp/patch_acp
 # --- autumn's PyO3 client --------------------------------------------------- #
 # Built in its own stage; only the wheel crosses into the runtime image.
 COPY --from=wheel /wheels/ /wheels/
-RUN /opt/hermes/.venv/bin/python -m pip install --no-cache-dir /wheels/*.whl \
+# `uv pip`, not `python -m pip`: the hermes venv is made by `uv venv`, which
+# does not put pip inside it, so `-m pip` there is "No module named pip". This
+# is the same form the hermes install above uses; the two must not drift.
+RUN VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache-dir /wheels/*.whl \
  && /opt/hermes/.venv/bin/python -c "import autumn; print('autumn client ok')" \
  && rm -rf /wheels
 
