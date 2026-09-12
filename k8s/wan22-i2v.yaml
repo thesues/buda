@@ -1,4 +1,4 @@
-# Wan2.2 text-to-video on the H20 node, reading its weights from autumn.
+# Wan2.2 image-to-video on the H20 node, reading its weights from autumn.
 #
 # Config is the one vLLM-Omni's own dashboard measured, so the number this
 # produces is comparable: cfg-parallel 2 x ulysses 2 = 4 GPUs, VAE patch
@@ -6,6 +6,14 @@
 # at 6 steps is 117-125 s on 4x A100-80GB. H20 has roughly half an A100's dense
 # BF16 throughput and video diffusion is compute-bound, so expect slower; the
 # point of this manifest is to find out by how much.
+#
+# The startup timeouts are raised from their defaults because the defaults are
+# shorter than this load. Reading ~127 GB off the autumn mount took 16 minutes;
+# `init_timeout` is 600 s and `stage_init_timeout` 300 s, so every worker
+# reported "ready to receive requests" and the orchestrator had already given
+# up on them -- `TimeoutError: Orchestrator did not become ready within 600s`,
+# after a full successful load, sixteen minutes in. Nothing was wrong with the
+# model or the mount; the clock was just set for a local disk.
 #
 # No image is built for this. `vllm/vllm-openai:v0.28.0` comes from the Volces
 # hub cache (Docker Hub itself is unreachable from these nodes) and vllm-omni
@@ -17,19 +25,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: wan22-t2v
+  name: wan22-i2v
   namespace: autumn
-  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-i2v }
 spec:
   replicas: 1
   # Recreate, not RollingUpdate: a surge-first rollout asks for 4 more GPUs
   # while the old pod still holds its 4, and deadlocks on a node with 8.
   strategy: { type: Recreate }
   selector:
-    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-i2v }
   template:
     metadata:
-      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-i2v }
     spec:
       enableServiceLinks: false   # k8s injects <SVC>_PORT=tcp://... which collides with the entrypoint's own names
       nodeSelector:
@@ -67,7 +75,7 @@ spec:
             - |
               set -euo pipefail
               MP=/mnt/autumn
-              MODEL="$MP/models/wan22-t2v-a14b"
+              MODEL="$MP/models/wan22-i2v-a14b"
 
               # fuse3 for fusermount3, which autumn-fuse needs to unmount. The
               # `|| true` on update is load-bearing: the image carries an apt
@@ -116,13 +124,15 @@ spec:
               # of A14B transformers.
               exec vllm serve "$MODEL" \
                 --omni \
-                --served-model-name wan22-t2v \
+                --served-model-name wan22-i2v \
                 --host 0.0.0.0 --port 8000 \
                 --use-hsdp \
                 --cfg-parallel-size 2 \
                 --ulysses-degree 2 \
                 --vae-patch-parallel-size 4 \
-                --vae-use-tiling
+                --vae-use-tiling \
+                --init-timeout 3600 \
+                --stage-init-timeout 3600
           env:
             - { name: CUDA_DEVICE_ORDER, value: "PCI_BUS_ID" }
             - { name: VLLM_LOGGING_LEVEL, value: "INFO" }
@@ -131,13 +141,28 @@ spec:
             # container, because the mount lives in it.
             privileged: true
           resources:
+            # 200Gi OOM-killed this every time, at the exact moment the FUSE
+            # read counter reached the checkpoint's full 127 GB: memory climbed
+            # 10 GiB -> 184 GiB -> 203 GiB over six minutes and then the kernel
+            # took it. Three of the terminations were labelled OOMKilled
+            # outright; the others read `exitCode 137, reason: Error`, which is
+            # the same event when the kernel takes a child rather than the
+            # cgroup's main process.
+            #
+            # Both halves are real and neither is waste: the mmap'd file pages
+            # ARE the read (diffusers loads safetensors by mapping them), and
+            # the tensors materialise beside them before HSDP shards them out
+            # to the four GPUs. 127 GB of each does not fit in 200.
+            #
+            # The node has 1.88 TiB and ~556 GiB of limits committed without
+            # this pod.
             requests:
               cpu: "16"
-              memory: 200Gi
+              memory: 450Gi
               nvidia.com/gpu: 4
             limits:
               cpu: "16"
-              memory: 200Gi
+              memory: 450Gi
               nvidia.com/gpu: 4
           volumeMounts:
             - { name: mnt, mountPath: /mnt/autumn }
@@ -165,10 +190,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: wan22-t2v
+  name: wan22-i2v
   namespace: autumn
-  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-i2v }
 spec:
-  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-t2v }
+  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: wan22-i2v }
   ports:
     - { name: http, port: 8000, targetPort: 8000 }

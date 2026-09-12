@@ -107,6 +107,47 @@ spec:
                   "${LLM_CONTEXT_LENGTH:-54000}" || true
               fi
 
+              # The Wan2.2 video provider and the skill that drives it.
+              #
+              # They live in the IMAGE and are synced into HERMES_HOME at every
+              # start, rather than being copied into the PVC once by hand.
+              # HERMES_HOME is a PVC, so a hand-copy would survive -- and would
+              # then be a version of the plugin that no commit describes, which
+              # is how the last config drifted. `hermes_cli.plugins` looks for
+              # user plugins at `get_hermes_home()/plugins/<name>/`, needing a
+              # plugin.yaml and an `__init__.py` with `register(ctx)`.
+              #
+              # rsync semantics by hand: replace the directory rather than
+              # merging into it, so a file deleted in the repo does not live on
+              # in the volume forever.
+              for kind in plugins skills; do
+                if [ -d "/app/hermes/$kind" ]; then
+                  for d in /app/hermes/$kind/*/; do
+                    [ -d "$d" ] || continue
+                    n="$(basename "$d")"
+                    rm -rf "${HERMES_HOME:-/opt/data}/$kind/$n"
+                    mkdir -p "${HERMES_HOME:-/opt/data}/$kind"
+                    cp -a "$d" "${HERMES_HOME:-/opt/data}/$kind/$n"
+                    echo "installed $kind/$n"
+                  done
+                fi
+              done
+
+              # A user plugin is discovered but NOT loaded unless it is in
+              # `plugins.enabled` — discovery logs "Skipping 'wan22' (not in
+              # plugins.enabled)" and otherwise says nothing, so the symptom is
+              # a model that reports the tool does not exist. Enabling is
+              # idempotent.
+              hermes plugins enable wan22 || \
+                echo "WARN: could not enable the wan22 plugin" >&2
+
+              # Which video backend `video_generate` dispatches to. With a
+              # single registered provider hermes would pick it anyway, but
+              # naming it means adding a second one later does not silently
+              # change which one answers.
+              hermes config set video_gen.provider wan22 || \
+                echo "WARN: could not select the video provider" >&2
+
               # hermes' AIAgent refuses any model whose context window is under
               # MINIMUM_CONTEXT_LENGTH = 64_000, a constant in its `agent`
               # package. FreeToken's real ceiling here is 62,080 counting
@@ -178,7 +219,12 @@ spec:
             # ignored and the session keeps the full hermes-acp toolset.
             # `mcp-<server>` toolsets are appended after this list, so narrowing
             # it cannot drop retrieval.
-            - { name: HERMES_ACP_TOOLSETS, value: "file,todo,memory,skills,vision" }
+            # `video_gen` carries exactly one tool, `video_generate`, and it
+            # covers both directions: prompt alone is text-to-video, prompt +
+            # image_url is image-to-video, and the active backend routes on
+            # that one condition. Without the toolset the tool is never
+            # offered, and the model invents a curl instead.
+            - { name: HERMES_ACP_TOOLSETS, value: "file,todo,memory,skills,vision,video_gen" }
             # `terminal` is deliberately absent. With a shell in hand the model
             # takes the shortcut -- observed locally reading the corpus with
             # `sed` instead of calling the retrieval server, which also means a
