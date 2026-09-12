@@ -60,6 +60,41 @@ _fs = None          # type: ignore[var-annotated]
 _fs_failed: Optional[str] = None
 
 
+def _read_credential(path: str) -> Tuple[str, bytes]:
+    """`(principal, raw secret)` from a credential file, or `("", b"")`.
+
+    Accepts the three shapes the Rust reader accepts: a `credential: <hex>`
+    line with an optional `principal: <name>`, two bare lines, or a single bare
+    hex line (anonymous). Anything else is left to fail at connect time with
+    the cluster's own message rather than being guessed at here.
+    """
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as e:
+        log.info("no credential at %s (%s); connecting anonymously", path, e)
+        return "", b""
+
+    principal, hexed = "", ""
+    bare: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("principal:"):
+            principal = line.split(":", 1)[1].strip()
+        elif line.startswith("credential:"):
+            hexed = line.split(":", 1)[1].strip()
+        else:
+            bare.append(line)
+    if not hexed and bare:
+        hexed = bare[-1]
+        if len(bare) >= 2 and not principal:
+            principal = bare[0]
+    if not hexed:
+        return "", b""
+    return principal, bytes.fromhex(hexed)
+
+
 def _connect():
     """One `Fs` for the process, built on first use.
 
@@ -81,10 +116,26 @@ def _connect():
             log.debug("set_transport(%s) refused; assuming it is already set", transport)
 
         mgr = os.environ.get("AUTUMN_MANAGER", "")
-        cred = os.environ.get("AUTUMN_FS_CREDENTIAL", "/etc/autumn/cred/fs.cred")
         if not mgr:
             raise RuntimeError("AUTUMN_MANAGER is unset; media storage has no cluster")
-        _fs = autumn.Fs.connect(mgr, credential_file=cred)
+
+        # `Fs.connect` takes RAW credential bytes and a principal, both-or-
+        # neither — not a path. The file's format has two readers already
+        # (`autumn_client::parse_credential_text` and autumn_kvcache's
+        # `read_credential_pair`); this is a third, kept deliberately small.
+        #
+        # Raw bytes, not the ASCII hex: the manager stores the SHA-256 of the
+        # decoded secret, so passing the hex through authenticates as something
+        # else and every protected-prefix op fails with PermissionDenied once
+        # enforcement is on. That is documented where the other reader lives,
+        # and it is the reason this does not just hand the file's text over.
+        principal, secret = _read_credential(
+            os.environ.get("AUTUMN_FS_CREDENTIAL", "/etc/autumn/cred/fs.cred")
+        )
+        if principal:
+            _fs = autumn.Fs.connect(mgr, principal=principal, credential=secret)
+        else:
+            _fs = autumn.Fs.connect(mgr)
         _fs_failed = None
         log.info("media store connected: manager=%s root=%s", mgr, ROOT)
         return _fs
