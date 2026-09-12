@@ -20,12 +20,17 @@
 #   kubectl -n autumn get sts autumn-ps \
 #     -o jsonpath='{.spec.template.spec.containers[0].image}'   # the tag to pass
 
-# Must name the commit the cluster is running; see the note at the top. This is
-# a real tag and not `:latest` on purpose — the build pipeline passes no
-# build-args, and a default that cannot be pulled fails the build while a
-# default that CAN be pulled but is the wrong commit builds a client that
-# decodes garbage. Update it in the same change that bumps the cluster.
-ARG AUTUMN_IMAGE=dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:947bae0396481fe9e8586aae7eefa98852d2247d
+# The autumn commit whose client this image carries. It MUST be the one the
+# cluster runs; see the note at the top.
+#
+# Sources from codeload, not `FROM <private registry>/autumn-rs:<sha>`. The
+# image carries them at /usr/local/share/autumn/src and pulling that way is how
+# Dockerfile.freetoken-l3 does it — but that one is built by hand with
+# credentials, and this pipeline's builder has none for the private registry:
+# it PUSHES there, it does not pull. One GET against codeload either works or
+# fails loudly, and it makes the wire pin a git sha you can check out.
+ARG AUTUMN_SHA=947bae0396481fe9e8586aae7eefa98852d2247d
+ARG AUTUMN_SPEC=https://codeload.github.com/journeymidnight/autumn-rs/tar.gz/${AUTUMN_SHA}
 # crates.io mirror for the wheel build. Defaulted, not empty: the CN build pool
 # reaches crates.io slowly enough that the wheel step times out without it.
 ARG CARGO_MIRROR=sparse+https://rsproxy.cn/index/
@@ -38,10 +43,6 @@ ARG BASE_REGISTRY=
 # Dockerfile builds fine on a laptop. Docker Hub accepts both spellings, so the
 # explicit one is the one that works in both places.
 ARG PYTHON_IMAGE=library/python:3.12-slim-bookworm
-
-# Sources only; nothing from this stage ships except the built wheel.
-FROM ${AUTUMN_IMAGE} AS autumncore
-
 FROM ${BASE_REGISTRY}${PYTHON_IMAGE}
 
 ARG APT_MIRROR=
@@ -85,12 +86,17 @@ COPY webui/scripts/patch_acp_toolsets.py /tmp/patch_acp_toolsets.py
 RUN /opt/hermes/.venv/bin/python /tmp/patch_acp_toolsets.py && rm /tmp/patch_acp_toolsets.py
 
 # --- autumn's PyO3 client --------------------------------------------------- #
-# Sources come from the autumn-rs image, which ships them at
-# /usr/local/share/autumn/src precisely so consumers need not vendor a copy.
 # The wheel goes into HERMES' venv, not the system one: `main.py` runs under
 # that interpreter, so that is where `import autumn` has to resolve.
-COPY --from=autumncore /usr/local/share/autumn/src/ /autumn-src/
+#
+# `test -f` right after the untar, because a codeload 404 for a bad sha returns
+# a valid gzip of an error page and `tar xz` is happy with it — the build would
+# then fail thousands of lines later inside cargo, about a missing manifest.
+ARG AUTUMN_SPEC
 RUN set -eux; \
+    mkdir -p /autumn-src; \
+    curl -fsSL "${AUTUMN_SPEC}" | tar xz --strip-components=1 -C /autumn-src; \
+    test -f /autumn-src/python/Cargo.toml; \
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \
     . /root/.cargo/env; \
     if [ -n "${CARGO_MIRROR}" ]; then \
