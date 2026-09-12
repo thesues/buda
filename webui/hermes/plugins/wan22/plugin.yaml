@@ -1,0 +1,6 @@
+name: wan22
+version: 0.1.0
+description: >-
+  Wan2.2 video generation served by vLLM-Omni in this cluster. Registers a
+  video_gen provider so the built-in `video_generate` tool has a backend.
+author: buda
