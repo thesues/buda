@@ -364,3 +364,48 @@ def test_stop_releases_a_turn_parked_on_an_approval(monkeypatch):
     assert released.get("choice") == "deny", "stop did not deny the parked approval"
 
 
+
+
+def test_the_session_key_is_visible_from_a_thread_hermes_starts(monkeypatch):
+    """A contextvar does not cross a `threading.Thread`.
+
+    A new thread begins with an EMPTY context, not a copy of its parent's, and
+    hermes dispatches tools on threads of its own. So the key bound with
+    `set_current_session_key` was invisible where the tool actually asked:
+    hermes queued the approval under `"default"`, looked for a notify callback
+    under `"default"`, found none, and the turn waited forever with no card on
+    screen. `get_current_session_key()` falls back to HERMES_SESSION_KEY, which
+    is process-wide and therefore does cross.
+
+    Ablation: drop the `os.environ["HERMES_SESSION_KEY"]` line and this fails.
+    """
+    import os
+    import threading
+
+    _fake_approval(monkeypatch)
+    m = _mgr(monkeypatch)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    s = m.start(session_id="s-thread", text="x", endpoint=_ep())
+    assert _wait_done(s)
+
+    seen = {}
+    t = threading.Thread(target=lambda: seen.setdefault("key", os.environ.get("HERMES_SESSION_KEY")))
+    t.start(); t.join(timeout=5)
+    assert seen["key"] == "s-thread", (
+        "a thread hermes starts cannot see the session key, so it will ask "
+        "under 'default' and no card will ever be shown"
+    )
+
+
+def test_the_gateway_context_switch_is_on(monkeypatch):
+    """`_is_gateway_approval_context()` reads HERMES_GATEWAY_SESSION. Without
+    it hermes takes the CLI branch — the thread-local callback and then the
+    `input()` that never returns."""
+    import os
+
+    _fake_approval(monkeypatch)
+    m = _mgr(monkeypatch)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    s = m.start(session_id="s1", text="x", endpoint=_ep())
+    assert _wait_done(s)
+    assert os.environ.get("HERMES_GATEWAY_SESSION") == "1"

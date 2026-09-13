@@ -196,10 +196,28 @@ class TurnManager:
             os.environ["HERMES_GATEWAY_SESSION"] = "1"
             os.environ["HERMES_INTERACTIVE"] = "1"
             key = self._approval_key(stream)
-            # A contextvar, so every thread hermes starts for this turn agrees
-            # on which conversation is asking.
+
+            # BOTH, and the env var is the one that carries.
+            #
+            # `get_current_session_key()` resolves contextvar → HERMES_SESSION_KEY
+            # → "default". A contextvar is NOT inherited by a thread started with
+            # `threading.Thread`: a new thread begins with an EMPTY context, not a
+            # copy of its parent's. hermes dispatches tools on such threads, so it
+            # asked under "default" while the notify callback was registered under
+            # the conversation's id — no callback found, no card, and the turn
+            # waited forever. That is the same wedge as before wearing a different
+            # hat: the first was a thread-local callback, this is a thread-local
+            # KEY.
+            #
+            # os.environ is process-wide and therefore thread-visible. It is
+            # correct here because this app runs one turn at a time per endpoint
+            # (`maxConcurrent`), and a second concurrent turn WOULD cross the two
+            # keys — if that limit is ever raised, this has to become a per-thread
+            # binding installed on hermes' side instead.
+            os.environ["HERMES_SESSION_KEY"] = key
             self._approval_tokens[stream.stream_id] = ap.set_current_session_key(key)
             ap.register_gateway_notify(key, lambda data: self._notify_approval(stream, key, data))
+            log.info("approval hook armed for %s (gateway)", key)
         except Exception:  # noqa: BLE001 -- a missing hook must not fail the turn
             log.warning("could not install the approval hook", exc_info=True)
 
