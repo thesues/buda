@@ -941,23 +941,67 @@ function renderAttachments() {
 // and was here first. Shadowing it made `attach(liveStream, 0)` — the call that
 // reconnects to a turn already running — upload a stream id as if it were a
 // file, so a conversation that was replying rendered nothing at all.
-async function attachFile(file) {
-  const ext = (file.name.split(".").pop() || "").toLowerCase();
+// A phone photo is 10-20 MB and 12 megapixels; the video model draws 1280x720.
+// Those pixels are thrown away downstream either way, so throw them away here,
+// where it also turns "图片太大" into a working upload.
+const MAX_EDGE = 1920;          // generous: bigger than any use we have for it
+const UPLOAD_LIMIT = 8 * 1024 * 1024;
+
+async function shrink(file) {
+  // `from-image` so a photo taken sideways is uploaded the way it looked, not
+  // the way its pixels are stored -- EXIF orientation is otherwise applied by
+  // the browser at DISPLAY time and lost the moment it is redrawn to a canvas.
+  let bmp;
+  try {
+    bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  } catch (_) {
+    return file;                // not a raster image we can decode; let it pass
+  }
+  const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
+  const needsResize = scale < 1;
+  const needsReencode = file.size > UPLOAD_LIMIT;
+  if (!needsResize && !needsReencode) { bmp.close?.(); return file; }
+
+  const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").drawImage(bmp, 0, 0, w, h);
+  bmp.close?.();
+
+  const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.88));
+  // Re-encoding can grow a file -- a small flat PNG becomes a bigger JPEG. Keep
+  // whichever is smaller, unless the original is over the limit and this is not.
+  if (!blob || (blob.size >= file.size && file.size <= UPLOAD_LIMIT)) return file;
+  return new File([blob], file.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+}
+
+async function attachFile(original) {
   const ok = ["png", "jpg", "jpeg", "webp", "gif"];
-  if (!ok.includes(ext)) { status(`不支持的图片格式：${ext || "?"}`); return; }
-  // The server reads at most 8 MiB of body and does not report truncation, so
-  // a larger file would be stored short and look corrupt only when rendered.
-  if (file.size > 8 * 1024 * 1024) {
-    status(`图片 ${Math.round(file.size / 1048576)} MB，超过 8 MB 上限`);
+  const ext0 = (original.name.split(".").pop() || "").toLowerCase();
+  if (!ok.includes(ext0)) { status(`不支持的图片格式：${ext0 || "?"}`); return; }
+
+  status(`处理 ${original.name}…`);
+  let file = original;
+  try { file = await shrink(original); } catch (_) { file = original; }
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+
+  // The backstop, after shrinking rather than instead of it. The server reads
+  // at most 8 MiB of body and does NOT report truncation, so anything past it
+  // would be stored short and look corrupt only when rendered.
+  if (file.size > UPLOAD_LIMIT) {
+    status(`图片 ${(file.size / 1048576).toFixed(1)} MB，缩小后仍超过 8 MB 上限`);
     return;
   }
-  status(`上传 ${file.name}…`);
+  const saved = original.size - file.size;
+  status(saved > 0
+    ? `上传 ${original.name}（${(original.size / 1048576).toFixed(1)} → ${(file.size / 1048576).toFixed(1)} MB）…`
+    : `上传 ${original.name}…`);
   try {
     const q = new URLSearchParams({ ext, session: S.session || "shared" });
     const r = await fetch(`/api/media?${q}`, { method: "POST", body: file });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-    PENDING.push({ id: j.id, url: j.url, name: file.name, kind: "image" });
+    PENDING.push({ id: j.id, url: j.url, name: original.name, kind: "image" });
     renderAttachments();
     status("");
   } catch (e) {

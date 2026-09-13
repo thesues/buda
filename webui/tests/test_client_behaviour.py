@@ -371,3 +371,42 @@ def test_the_upload_helper_does_not_shadow_the_sse_subscriber():
     # The one that owns the name takes (streamId, afterSeq).
     assert "seq" in defs[0].lower(), f"the surviving `attach` is not the subscriber: attach({defs[0]})"
     assert "function attachFile(" in js, "the upload helper should be `attachFile`"
+
+
+def test_an_oversized_image_is_shrunk_before_it_is_refused():
+    """"Too large" was the entire handling for a phone photo.
+
+    A 12-megapixel JPEG is 10-20 MB and the video model draws 1280x720, so the
+    pixels are discarded downstream regardless — discarding them in the browser
+    is both cheaper and the difference between a working upload and a refusal.
+
+    Three things have to hold together and each has bitten somewhere:
+
+    * the size check runs AFTER the shrink, or shrinking is dead code;
+    * orientation comes `from-image`, or a photo taken sideways uploads
+      sideways — the browser applies EXIF at display time and loses it the
+      moment the image is redrawn into a canvas;
+    * a re-encode that came out BIGGER is discarded, because a small flat PNG
+      becomes a larger JPEG and "helpfully" doubling a 200 KB file is a bug.
+
+    Ablation: move the limit check above the `shrink` call and the first
+    assertion fails.
+    """
+    js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    body = js[js.index("async function attachFile("):]
+    body = body[:body.index("function wireAttachments")]
+
+    shrink_at = body.index("shrink(original)")
+    limit_at = body.index("> UPLOAD_LIMIT")
+    assert shrink_at < limit_at, (
+        "the size check runs before the shrink, so shrinking can never rescue "
+        "an oversized file"
+    )
+
+    shrink_fn = js[js.index("async function shrink("):js.index("async function attachFile(")]
+    assert 'imageOrientation: "from-image"' in shrink_fn, (
+        "EXIF orientation is dropped when the image is redrawn to a canvas"
+    )
+    assert "blob.size >= file.size" in shrink_fn, (
+        "a re-encode that grew the file must be discarded, not uploaded"
+    )
