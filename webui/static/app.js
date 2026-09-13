@@ -59,34 +59,12 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     node.setAttribute("rel", "noopener noreferrer");
   }
 });
-// Media stored in autumn comes back as a link to our own endpoint. Markdown
-// renders that as an <a>; turn the ones that point at media into the element
-// that actually shows it. Done after sanitising, on the parsed DOM, so nothing
-// here re-introduces markup the sanitiser just removed.
-const MEDIA_HREF = /^\/api\/media\?id=/;
-const VIDEO_EXT = /\.(mp4|webm)(?:$|[?&])/i;
-
-function inlineMedia(root) {
-  root.querySelectorAll('a[href^="/api/media"]').forEach((a) => {
-    const href = a.getAttribute("href") || "";
-    if (!MEDIA_HREF.test(href)) return;
-    const el = VIDEO_EXT.test(href)
-      ? Object.assign(document.createElement("video"), {
-          src: href, controls: true, loop: true, playsInline: true, preload: "metadata",
-        })
-      : Object.assign(document.createElement("img"), { src: href, loading: "lazy" });
-    el.className = "media";
-    a.replaceWith(el);
-  });
-  return root;
-}
-
 const renderMD = (src) => {
   const box = document.createElement("div");
   box.innerHTML = DOMPurify.sanitize(
     marked.parse(src || "", { gfm: true, breaks: true }),
   );
-  return inlineMedia(box).innerHTML;
+  return box.innerHTML;
 };
 
 const S = {
@@ -927,151 +905,10 @@ async function newSession() {
 }
 
 /* ---------- sending ---------- */
-// ── attachments ────────────────────────────────────────────────────────────
-//
-// The bytes go to autumn the moment a file is picked, and what reaches the
-// message is the URL they came back as. The version this replaces pasted a
-// data URL into the text, which is the transcript — so it was re-sent to the
-// model on every later turn of the conversation, filled the reader's screen,
-// and hermes' own vision tool died on it with "File name too long". A 5 KB
-// PNG is small enough that doing it the wrong way looks fine.
-
-const PENDING = [];   // { id, url, name, kind }
-
-function renderAttachments() {
-  const box = $("#attachments");
-  box.innerHTML = "";
-  box.hidden = PENDING.length === 0;
-  PENDING.forEach((a, i) => {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    const thumb = document.createElement("img");
-    thumb.src = a.url; thumb.alt = a.name; thumb.loading = "lazy";
-    const x = document.createElement("button");
-    x.type = "button"; x.textContent = "×"; x.title = "移除";
-    x.onclick = () => { PENDING.splice(i, 1); renderAttachments(); };
-    chip.append(thumb, x);
-    box.append(chip);
-  });
-}
-
-// `attachFile`, not `attach`: `attach(streamId, seq)` is the SSE subscriber
-// and was here first. Shadowing it made `attach(liveStream, 0)` — the call that
-// reconnects to a turn already running — upload a stream id as if it were a
-// file, so a conversation that was replying rendered nothing at all.
-// A phone photo is 10-20 MB and 12 megapixels; the video model draws 1280x720.
-// Those pixels are thrown away downstream either way, so throw them away here,
-// where it also turns "图片太大" into a working upload.
-const MAX_EDGE = 1920;          // generous: bigger than any use we have for it
-const UPLOAD_LIMIT = 8 * 1024 * 1024;
-
-async function shrink(file) {
-  // `from-image` so a photo taken sideways is uploaded the way it looked, not
-  // the way its pixels are stored -- EXIF orientation is otherwise applied by
-  // the browser at DISPLAY time and lost the moment it is redrawn to a canvas.
-  let bmp;
-  try {
-    bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-  } catch (_) {
-    return file;                // not a raster image we can decode; let it pass
-  }
-  const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
-  const needsResize = scale < 1;
-  const needsReencode = file.size > UPLOAD_LIMIT;
-  if (!needsResize && !needsReencode) { bmp.close?.(); return file; }
-
-  const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  c.getContext("2d").drawImage(bmp, 0, 0, w, h);
-  bmp.close?.();
-
-  const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.88));
-  // Re-encoding can grow a file -- a small flat PNG becomes a bigger JPEG. Keep
-  // whichever is smaller, unless the original is over the limit and this is not.
-  if (!blob || (blob.size >= file.size && file.size <= UPLOAD_LIMIT)) return file;
-  return new File([blob], file.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
-}
-
-async function attachFile(original) {
-  const ok = ["png", "jpg", "jpeg", "webp", "gif"];
-  const ext0 = (original.name.split(".").pop() || "").toLowerCase();
-  if (!ok.includes(ext0)) { status(`不支持的图片格式：${ext0 || "?"}`); return; }
-
-  status(`处理 ${original.name}…`);
-  let file = original;
-  try { file = await shrink(original); } catch (_) { file = original; }
-  const ext = (file.name.split(".").pop() || "").toLowerCase();
-
-  // The backstop, after shrinking rather than instead of it. The server reads
-  // at most 8 MiB of body and does NOT report truncation, so anything past it
-  // would be stored short and look corrupt only when rendered.
-  if (file.size > UPLOAD_LIMIT) {
-    status(`图片 ${(file.size / 1048576).toFixed(1)} MB，缩小后仍超过 8 MB 上限`);
-    return;
-  }
-  const saved = original.size - file.size;
-  status(saved > 0
-    ? `上传 ${original.name}（${(original.size / 1048576).toFixed(1)} → ${(file.size / 1048576).toFixed(1)} MB）…`
-    : `上传 ${original.name}…`);
-  try {
-    const q = new URLSearchParams({ ext, session: S.session || "shared" });
-    const r = await fetch(`/api/media?${q}`, { method: "POST", body: file });
-    // NOT `await r.json()` unguarded. Between us and this endpoint sits a
-    // gateway that answers its own failures in PLAIN TEXT — a pod mid-rollout
-    // gets "no healthy upstream", and parsing that as JSON reports
-    // `unexpected token 'o'`, which tells the reader nothing about what went
-    // wrong and points at the wrong layer entirely.
-    const body = await r.text();
-    let j = {};
-    try { j = JSON.parse(body); } catch (_) { j = {}; }
-    if (!r.ok) {
-      const why = j.error || body.trim().slice(0, 120) || `HTTP ${r.status}`;
-      throw new Error(r.status === 503 || /no healthy upstream/i.test(body)
-        ? "服务正在重启，稍后再试"
-        : why);
-    }
-    PENDING.push({ id: j.id, url: j.url, name: original.name, kind: "image" });
-    renderAttachments();
-    status("");
-  } catch (e) {
-    status(`上传失败：${e.message}`);
-  }
-}
-
-function wireAttachments() {
-  const input = $("#input");
-  $("#attach").onclick = () => $("#file-input").click();
-  $("#file-input").onchange = (e) => {
-    [...e.target.files].forEach(attachFile);
-    e.target.value = "";             // same file twice in a row must still fire
-  };
-  // Paste. A screenshot arrives as a file with no name, so give it one.
-  input.addEventListener("paste", (e) => {
-    const files = [...(e.clipboardData?.files || [])];
-    if (!files.length) return;
-    e.preventDefault();
-    files.forEach((f) => attachFile(f.name ? f : new File([f], `pasted.${(f.type.split("/")[1] || "png")}`, { type: f.type })));
-  });
-  // Drop, on the whole composer rather than the textarea alone — aiming at a
-  // one-line input is a worse target than the box around it.
-  const form = $("#composer");
-  ["dragenter", "dragover"].forEach((t) =>
-    form.addEventListener(t, (e) => { e.preventDefault(); form.classList.add("dropping"); }));
-  ["dragleave", "drop"].forEach((t) =>
-    form.addEventListener(t, () => form.classList.remove("dropping")));
-  form.addEventListener("drop", (e) => {
-    e.preventDefault();
-    [...(e.dataTransfer?.files || [])].forEach(attachFile);
-  });
-}
-
 async function send() {
   const input = $("#input");
-  let text = input.value.trim();
-  // An image with no words is a real message here -- "make this move" is often
-  // the whole intent -- so only refuse when there is neither.
-  if (!text && !PENDING.length) return;
+  const text = input.value.trim();
+  if (!text) return;
   if (S.awaitingPerm) {
     // Never a silent return: you type, press Enter, nothing happens, and the
     // reason (an approval is blocking the agent) is invisible. Point at it.
@@ -1082,14 +919,6 @@ async function send() {
   }
   if (S.busy) return;   // this conversation is already replying
   if (S.switching) { status("正在切换会话，稍候"); return; }
-  if (PENDING.length) {
-    // Markdown image syntax, so the transcript shows the picture and the model
-    // receives a URL it can hand straight to a tool. Never the bytes.
-    const refs = PENDING.map((a) => `![${a.name}](${a.url})`).join("\n");
-    text = text ? `${text}\n\n${refs}` : refs;
-    PENDING.length = 0;
-    renderAttachments();
-  }
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
   S.seg = null;
@@ -1190,7 +1019,6 @@ async function boot() {
   });
 
   $("#new-session").onclick = newSession;
-  wireAttachments();
   // Cmd/Ctrl+K from anywhere, including the composer -- the shortcut is useless
   // if you have to leave the box you are typing in to reach it.
   document.addEventListener("keydown", (e) => {

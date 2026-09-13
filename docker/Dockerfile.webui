@@ -5,42 +5,13 @@
 # wanted and quietly break the other. `hermes_session_api.py` is executed by
 # HERMES' interpreter for exactly the same reason.
 #
-# Retrieval still goes through `memory-mcp` over HTTP MCP. Media does not: the
-# app stores images and generated video in autumn through the PyO3 client,
-# built here from the autumn-rs image's own sources.
-#
-# That client IS the wire format, so this image is now bound to autumn's WIRE
-# lockstep: AUTUMN_SHA must name the same commit as the running cluster, and
-# a wire bump requires rebuilding this image with it. A mismatch does not fail
-# the handshake — it decodes garbage. The alternative was a FUSE mount, which
-# keeps the image unbound but puts the kernel in the path of every byte for a
-# whole-file read that wants one round trip; measured on this cluster, a FUSE
-# read costs ~2 ms of round trip plus the kernel's own overhead either way.
-#
-#   kubectl -n autumn get sts autumn-ps \
-#     -o jsonpath='{.spec.template.spec.containers[0].image}'   # the tag to pass
-
-# The autumn commit whose client this image carries. It MUST be the one the
-# cluster runs; see the note at the top.
-#
-# Sources from codeload, not `FROM <private registry>/autumn-rs:<sha>`. The
-# autumn image does carry them at /usr/local/share/autumn/src, and
-# Dockerfile.freetoken-l3 pulls them that way — but that one is built by hand
-# with credentials, and this pipeline's builder has none for the private
-# registry: it PUSHES there, it does not pull. One GET against codeload either
-# works or fails loudly, and it makes the wire pin a git sha you can check out.
-ARG AUTUMN_SHA=947bae0396481fe9e8586aae7eefa98852d2247d
-ARG AUTUMN_SPEC=https://codeload.github.com/journeymidnight/autumn-rs/tar.gz/${AUTUMN_SHA}
-# crates.io mirror for the wheel build. Defaulted, not empty: the CN build pool
-# reaches crates.io slowly enough to matter — a build that pulled its 178 crates
-# from crates.io direct took 24.5 minutes against the 2.5 this image needed
-# before it carried a Rust step at all.
-#
-# Note for whoever times this next: the pipeline's builder keeps NO layer cache
-# between runs (zero CACHED steps in any build so far), so the wheel is compiled
-# every time even though it only changes when AUTUMN_SHA does. If build time
-# becomes the problem again, that — not the mirror — is the thing to attack.
-ARG CARGO_MIRROR=sparse+https://rsproxy.cn/index/
+# Retrieval goes through `memory-mcp` over HTTP MCP. Nothing else here talks
+# to autumn: the app carried a PyO3 client while it stored media in autumn, and
+# that client IS the wire format, so the image was pinned to autumn's WIRE
+# lockstep — a commit mismatch decoded garbage rather than failing a handshake.
+# With media gone the client went with it, and so did the pin: this image is now
+# independent of the cluster's autumn version, and of the Rust stage that cost
+# the build its slowest minutes.
 
 ARG BASE_REGISTRY=
 # `library/` spelled out, not the bare `python:` Docker Hub lets you write.
@@ -50,55 +21,6 @@ ARG BASE_REGISTRY=
 # Dockerfile builds fine on a laptop. Docker Hub accepts both spellings, so the
 # explicit one is the one that works in both places.
 ARG PYTHON_IMAGE=library/python:3.12-slim-bookworm
-
-# The Rust toolchain, taken from the same Hub cache as everything else rather
-# than downloaded. `curl https://sh.rustup.rs | sh` is one more network call
-# that can fail inside a build whose logs this pipeline only returns the tail
-# of; an image either pulls or it does not, and BASE_REGISTRY is an arg the
-# pipeline actually passes.
-FROM ${BASE_REGISTRY}library/rust:1.93-bookworm AS rusttool
-
-# The wheel is built against the SAME interpreter the runtime uses — a
-# cp312 wheel does not install into a cp311 venv and vice versa — so this
-# stage starts from the runtime's own base and borrows only the toolchain.
-FROM ${BASE_REGISTRY}${PYTHON_IMAGE} AS wheel
-ARG APT_MIRROR=
-ARG PIP_INDEX_URL=https://pypi.org/simple/
-# NO default here. A stage-level `ARG X=` with its own default OVERRIDES the
-# global one, so re-declaring these with `=` silently emptied them: the build
-# logged `if [ -n "" ]`, wrote no cargo config, and pulled 178 crates straight
-# from crates.io. Bare `ARG` inherits the global value, which is the point.
-ARG CARGO_MIRROR
-ARG AUTUMN_SPEC
-ENV CARGO_HOME=/usr/local/cargo \
-    RUSTUP_HOME=/usr/local/rustup \
-    PATH=/usr/local/cargo/bin:$PATH \
-    PIP_INDEX_URL=${PIP_INDEX_URL} \
-    UV_INDEX_URL=${PIP_INDEX_URL}
-COPY --from=rusttool /usr/local/cargo /usr/local/cargo
-COPY --from=rusttool /usr/local/rustup /usr/local/rustup
-RUN set -eux; \
-    if [ -n "${APT_MIRROR}" ]; then \
-      sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources || true; \
-    fi; \
-    apt-get update; \
-    # gcc + libc6-dev, not build-essential: cargo needs a linker and a libc,
-    # not make/dpkg-dev/g++ as well.
-    apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev pkg-config; \
-    rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    mkdir -p /autumn-src; \
-    curl -fsSL "${AUTUMN_SPEC}" | tar xz --strip-components=1 -C /autumn-src; \
-    test -f /autumn-src/python/Cargo.toml
-RUN set -eux; \
-    if [ -n "${CARGO_MIRROR}" ]; then \
-      printf '[source.crates-io]\nreplace-with = "m"\n[source.m]\nregistry = "%s"\n' "${CARGO_MIRROR}" \
-        > ${CARGO_HOME}/config.toml; \
-    fi; \
-    python -m pip install --no-cache-dir "maturin>=1,<2"; \
-    cd /autumn-src/python; \
-    maturin build --release --interpreter python3 --out /wheels; \
-    ls -l /wheels
 
 FROM ${BASE_REGISTRY}${PYTHON_IMAGE}
 
@@ -148,19 +70,10 @@ RUN set -eux; \
 COPY webui/scripts/patch_acp_toolsets.py /tmp/patch_acp_toolsets.py
 RUN /opt/hermes/.venv/bin/python /tmp/patch_acp_toolsets.py && rm /tmp/patch_acp_toolsets.py
 
-# --- autumn's PyO3 client --------------------------------------------------- #
-# Built in its own stage; only the wheel crosses into the runtime image.
-COPY --from=wheel /wheels/ /wheels/
-# `uv pip`, not `python -m pip`: the hermes venv is made by `uv venv`, which
-# does not put pip inside it, so `-m pip` there is "No module named pip". This
-# is the same form the hermes install above uses; the two must not drift.
-RUN VIRTUAL_ENV=/opt/hermes/.venv uv pip install --no-cache-dir /wheels/*.whl \
- && /opt/hermes/.venv/bin/python -c "import autumn; print('autumn client ok')" \
- && rm -rf /wheels
 
 # --- the app ---------------------------------------------------------------- #
-RUN python -m pip install --no-cache-dir "aiohttp>=3.9"
-
+# No pip install here on purpose: `http_shell.py` replaced aiohttp with the
+# stdlib, and it was this server's only third-party dependency.
 WORKDIR /app
 COPY webui/ /app/
 
@@ -183,4 +96,4 @@ EXPOSE 8080
 # ends without one leaves a zombie per turn. The lerobot console learned this by
 # accumulating 48 of them over 26 hours.
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "server.py"]
+CMD ["/opt/hermes/.venv/bin/python", "main.py"]
