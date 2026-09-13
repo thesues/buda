@@ -230,7 +230,26 @@ spec:
             # image_url is image-to-video, and the active backend routes on
             # that one condition. Without the toolset the tool is never
             # offered, and the model invents a curl instead.
-            - { name: HERMES_ACP_TOOLSETS, value: "file,todo,memory,skills,vision,video_gen" }
+            # The BASIC tools, and specialised ones left out on purpose.
+            #
+            # `terminal` is the one that matters: without a way to run
+            # something, a skill can only describe work it cannot do, and the
+            # allowlist here was narrow enough (six entries, eleven tools) that
+            # the agent had no way to reach anything this cluster offers. The
+            # lerobot console solves the same problem from the other side —
+            # hermes' full default set minus a denylist — and ends up with far
+            # more available.
+            #
+            # Deliberately absent:
+            #   vision / video_gen  a single-purpose tool each, and the work
+            #                       they do belongs in a skill that drives the
+            #                       API with terminal;
+            #   browser*            no Chromium in this image, and its
+            #                       availability check DOWNLOADS one;
+            #   delegation          subagents have nowhere to render here;
+            #   the platform integrations (slack/discord/feishu/…) cost tokens
+            #   in every request's tool list and none of them are wired up.
+            - { name: HERMES_ACP_TOOLSETS, value: "file,terminal,todo,memory,skills,search,web,session_search,clarify,mcp-memory" }
             # `terminal` is deliberately absent. With a shell in hand the model
             # takes the shortcut -- observed locally reading the corpus with
             # `sed` instead of calling the retrieval server, which also means a

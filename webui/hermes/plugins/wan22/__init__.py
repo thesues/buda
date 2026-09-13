@@ -44,6 +44,7 @@ DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 DEFAULT_FPS = 16
 DEFAULT_STEPS = int(os.environ.get("WAN22_STEPS", "6"))
+DEFAULT_ASPECT = "16:9"
 
 # The read has to outlast a 720p generation, which is minutes, not seconds.
 # Whatever this is set to is the real ceiling on `duration` x `resolution`.
@@ -55,8 +56,53 @@ _ASPECT = {
     "1:1": (960, 960),
 }
 
+# Wan's VAE downsamples by 8 and the transformer patches by 2, so both edges
+# must be multiples of 16. Rounding rather than truncating keeps the aspect
+# closer on odd sizes.
+SIZE_MULTIPLE = 16
+# Roughly 720p worth of pixels. Holding AREA rather than a fixed edge is what
+# lets a portrait photo stay portrait without costing more than a landscape one
+# — the cost of a diffusion step is pixels, not width.
+TARGET_PIXELS = 1280 * 720
 
-def _resolve_image(url: Optional[str]) -> Optional[str]:
+
+def _snap(n: int) -> int:
+    return max(SIZE_MULTIPLE, int(round(n / SIZE_MULTIPLE)) * SIZE_MULTIPLE)
+
+
+def _size_for(image_bytes: Optional[bytes], aspect_ratio: str) -> Tuple[int, int, str]:
+    """Output size, taken from the IMAGE when there is one.
+
+    A picture that is 4:3 or 3:2 — most photographs — rendered into a fixed
+    1280x720 is either stretched or cropped, and neither is what "make this
+    move" asked for. So read the source's own ratio and hold the pixel budget
+    instead of the shape.
+
+    Falls back to the named ratio when there is no image or it cannot be read;
+    an explicit `aspect_ratio` from the caller still wins, because someone who
+    asked for 9:16 means it.
+    """
+    if aspect_ratio in _ASPECT and aspect_ratio != DEFAULT_ASPECT:
+        w, h = _ASPECT[aspect_ratio]
+        return w, h, f"caller asked for {aspect_ratio}"
+    if image_bytes:
+        try:
+            from PIL import Image  # noqa: PLC0415
+            import io  # noqa: PLC0415
+
+            with Image.open(io.BytesIO(image_bytes)) as im:
+                sw, sh = im.size
+            if sw > 0 and sh > 0:
+                scale = (TARGET_PIXELS / (sw * sh)) ** 0.5
+                w, h = _snap(sw * scale), _snap(sh * scale)
+                return w, h, f"from the image ({sw}x{sh}, {sw / sh:.2f}:1)"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not read the image's size (%s); using %s", exc, aspect_ratio)
+    w, h = _ASPECT.get(aspect_ratio, _ASPECT[DEFAULT_ASPECT])
+    return w, h, f"default {aspect_ratio}"
+
+
+def _resolve_image(url: Optional[str]) -> Tuple[Optional[str], Optional[bytes]]:
     """Turn a webui media reference into something the video server can read.
 
     An image a person attached in the chat is already in autumn, and the URL it
@@ -69,8 +115,19 @@ def _resolve_image(url: Optional[str]) -> Optional[str]:
     anything else — an http(s) link, a data URL already — this returns it
     untouched and the server fetches it itself.
     """
-    if not url or not url.startswith("/api/media"):
-        return url
+    if not url:
+        return None, None
+    if url.startswith("data:") and ";base64," in url:
+        # Already inline: decode once here so the size can be read from it.
+        try:
+            import base64  # noqa: PLC0415
+            return url, base64.b64decode(url.split(",", 1)[1])
+        except Exception:  # noqa: BLE001
+            return url, None
+    if not url.startswith("/api/media"):
+        # An http(s) link the server fetches itself. We never see the bytes, so
+        # the size cannot be read and the named ratio is what is left.
+        return url, None
     try:
         import base64  # noqa: PLC0415
         import media  # noqa: PLC0415 -- the webui's store, same process
@@ -80,7 +137,7 @@ def _resolve_image(url: Optional[str]) -> Optional[str]:
 
         data, ctype = media.get(unquote(mid))
         log.info("resolved %s from autumn (%d bytes, %s)", url, len(data), ctype)
-        return f"data:{ctype};base64," + base64.b64encode(data).decode()
+        return f"data:{ctype};base64," + base64.b64encode(data).decode(), data
     except Exception as exc:  # noqa: BLE001
         # Surface it as the caller's error rather than sending a relative URL
         # the server will fail on with a less obvious message.
@@ -166,8 +223,6 @@ class Wan22VideoGenProvider(VideoGenProvider):
 
         mdl = model or DEFAULT_MODEL
         secs = int(duration or 5)
-        w, h = _ASPECT.get(aspect_ratio, (DEFAULT_WIDTH, DEFAULT_HEIGHT))
-        frames = _frames_for(secs, DEFAULT_FPS)
 
         # `image_url` is the whole T2V/I2V switch, on both sides of this
         # adapter: hermes documents it as the routing condition and vLLM-Omni
@@ -176,12 +231,18 @@ class Wan22VideoGenProvider(VideoGenProvider):
         # if that is all the caller gave us rather than silently doing T2V.
         img = image_url or (reference_image_urls[0] if reference_image_urls else None)
         try:
-            img = _resolve_image(img)
+            img, img_bytes = _resolve_image(img)
         except ValueError as exc:
             return error_response(
                 error=str(exc), error_type="bad_reference", provider=self.name,
                 model=mdl, prompt=prompt, aspect_ratio=aspect_ratio,
             )
+
+        # After resolving, because the source's own dimensions are the best
+        # answer and they are in those bytes.
+        w, h, why = _size_for(img_bytes, aspect_ratio)
+        log.info("output %dx%d (%s)", w, h, why)
+        frames = _frames_for(secs, DEFAULT_FPS)
 
         form: Dict[str, Any] = {
             "prompt": prompt,
@@ -265,6 +326,7 @@ class Wan22VideoGenProvider(VideoGenProvider):
                 "frames": frames,
                 "steps": DEFAULT_STEPS,
                 "size": f"{w}x{h}",
+                "size_reason": why,
             },
         )
 

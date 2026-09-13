@@ -1014,8 +1014,20 @@ async function attachFile(original) {
   try {
     const q = new URLSearchParams({ ext, session: S.session || "shared" });
     const r = await fetch(`/api/media?${q}`, { method: "POST", body: file });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    // NOT `await r.json()` unguarded. Between us and this endpoint sits a
+    // gateway that answers its own failures in PLAIN TEXT — a pod mid-rollout
+    // gets "no healthy upstream", and parsing that as JSON reports
+    // `unexpected token 'o'`, which tells the reader nothing about what went
+    // wrong and points at the wrong layer entirely.
+    const body = await r.text();
+    let j = {};
+    try { j = JSON.parse(body); } catch (_) { j = {}; }
+    if (!r.ok) {
+      const why = j.error || body.trim().slice(0, 120) || `HTTP ${r.status}`;
+      throw new Error(r.status === 503 || /no healthy upstream/i.test(body)
+        ? "服务正在重启，稍后再试"
+        : why);
+    }
     PENDING.push({ id: j.id, url: j.url, name: original.name, kind: "image" });
     renderAttachments();
     status("");

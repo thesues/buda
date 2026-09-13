@@ -127,23 +127,58 @@ class EventSink:
             return
         self.stream.emit("delta", text=text, thought=thought)
 
+    # hermes calls this POSITIONALLY:
+    #   tool_progress_callback(event, name, preview, args, **extra)
+    # e.g. ("tool.started", "skills_list", preview, args)
+    #      ("tool.completed", "skills_list", None, None, duration=…, is_error=…)
+    #      ("reasoning.available", "_thinking", text, None)
+    # The first argument is the EVENT, the second is the tool. Reading the first
+    # string as the label is why every row in the activity panel read
+    # "tool.started" with no status and no name — the thing the reader actually
+    # wants was in the argument after it, and was being thrown away.
+    _EVENT_STATUS = {"tool.started": "running", "tool.completed": "completed"}
+
     def tool(self, *args, **kwargs) -> None:
-        """hermes' tool-progress callback signature differs across versions and
-        call sites, so accept anything and pull out what is recognisable rather
-        than binding to one arity that a later version quietly changes."""
+        """hermes' tool-progress callback. Positional, with the shape above.
+
+        Still tolerant of a dict, because other call sites and older versions
+        pass one — but the positional form is the one that is actually used,
+        so it is read first rather than guessed at.
+        """
         info = dict(kwargs)
         for a in args:
             if isinstance(a, dict):
                 info.update(a)
-            elif isinstance(a, str) and "title" not in info:
-                info["title"] = a
-        title = str(info.get("title") or info.get("name") or info.get("tool") or "tool")
+
+        pos = [a for a in args if not isinstance(a, dict)]
+        event = str(pos[0]) if pos and isinstance(pos[0], str) else ""
+        name = pos[1] if len(pos) > 1 and isinstance(pos[1], str) else ""
+
+        # `_thinking` is the reasoning channel wearing the tool callback's
+        # signature; it has its own pane and is not a tool call.
+        if name == "_thinking" or event == "reasoning.available":
+            return
+
+        title = str(info.get("title") or name or info.get("name") or event or "tool")
+        status = str(info.get("status") or self._EVENT_STATUS.get(event, ""))
+        if info.get("is_error"):
+            status = "failed"
+        detail = str(info.get("detail") or "")
+        dur = info.get("duration")
+        if dur and not detail:
+            try:
+                detail = f"{float(dur):.1f}s"
+            except (TypeError, ValueError):
+                pass
+
         self.stream.emit(
             "tool",
+            # Keyed on the tool, so `started` and `completed` land on ONE row
+            # instead of two — which is what the panel groups by.
             id=str(info.get("id") or info.get("tool_call_id") or title),
             title=title,
-            status=str(info.get("status") or ""),
-            detail=str(info.get("detail") or ""),
+            status=status,
+            detail=detail,
         )
 
     def step(self, *args, **kwargs) -> None:

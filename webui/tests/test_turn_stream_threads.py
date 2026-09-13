@@ -168,3 +168,58 @@ def test_a_step_with_nothing_to_say_is_dropped():
     assert s.after(0) == []
     sink.step("thinking about it")
     assert s.after(0)[0]["text"] == "thinking about it"
+
+
+# ── the tool callback's real signature ──────────────────────────────────────
+
+
+def _tool_events(calls):
+    """Run `sink.tool(*args, **kwargs)` for each call, return the emitted rows."""
+    from turn_stream import EventSink, TurnStream
+
+    st = TurnStream("st", "sess")
+    sink = EventSink(st)
+    for args, kwargs in calls:
+        sink.tool(*args, **kwargs)
+    return [e for e in st.after(0) if e["kind"] == "tool"]
+
+
+def test_a_tool_row_is_named_after_the_tool_not_the_event():
+    """hermes calls this positionally: `(event, name, preview, args, **extra)`.
+
+    Reading the first string as the label made every row in the activity panel
+    read `tool.started`, with no status and no name — the tool the reader
+    actually wanted was in the next argument and was discarded. Verbatim from
+    `agent/tool_executor.py`:
+
+        agent.tool_progress_callback("tool.started", name, preview, args)
+        agent.tool_progress_callback("tool.completed", function_name, None,
+                                     None, duration=…, is_error=…)
+
+    Ablation: take `pos[0]` as the title again and both assertions fail.
+    """
+    rows = _tool_events([
+        (("tool.started", "skills_list", "preview", {"a": 1}), {}),
+        (("tool.completed", "skills_list", None, None), {"duration": 1.25, "is_error": False}),
+    ])
+    assert [r["title"] for r in rows] == ["skills_list", "skills_list"]
+    assert [r["status"] for r in rows] == ["running", "completed"]
+    # Both halves key on the same row, or the panel shows the call twice.
+    assert rows[0]["id"] == rows[1]["id"]
+    assert "1.2" in rows[1]["detail"], rows[1]["detail"]
+
+
+def test_a_failed_tool_says_so():
+    rows = _tool_events([
+        (("tool.completed", "search_files", None, None), {"is_error": True}),
+    ])
+    assert rows[0]["status"] == "failed"
+
+
+def test_the_reasoning_channel_is_not_a_tool_row():
+    """`reasoning.available` arrives through the same callback with `_thinking`
+    as its name. It has its own pane; listing it as a tool call was noise."""
+    rows = _tool_events([
+        (("reasoning.available", "_thinking", "some thinking", None), {}),
+    ])
+    assert rows == []
