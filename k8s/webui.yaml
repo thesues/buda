@@ -260,11 +260,12 @@ spec:
             # leaves ~8k for the reply. Raise it only together with the KV
             # budget on the FreeToken side.
             - { name: LLM_CONTEXT_LENGTH, value: "54000" }
-            # What this deployment is for. NOTE: nothing in the webui reads
-            # this today -- the reader that did went with `server.py` in the
-            # ACP retirement, and no fallback replaced it. Left here because
-            # the text is the brief we want; it needs a consumer to take
-            # effect. Do not trust it to be shaping the agent.
+            # What this deployment is for. Read by `hermes_agent.CHAT_DIRECTIVE`
+            # and passed as `system_message`, which hermes APPENDS to its own
+            # system prompt -- so this steers the agent without displacing its
+            # internals, and without appearing in the user's own message the way
+            # the retired ACP server's version did. Unset falls back to the same
+            # text, which lives beside the code that uses it.
             - name: CHAT_DIRECTIVE
               value: |
                 你是佛教典籍的检索助手，工作是从已索引的语料库中找出依据来回答问题。

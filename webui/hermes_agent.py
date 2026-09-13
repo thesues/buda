@@ -353,6 +353,37 @@ def bind_callbacks(agent: Any, sink: Any) -> None:
             setattr(agent, name, fn)
 
 
+# What this deployment is FOR, appended to hermes' own system prompt.
+#
+# It is an env var so one image can be pointed at a different job without a
+# rebuild, and the default is the scripture brief this deployment exists for.
+# The default it replaced was inherited from a coding console ("use fenced code
+# blocks with a language tag") and steered the agent toward long prose, which is
+# the opposite of what a lookup wants.
+#
+# This reaches the model as `system_message`, NOT appended to the user's first
+# prompt the way the retired ACP server did it. ACP had no system channel, so
+# that server glued the brief onto the user's words and kept a `_directive_sent`
+# set to do it only once. The library path has a real parameter:
+# `system_prompt.build_system_prompt_parts` APPENDS it as a context part
+# (`agent/system_prompt.py`), so hermes' internals and tool instructions are
+# untouched, the transcript shows what the user actually typed, and the session
+# auto-title still comes from their real first words.
+#
+# Passed on EVERY turn, not just the first. hermes builds the system prompt once
+# per session and replays it verbatim to keep the upstream prompt cache warm, so
+# a constant string costs nothing — while a first-turn-only injection would be
+# missing from any session whose first turn predates it.
+CHAT_DIRECTIVE = os.environ.get(
+    "CHAT_DIRECTIVE",
+    "你是佛教典籍的检索助手，工作是从已索引的语料库中找出依据来回答问题。\n"
+    "- 凡涉及经文内容的问题，先用语料库工具检索，不要凭记忆作答。\n"
+    "- 回答时给出经名与原文引文，并标出出处（文件 › 标题路径 › 行号）。\n"
+    "- 语料库里没有的，直说没有；可以补充常识背景，但要注明那不是来自语料库。\n"
+    "- 简明作答，通常几段以内。除非明确要求，不要写长文、不要综述式铺陈。",
+)
+
+
 def run_turn(
     agent: Any,
     *,
@@ -366,10 +397,16 @@ def run_turn(
     `persist_user_message` is what makes the prompt itself land in the store;
     without it the assistant's reply is persisted against a conversation that
     does not contain the question.
+
+    `system_message` left as None takes `CHAT_DIRECTIVE`. An explicit `""`
+    suppresses it — a caller that wants no brief can say so, and only `None`
+    means "whatever this deployment is for".
     """
+    if system_message is None:
+        system_message = CHAT_DIRECTIVE
     candidate = {
         "user_message": user_message,
-        "system_message": system_message,
+        "system_message": system_message or None,
         "conversation_history": history,
         "task_id": session_id,
         "persist_user_message": user_message if isinstance(user_message, str) else None,

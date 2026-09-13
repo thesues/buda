@@ -210,3 +210,77 @@ def test_binding_skips_callbacks_this_hermes_does_not_have(monkeypatch):
     ha.bind_callbacks(agent, Sink())
     assert not hasattr(agent, "step_callback")
     assert agent.thinking_callback is None, "hermes' own status chatter stays off"
+
+
+# ── the deployment's brief ──────────────────────────────────────────────────
+#
+# CHAT_DIRECTIVE says what this deployment is FOR. It was inert for a while and
+# nobody could see it: its reader went with `server.py` in the ACP retirement,
+# no fallback replaced it, and the manifest kept setting an env var that reached
+# nothing. A brief that silently does not apply looks exactly like a model that
+# ignores instructions, so these pin the wiring rather than the wording.
+
+
+def test_the_directive_reaches_the_model_as_a_system_message(monkeypatch):
+    """Ablation: drop the `if system_message is None` default in `run_turn`
+    and this goes red -- which is the state the deployment was actually in."""
+    monkeypatch.setattr(ha, "CHAT_DIRECTIVE", "BRIEF")
+    seen = {}
+
+    class Agent:
+        def run_conversation(self, user_message, system_message=None, **kw):
+            seen.update(user_message=user_message, system_message=system_message)
+            return {}
+
+    ha.run_turn(Agent(), session_id="s", user_message="问题", history=[])
+    assert seen["system_message"] == "BRIEF"
+
+
+def test_the_directive_never_touches_what_the_user_typed(monkeypatch):
+    """The retired ACP server glued the brief onto the user's first prompt
+    because ACP had no system channel. Doing that here would put the steering
+    block in the user's own bubble, in the persisted turn, and in the session
+    auto-title -- which is drawn from their real first words."""
+    monkeypatch.setattr(ha, "CHAT_DIRECTIVE", "BRIEF")
+    seen = {}
+
+    class Agent:
+        def run_conversation(self, user_message, system_message=None,
+                             persist_user_message=None, **kw):
+            seen.update(user_message=user_message,
+                        persist_user_message=persist_user_message)
+            return {}
+
+    ha.run_turn(Agent(), session_id="s", user_message="问题", history=[])
+    assert seen["user_message"] == "问题"
+    assert seen["persist_user_message"] == "问题"
+
+
+def test_a_caller_can_suppress_the_brief_but_only_by_saying_so(monkeypatch):
+    """`None` means "whatever this deployment is for"; `""` means "none". If
+    empty string fell through to the default there would be no way to turn it
+    off, and if it reached hermes as `""` it would append a blank context part."""
+    monkeypatch.setattr(ha, "CHAT_DIRECTIVE", "BRIEF")
+    seen = {}
+
+    class Agent:
+        def run_conversation(self, user_message, system_message=None, **kw):
+            seen["system_message"] = system_message
+            return {}
+
+    ha.run_turn(Agent(), session_id="s", user_message="q", history=[],
+                system_message="")
+    assert seen["system_message"] is None
+
+
+def test_an_older_hermes_without_system_message_still_runs_the_turn(monkeypatch):
+    """`supported_kwargs` drops what the installed hermes lacks. The brief is a
+    feature; losing it must not cost the conversation."""
+    monkeypatch.setattr(ha, "CHAT_DIRECTIVE", "BRIEF")
+
+    class Older:
+        def run_conversation(self, user_message, conversation_history=None):
+            return {"ok": user_message}
+
+    assert ha.run_turn(Older(), session_id="s", user_message="q",
+                       history=[]) == {"ok": "q"}
