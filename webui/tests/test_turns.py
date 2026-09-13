@@ -206,18 +206,82 @@ def test_finished_streams_are_eventually_dropped(monkeypatch):
 # ── approvals ───────────────────────────────────────────────────────────────
 
 
-def test_a_permission_prompt_is_refused_visibly_rather_than_auto_approved(monkeypatch):
-    """Two silent outcomes are both wrong until the client can answer.
+def _fake_approval(monkeypatch):
+    """Stand in for `tools.approval`, which lives in hermes' venv.
 
-    Auto-approving runs a command nobody agreed to; denying without a word
-    leaves the reader watching a turn fail for no stated reason.
+    Only the surface `_ask` uses: the pending map, its lock, and the three
+    approve/is-approved calls. Real enough that a wrong key or a missed
+    resolution still shows up here.
     """
+    import sys
+    import threading as _t
+    import types
+
+    ap = types.ModuleType("tools.approval")
+    ap._pending = {}
+    ap._lock = _t.Lock()
+    ap._session = set()
+    ap._permanent = set()
+    ap.submit_pending = lambda key, entry: ap._pending.__setitem__(key, entry)
+    ap.approve_session = lambda key, pat: ap._session.add((key, pat))
+    ap.approve_permanent = lambda pat: ap._permanent.add(pat)
+    ap.is_approved = lambda key, pat: (key, pat) in ap._session or pat in ap._permanent
+    tools = sys.modules.get("tools") or types.ModuleType("tools")
+    tools.approval = ap
+    monkeypatch.setitem(sys.modules, "tools", tools)
+    monkeypatch.setitem(sys.modules, "tools.approval", ap)
+    return ap
+
+
+def test_a_permission_prompt_reaches_the_reader_and_blocks_until_answered(monkeypatch):
+    """The turn must not proceed while it is asking.
+
+    The previous behaviour refused everything, because the client had no way to
+    answer — which made `terminal` useless: the first command that needed
+    permission failed and the agent was told no by a thing the reader never saw.
+    """
+    import threading
+
+    ap = _fake_approval(monkeypatch)
     m = _mgr(monkeypatch)
     s = m.start(session_id="s1", text="x", endpoint=_ep())
     assert _wait_done(s)
-    assert m._ask(s, "rm -rf /tmp/x") is False
-    note = [e for e in s.after(0) if e["kind"] == "note"][-1]
-    assert "rm -rf /tmp/x" in note["text"] and "拒绝" in note["text"]
+
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", m._ask(s, "rm -rf /tmp/x", "delete a path")))
+    t.start()
+
+    # The card reaches the reader…
+    ev = None
+    for _ in range(200):
+        ev = next((e for e in s.after(0) if e["kind"] == "approval"), None)
+        if ev:
+            break
+        time.sleep(0.01)
+    assert ev, "no approval event was emitted"
+    assert [o["optionId"] for o in ev["options"]] == ["once", "session", "always", "deny"]
+
+    # …and the turn is still waiting on it.
+    assert t.is_alive(), "the turn carried on without an answer"
+
+    entry = ap._pending["s1"]
+    assert entry["id"] == ev["id"]
+    entry["answer"]("session")
+    t.join(timeout=5)
+    assert out["r"] == "session"
+    # `session` must approve the key hermes itself checks — its own pattern key
+    # is the DESCRIPTION, so approving the command string would approve nothing.
+    assert ("s1", "delete a path") in ap._session
+
+
+def test_an_already_approved_pattern_does_not_ask_again(monkeypatch):
+    ap = _fake_approval(monkeypatch)
+    m = _mgr(monkeypatch)
+    s = m.start(session_id="s1", text="x", endpoint=_ep())
+    assert _wait_done(s)
+    ap.approve_session("s1", "delete a path")
+    assert m._ask(s, "rm -rf /tmp/x", "delete a path") == "session"
+    assert not [e for e in s.after(0) if e["kind"] == "approval"], "asked anyway"
 
 
 def test_the_approval_hook_is_installed_per_turn(monkeypatch):

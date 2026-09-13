@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import logging
 import secrets
+import os
 import threading
+import uuid
 from typing import Any, Callable
 
 from hermes_agent import AgentPool, Endpoint, history_for, run_turn
@@ -43,6 +45,12 @@ class Refused(Exception):
 
     def as_json(self) -> dict:
         return {"error": self.message, self.reason: True, **self.extra}
+
+
+# How long a permission card waits before the turn gives up on it. Long,
+# because the person it is asking may be away from the tab; bounded, because a
+# turn blocked forever holds its thread and its agent.
+APPROVAL_TIMEOUT_S = int(os.environ.get("BUDA_APPROVAL_TIMEOUT_S", "600"))
 
 
 class TurnManager:
@@ -177,16 +185,72 @@ class TurnManager:
         except Exception:  # noqa: BLE001 -- a missing hook must not fail the turn
             log.debug("could not install the approval callback", exc_info=True)
 
-    def _ask(self, stream: TurnStream, *args: Any, **kwargs: Any) -> bool:
-        """Refuse, visibly.
+    def _ask(self, stream: TurnStream, command: str = "", description: str = "",
+             *, allow_permanent: bool = True, **_: Any) -> str:
+        """Ask the reader, through hermes' own approval state.
 
-        Until the client can answer a prompt, auto-approving would run a command
-        nobody agreed to and silently denying would leave the reader watching a
-        turn fail for no stated reason. Say so in the transcript and refuse.
+        hermes' contract, from `tools/approval.py`:
+            (command, description, *, allow_permanent=True)
+              -> 'once' | 'session' | 'always' | 'deny'
+
+        The state lives in `tools.approval` — `_pending`, `_session_approved`,
+        `submit_pending`, `approve_session`, `is_approved` — and the routes read
+        the same module, which is what hermes-webui does. Keeping a second
+        pending-map here would be a copy of a thing hermes already owns, and the
+        two would drift the first time a code path answered one and not the
+        other.
+
+        This runs on the TURN's thread and blocks it, which is correct: the tool
+        call has not happened yet and must not until someone says so.
         """
-        what = next((str(a) for a in args if isinstance(a, str) and a.strip()), "")
-        stream.emit("note", text=f"需要确认，已拒绝：{what or '一个需要授权的操作'}")
-        return False
+        from tools import approval as ap  # noqa: PLC0415
+
+        key = f"{stream.session_id or stream.stream_id}"
+        # hermes keys its own approvals on the DESCRIPTION (`approval.py:665`,
+        # `pattern_key = description`), so use the same thing or "本次会话都允许"
+        # would approve a key nothing ever checks.
+        pattern = description or command
+        if ap.is_approved(key, pattern):
+            return "session"
+
+        req_id = f"perm-{uuid.uuid4().hex[:12]}"
+        answered = threading.Event()
+        box: dict[str, str] = {}
+        opts = [
+            {"optionId": "once", "name": "允许一次"},
+            {"optionId": "session", "name": "本次会话都允许"},
+        ]
+        if allow_permanent:
+            opts.append({"optionId": "always", "name": "始终允许"})
+        opts.append({"optionId": "deny", "name": "拒绝"})
+
+        ap.submit_pending(key, {
+            "id": req_id,
+            "title": description or command or "需要确认",
+            "command": command,
+            "options": opts,
+            # `answer` is how the route hands the choice back to this thread.
+            "answer": lambda choice: (box.setdefault("choice", choice), answered.set()),
+            "pattern": pattern,
+            "session_key": key,
+        })
+        # Push it to whoever is watching this turn; `pollApprovals` is the
+        # fallback for a reader who reconnected and missed the event.
+        stream.emit("approval", id=req_id, title=description or command or "需要确认",
+                    options=opts)
+
+        if not answered.wait(timeout=APPROVAL_TIMEOUT_S):
+            with ap._lock:
+                ap._pending.pop(key, None)
+            stream.emit("note", text="确认超时，已拒绝")
+            return "deny"
+
+        choice = box.get("choice") or "deny"
+        if choice in ("session", "always"):
+            ap.approve_session(key, pattern)
+            if choice == "always":
+                ap.approve_permanent(pattern)
+        return choice
 
     def _run_turn(
         self, stream: TurnStream, session_id: str, text: str, endpoint: Endpoint

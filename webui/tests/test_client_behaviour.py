@@ -260,8 +260,10 @@ def test_a_refused_send_puts_the_message_back():
 # URLs `app.js` builds that the server does NOT serve, each because the feature
 # behind it was never built -- not because a route was mislaid:
 #
-#   /api/approval/*   `TurnManager._ask` refuses visibly rather than
-#                     auto-approving, so there is nothing to answer yet.
+# Nothing, currently. Approvals were here — `TurnManager._ask` refused
+# everything because the client had no way to answer — and are built now,
+# against hermes' own `tools.approval` state rather than a second pending map
+# on this side.
 #
 # Deleting a session USED to be here: the store bridge is read-only and there
 # was no route, so the client's `DELETE /api/session/<id>` 404'd and the
@@ -273,10 +275,7 @@ def test_a_refused_send_puts_the_message_back():
 # They are listed verbatim so that building the feature -- or deleting the dead
 # UI that calls it -- has to come past these tests, instead of going on 404ing
 # in a browser while the suite stays green.
-KNOWN_UNBUILT = {
-    "/api/approval/pending${q}",
-    "/api/approval/answer",
-}
+KNOWN_UNBUILT: set[str] = set()
 
 
 def _client_api_urls() -> set[str]:

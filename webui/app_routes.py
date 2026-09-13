@@ -223,6 +223,65 @@ def build_app(
         last_session.pop(req.client_id, None)
         return json_response({"ok": True, "deleted": sid})
 
+    # ── approvals ──────────────────────────────────────────────────────────
+    #
+    # The state is hermes' own (`tools.approval._pending`), not a second map
+    # kept here. hermes-webui does the same, and for the same reason: the agent
+    # thread blocks on that module, so a copy on this side would be a thing to
+    # keep in sync with the thing that actually decides.
+
+    def _approval_state():
+        from tools import approval as ap  # noqa: PLC0415
+
+        return ap
+
+    @app.route("GET", "/api/approval/pending")
+    def _perm_pending(req: Request) -> Response:
+        """What this conversation is waiting on.
+
+        Scoped by session on purpose: unscoped, this showed one reader a prompt
+        raised in a conversation they had never opened — and let them answer it.
+        """
+        sid = req.query.get("session", "")
+        try:
+            ap = _approval_state()
+        except Exception:  # noqa: BLE001 -- no approval module, nothing pending
+            return json_response({"pending": []})
+        with ap._lock:
+            entry = ap._pending.get(sid) if sid else None
+            rows = [entry] if entry else []
+        # `answer` is a callable and the client has no use for it.
+        return json_response({"pending": [
+            {k: v for k, v in r.items() if k in ("id", "title", "command", "options")}
+            for r in rows if r
+        ]})
+
+    @app.route("POST", "/api/approval/answer")
+    def _perm_answer(req: Request) -> Response:
+        """Hand one choice back to the blocked turn."""
+        body = req.json()
+        rid = str(body.get("id") or "")
+        choice = str(body.get("optionId") or "deny")
+        if not rid:
+            return json_response({"error": "id is required"}, status=400)
+        try:
+            ap = _approval_state()
+        except Exception:  # noqa: BLE001
+            return json_response({"error": "approvals unavailable"}, status=503)
+
+        with ap._lock:
+            key = next((k for k, v in ap._pending.items()
+                        if isinstance(v, dict) and v.get("id") == rid), None)
+            entry = ap._pending.pop(key, None) if key else None
+        if entry is None:
+            # Already answered, or expired. Not an error: two tabs can both
+            # have the card on screen and both press a button.
+            return json_response({"ok": True, "stale": True})
+        fn = entry.get("answer")
+        if callable(fn):
+            fn(choice)
+        return json_response({"ok": True, "id": rid, "optionId": choice})
+
     # ── media ──────────────────────────────────────────────────────────────
 
     @app.route("POST", "/api/media")

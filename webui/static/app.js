@@ -502,8 +502,11 @@ async function pollApprovals() {
     // Say which conversation we are in. Unscoped, this poll showed a second
     // person a permission prompt raised in a conversation they had never
     // opened — and let them answer it.
-    const q = S.sessionId ? `?session=${encodeURIComponent(S.sessionId)}` : "";
-    const j = await (await fetch(`/api/approval/pending${q}`)).json();
+    // The `?` stays OUTSIDE the interpolation: a reader — and the test that
+    // checks the client only asks for paths the router serves — cannot tell a
+    // query from a path segment when the separator is hidden inside `${…}`.
+    const q = S.sessionId ? `session=${encodeURIComponent(S.sessionId)}` : "";
+    const j = await (await fetch(`/api/approval/pending?${q}`)).json();
     const p = (j.pending || [])[0];
     if (p) showApproval(p);
     else S.awaitingPerm = false;
