@@ -117,20 +117,34 @@ spec:
               # user plugins at `get_hermes_home()/plugins/<name>/`, needing a
               # plugin.yaml and an `__init__.py` with `register(ctx)`.
               #
-              # rsync semantics by hand: replace the directory rather than
-              # merging into it, so a file deleted in the repo does not live on
-              # in the volume forever.
+              # The image is the source of truth: mirror it, do not merge into
+              # it. Two things the first version of this got wrong, both of
+              # which a reader saw before the code did.
+              #
+              # It copied by BASENAME, flattening the tree — hermes groups
+              # skills by directory, so `research/buddhist-canon-retrieval`
+              # landed as a second top-level `buddhist-canon-retrieval` and the
+              # agent reported "two skills with the same name in different
+              # categories" and had to pick. Copy the WHOLE tree instead.
+              #
+              # And it only ever ADDED. A skill deleted from the repo stayed in
+              # the volume forever, still listed, still loadable — which is how
+              # a retired skill keeps being used. Anything under a managed root
+              # that the image no longer carries is removed.
+              H="${HERMES_HOME:-/opt/data}"
               for kind in plugins skills; do
-                if [ -d "/app/hermes/$kind" ]; then
-                  for d in /app/hermes/$kind/*/; do
-                    [ -d "$d" ] || continue
-                    n="$(basename "$d")"
-                    rm -rf "${HERMES_HOME:-/opt/data}/$kind/$n"
-                    mkdir -p "${HERMES_HOME:-/opt/data}/$kind"
-                    cp -a "$d" "${HERMES_HOME:-/opt/data}/$kind/$n"
-                    echo "installed $kind/$n"
-                  done
-                fi
+                src="/app/hermes/$kind"
+                [ -d "$src" ] || continue
+                mkdir -p "$H/$kind"
+                # remove what the image dropped, then lay the tree down whole
+                (cd "$src" && find . -mindepth 1 -maxdepth 1 -type d -printf '%P\n') > /tmp/.keep.$kind
+                for existing in "$H/$kind"/*/; do
+                  [ -d "$existing" ] || continue
+                  n="$(basename "$existing")"
+                  grep -qx "$n" /tmp/.keep.$kind || { rm -rf "$existing"; echo "removed $kind/$n (gone from the image)"; }
+                done
+                cp -a "$src/." "$H/$kind/"
+                echo "installed $kind: $(cd "$src" && find . -name SKILL.md -o -name plugin.yaml | wc -l) item(s)"
               done
 
               # The autumn client is IP-only — it does not resolve names — so
@@ -240,16 +254,23 @@ spec:
             # hermes' full default set minus a denylist — and ends up with far
             # more available.
             #
+            # `video_gen` is IN: it is hermes' own cross-backend interface —
+            # one `video_generate` tool that routes text-to-video vs
+            # image-to-video on whether an `image_url` was given, dispatching
+            # to whichever `VideoGenProvider` is active (hermes ships fal and
+            # xai; `plugins/wan22` is ours). A skill driving the API with curl
+            # would put the base64 and the file handling back in the agent's
+            # hands, which is what moving media into autumn took out.
+            #
             # Deliberately absent:
-            #   vision / video_gen  a single-purpose tool each, and the work
-            #                       they do belongs in a skill that drives the
-            #                       API with terminal;
+            #   vision              a single-purpose tool, and the work it does
+            #                       belongs in a skill;
             #   browser*            no Chromium in this image, and its
             #                       availability check DOWNLOADS one;
             #   delegation          subagents have nowhere to render here;
             #   the platform integrations (slack/discord/feishu/…) cost tokens
             #   in every request's tool list and none of them are wired up.
-            - { name: HERMES_ACP_TOOLSETS, value: "file,terminal,todo,memory,skills,search,web,session_search,clarify,mcp-memory" }
+            - { name: HERMES_ACP_TOOLSETS, value: "file,terminal,todo,memory,skills,search,web,session_search,clarify,video_gen,mcp-memory" }
             # `terminal` is deliberately absent. With a shell in hand the model
             # takes the shortcut -- observed locally reading the corpus with
             # `sed` instead of calling the retrieval server, which also means a
