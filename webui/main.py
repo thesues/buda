@@ -103,6 +103,30 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             log.error("could not point hermes at %s: %s", mcp_url, e)
 
+    # Writing the server into config.yaml is not connecting to it. The ACP
+    # adapter called `register_mcp_servers` itself; nothing in the library path
+    # did, so `mcp_servers` sat in the config, `mcp-memory` sat in
+    # enabled_toolsets, and the agent was handed eleven tools none of which
+    # could reach the corpus. Asked about a sutra it ran `search_files` over a
+    # filesystem that has no corpus on it and answered that the corpus "is not
+    # available in this environment" — which was true, and entirely our doing.
+    #
+    # Once per process, before any agent is built: the registry is global and
+    # `refresh_agent_mcp_tools` picks the tools up per turn from there.
+    try:
+        from hermes_cli.config import load_config
+        from tools.mcp_tool import register_mcp_servers
+
+        servers = (load_config() or {}).get("mcp_servers") or {}
+        if servers:
+            added = register_mcp_servers(servers)
+            log.info("registered %d MCP tool(s) from %s: %s",
+                     len(added), list(servers), ", ".join(added[:4]) + ("…" if len(added) > 4 else ""))
+        else:
+            log.warning("no mcp_servers in hermes config; corpus search will be unavailable")
+    except Exception:  # noqa: BLE001 -- a chat box without retrieval still starts
+        log.exception("could not register MCP servers; corpus search will be unavailable")
+
     manager = TurnManager(AgentPool())
     app = build_app(
         manager=manager,

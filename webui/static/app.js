@@ -884,7 +884,22 @@ async function removeSession(id, title) {
   // no undo. Three conversations went that way.
   const name = (title || "").trim() || id.slice(0, 8);
   if (!confirm(`删除会话「${name}」?此操作不可撤销。`)) return;
-  await fetch(`/api/session/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+  // POST to a real route, and SHOW a failure. The old call was
+  // `DELETE /api/session/<id>` — a path the exact-match router cannot serve —
+  // with `.catch(() => {})` on the end, so every delete 404'd silently and the
+  // row reappeared with no explanation.
+  try {
+    const r = await fetch("/api/session/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: id }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { status(`删除失败：${j.error || `HTTP ${r.status}`}`); return; }
+  } catch (e) {
+    status(`删除失败：${e.message}`);
+    return;
+  }
   if (S.sessionId === id) S.sessionId = null;
   loadSessions();
 }

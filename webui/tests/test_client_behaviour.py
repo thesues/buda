@@ -262,8 +262,13 @@ def test_a_refused_send_puts_the_message_back():
 #
 #   /api/approval/*   `TurnManager._ask` refuses visibly rather than
 #                     auto-approving, so there is nothing to answer yet.
-#   DELETE a session  the session store (`hermes_session_api.py`) exposes
-#                     `list_sessions` and `history` and no delete at all.
+#
+# Deleting a session USED to be here: the store bridge is read-only and there
+# was no route, so the client's `DELETE /api/session/<id>` 404'd and the
+# `.catch(() => {})` on it turned that into a row that silently came back. It
+# is built now — `POST /api/session/delete`, which shells out to
+# `hermes sessions delete` because a session spans more than one table and that
+# CLI is the thing that knows which.
 #
 # They are listed verbatim so that building the feature -- or deleting the dead
 # UI that calls it -- has to come past these tests, instead of going on 404ing
@@ -271,7 +276,6 @@ def test_a_refused_send_puts_the_message_back():
 KNOWN_UNBUILT = {
     "/api/approval/pending${q}",
     "/api/approval/answer",
-    "/api/session/${encodeURIComponent(id)}",
 }
 
 

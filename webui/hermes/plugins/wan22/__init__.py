@@ -56,6 +56,37 @@ _ASPECT = {
 }
 
 
+def _resolve_image(url: Optional[str]) -> Optional[str]:
+    """Turn a webui media reference into something the video server can read.
+
+    An image a person attached in the chat is already in autumn, and the URL it
+    is referred to by — `/api/media?id=<session>/<name>` — is RELATIVE to the
+    webui. Handing that to vLLM-Omni would have it resolve the path against its
+    own host and find nothing. So read the bytes out of autumn here and pass a
+    data URL.
+
+    This is also what lets the skill say "pass the URL straight through". Given
+    anything else — an http(s) link, a data URL already — this returns it
+    untouched and the server fetches it itself.
+    """
+    if not url or not url.startswith("/api/media"):
+        return url
+    try:
+        import base64  # noqa: PLC0415
+        import media  # noqa: PLC0415 -- the webui's store, same process
+
+        mid = url.split("id=", 1)[1].split("&", 1)[0]
+        from urllib.parse import unquote  # noqa: PLC0415
+
+        data, ctype = media.get(unquote(mid))
+        log.info("resolved %s from autumn (%d bytes, %s)", url, len(data), ctype)
+        return f"data:{ctype};base64," + base64.b64encode(data).decode()
+    except Exception as exc:  # noqa: BLE001
+        # Surface it as the caller's error rather than sending a relative URL
+        # the server will fail on with a less obvious message.
+        raise ValueError(f"could not read {url} from autumn: {exc}") from exc
+
+
 def _frames_for(duration_s: int, fps: int) -> int:
     """Wan's VAE compresses time by 4, so frame counts are 4n+1.
 
@@ -144,6 +175,13 @@ class Wan22VideoGenProvider(VideoGenProvider):
         # multi-image surface, which this model has no use for; take the first
         # if that is all the caller gave us rather than silently doing T2V.
         img = image_url or (reference_image_urls[0] if reference_image_urls else None)
+        try:
+            img = _resolve_image(img)
+        except ValueError as exc:
+            return error_response(
+                error=str(exc), error_type="bad_reference", provider=self.name,
+                model=mdl, prompt=prompt, aspect_ratio=aspect_ratio,
+            )
 
         form: Dict[str, Any] = {
             "prompt": prompt,

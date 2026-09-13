@@ -19,6 +19,7 @@ Two contracts worth restating because they are easy to break silently:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import media
@@ -179,6 +180,48 @@ def build_app(
         if sid:
             last_session[req.client_id] = sid
         return json_response({"ok": True, "current": sid or None})
+
+    @app.route("POST", "/api/session/delete")
+    def _delete(req: Request) -> Response:
+        """Delete a conversation, through hermes' own CLI.
+
+        Not by touching the store directly. `hermes_session_api.py` says why in
+        its docstring and it is the reason that bridge is read-only: a session
+        lives in more than one table and the CLI is the thing that knows which
+        — including the FTS index, which a hand-rolled DELETE would leave
+        pointing at rows that no longer exist.
+
+        POST, not DELETE-with-a-path-id: the router matches `(method, path)`
+        exactly and has no parameter support, so `/api/session/<id>` can never
+        be a route here. The client used to send exactly that and swallow the
+        404, which is why deleting appeared to work and the row came back.
+        """
+        import subprocess  # noqa: PLC0415 -- not on the import path of a turn
+
+        sid = (req.json().get("sessionId") or "").strip()
+        if not sid:
+            return json_response({"error": "sessionId is required"}, status=400)
+        # Deleting a conversation that is mid-reply would leave the turn
+        # writing into a store row that no longer exists. `running()` is
+        # session_id -> stream_id for exactly the turns still going.
+        if sid in manager.running():
+            return json_response(
+                {"error": "这个会话正在回复中，先停止再删除"}, status=409,
+            )
+        try:
+            r = subprocess.run(
+                [os.environ.get("HERMES_BIN", "hermes"), "sessions", "delete", sid, "--yes"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("could not run hermes sessions delete")
+            return json_response({"error": f"删除失败: {e}"}, status=503)
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "").strip()[:300]
+            log.warning("hermes sessions delete %s failed: %s", sid, detail)
+            return json_response({"error": detail or "hermes 拒绝了删除"}, status=502)
+        last_session.pop(req.client_id, None)
+        return json_response({"ok": True, "deleted": sid})
 
     # ── media ──────────────────────────────────────────────────────────────
 
