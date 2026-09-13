@@ -65,6 +65,9 @@ class TurnManager:
         self._history = history
         self._run = run
         self._lock = threading.Lock()
+        # One contextvar token per live turn, so teardown resets exactly the
+        # binding that turn made and not a later one's.
+        self._approval_tokens: dict[str, Any] = {}
         # By SESSION, not one global: a reader looking at an idle conversation
         # while another streams must see THAT conversation's state. Deriving it
         # from a global is how a busy session's spinner lands on an idle one.
@@ -163,94 +166,93 @@ class TurnManager:
     def _install_approval(self, stream: TurnStream) -> None:
         """Route this turn's permission prompts to this turn's reader.
 
-        hermes installs the approval hook MODULE-side rather than on the agent
-        (`tools.terminal_tool.set_approval_callback`), which would be a race
-        between concurrent turns — except the hook is a `threading.local`, and
-        each turn owns a thread. So the isolation is free here, and the ACP
-        adapter's save-and-restore dance around it is not needed.
+        Through hermes' GATEWAY path, not `terminal_tool.set_approval_callback`.
+        That setter stores the callback in a `threading.local` — deliberately,
+        it is a fix for concurrent ACP sessions sharing one slot — and hermes
+        dispatches tools on threads of its own. The callback was therefore
+        invisible to the thread that actually asked, hermes fell through to its
+        `input()` fallback, and that spawns a daemon thread reading a stdin no
+        one will ever type into. Measured: a turn stopped at
+        `terminal / running`, emitted nothing for minutes, held the endpoint's
+        only slot, and `interrupt()` could not touch it because interrupt sets
+        a flag the conversation loop reads and the loop was never reached. The
+        module's own comment calls this "an invisible 60s deadlock".
 
-        `HERMES_INTERACTIVE` is how `tools.approval` knows an interactive
-        callback exists and the non-interactive AUTO-APPROVE path must not fire.
-        Without it a tool that should have asked simply proceeds.
+        The gateway path is module-global instead: the session key is a
+        contextvar (inherited by threads hermes spawns), the pending entry goes
+        into `_gateway_queues`, and `resolve_gateway_approval` unblocks it from
+        whichever thread the HTTP handler happens to be on. This is what
+        hermes-webui does, for the same reason.
+
+        `HERMES_GATEWAY_SESSION` is the switch `_is_gateway_approval_context()`
+        reads; `HERMES_INTERACTIVE` tells the non-interactive auto-approve path
+        to stay out of it.
         """
         import os
 
         try:
-            from tools import terminal_tool
+            from tools import approval as ap
 
-            terminal_tool.set_approval_callback(
-                lambda *a, **kw: self._ask(stream, *a, **kw)
-            )
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
             os.environ["HERMES_INTERACTIVE"] = "1"
+            key = self._approval_key(stream)
+            # A contextvar, so every thread hermes starts for this turn agrees
+            # on which conversation is asking.
+            self._approval_tokens[stream.stream_id] = ap.set_current_session_key(key)
+            ap.register_gateway_notify(key, lambda data: self._notify_approval(stream, key, data))
         except Exception:  # noqa: BLE001 -- a missing hook must not fail the turn
-            log.debug("could not install the approval callback", exc_info=True)
+            log.warning("could not install the approval hook", exc_info=True)
 
-    def _ask(self, stream: TurnStream, command: str = "", description: str = "",
-             *, allow_permanent: bool = True, **_: Any) -> str:
-        """Ask the reader, through hermes' own approval state.
+    @staticmethod
+    def _approval_key(stream: TurnStream) -> str:
+        """One key per CONVERSATION, so "allow for this session" means what a
+        reader thinks it means and a reconnect finds its own pending card."""
+        return str(stream.session_id or stream.stream_id)
 
-        hermes' contract, from `tools/approval.py`:
-            (command, description, *, allow_permanent=True)
-              -> 'once' | 'session' | 'always' | 'deny'
+    def _notify_approval(self, stream: TurnStream, key: str, data: dict) -> None:
+        """hermes has something to ask. Put it on this turn's stream.
 
-        The state lives in `tools.approval` — `_pending`, `_session_approved`,
-        `submit_pending`, `approve_session`, `is_approved` — and the routes read
-        the same module, which is what hermes-webui does. Keeping a second
-        pending-map here would be a copy of a thing hermes already owns, and the
-        two would drift the first time a code path answered one and not the
-        other.
-
-        This runs on the TURN's thread and blocks it, which is correct: the tool
-        call has not happened yet and must not until someone says so.
+        Runs on the agent's thread, inside the wait — emitting here is what
+        makes the card appear while the turn is still blocked, which is the
+        whole point.
         """
-        from tools import approval as ap  # noqa: PLC0415
-
-        key = f"{stream.session_id or stream.stream_id}"
-        # hermes keys its own approvals on the DESCRIPTION (`approval.py:665`,
-        # `pattern_key = description`), so use the same thing or "本次会话都允许"
-        # would approve a key nothing ever checks.
-        pattern = description or command
-        if ap.is_approved(key, pattern):
-            return "session"
-
-        req_id = f"perm-{uuid.uuid4().hex[:12]}"
-        answered = threading.Event()
-        box: dict[str, str] = {}
         opts = [
             {"optionId": "once", "name": "允许一次"},
             {"optionId": "session", "name": "本次会话都允许"},
         ]
-        if allow_permanent:
+        if data.get("allow_permanent", True):
             opts.append({"optionId": "always", "name": "始终允许"})
         opts.append({"optionId": "deny", "name": "拒绝"})
+        title = str(data.get("description") or data.get("command") or "需要确认")
+        stream.emit(
+            "approval",
+            id=key,                      # resolve_gateway_approval keys on this
+            title=title,
+            command=str(data.get("command") or ""),
+            options=opts,
+        )
+        status_note = f"需要你确认：{title}"
+        stream.emit("note", text=status_note)
 
-        ap.submit_pending(key, {
-            "id": req_id,
-            "title": description or command or "需要确认",
-            "command": command,
-            "options": opts,
-            # `answer` is how the route hands the choice back to this thread.
-            "answer": lambda choice: (box.setdefault("choice", choice), answered.set()),
-            "pattern": pattern,
-            "session_key": key,
-        })
-        # Push it to whoever is watching this turn; `pollApprovals` is the
-        # fallback for a reader who reconnected and missed the event.
-        stream.emit("approval", id=req_id, title=description or command or "需要确认",
-                    options=opts)
+    def _release_approval(self, stream: TurnStream) -> None:
+        """Drop the turn's approval wiring, and deny anything still pending.
 
-        if not answered.wait(timeout=APPROVAL_TIMEOUT_S):
-            with ap._lock:
-                ap._pending.pop(key, None)
-            stream.emit("note", text="确认超时，已拒绝")
-            return "deny"
+        A turn that ended with a card still on screen would otherwise leave an
+        entry in `_gateway_queues` that nothing will ever answer, and the next
+        approval for this conversation would queue behind it.
+        """
+        try:
+            from tools import approval as ap
 
-        choice = box.get("choice") or "deny"
-        if choice in ("session", "always"):
-            ap.approve_session(key, pattern)
-            if choice == "always":
-                ap.approve_permanent(pattern)
-        return choice
+            key = self._approval_key(stream)
+            ap.resolve_gateway_approval(key, "deny", resolve_all=True)
+            if hasattr(ap, "unregister_gateway_notify"):
+                ap.unregister_gateway_notify(key)
+            tok = self._approval_tokens.pop(stream.stream_id, None)
+            if tok is not None:
+                ap.reset_current_session_key(tok)
+        except Exception:  # noqa: BLE001
+            log.debug("approval teardown skipped", exc_info=True)
 
     def _run_turn(
         self, stream: TurnStream, session_id: str, text: str, endpoint: Endpoint
@@ -274,6 +276,7 @@ class TurnManager:
             log.exception("turn %s failed", stream.stream_id)
             stream.finish(error=str(e) or e.__class__.__name__)
         finally:
+            self._release_approval(stream)
             self._pool.clear_running(stream.stream_id)
 
     # ── stopping ───────────────────────────────────────────────────────────
@@ -289,4 +292,17 @@ class TurnManager:
         if stream is None or not stream.running:
             return False
         stream.stopped = True
+        # Deny anything this conversation is parked on FIRST. `interrupt` only
+        # sets a flag the conversation loop reads, and a turn blocked waiting
+        # for permission is not in that loop — it is parked on the approval
+        # queue, which is exactly where a reader who pressed Stop most wants it
+        # to stop. Releasing it lets the turn reach the loop and see the flag.
+        try:
+            from tools import approval as ap
+
+            n = ap.resolve_gateway_approval(self._approval_key(stream), "deny", resolve_all=True)
+            if n:
+                stream.emit("note", text="已停止：拒绝了等待中的确认")
+        except Exception:  # noqa: BLE001 -- a failed release must not fail the stop
+            log.debug("no pending approval to release for %s", stream_id, exc_info=True)
         return self._pool.interrupt(stream_id, "user asked to stop")

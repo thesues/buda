@@ -209,23 +209,60 @@ def test_finished_streams_are_eventually_dropped(monkeypatch):
 def _fake_approval(monkeypatch):
     """Stand in for `tools.approval`, which lives in hermes' venv.
 
-    Only the surface `_ask` uses: the pending map, its lock, and the three
-    approve/is-approved calls. Real enough that a wrong key or a missed
-    resolution still shows up here.
+    Models the GATEWAY surface — a module-global queue keyed by session, a
+    notify callback, and a resolve that unblocks from any thread — because that
+    is the surface this code uses. The thread-local
+    `terminal_tool.set_approval_callback` is NOT modelled: it is what this
+    replaced, and modelling it would let the old bug pass.
     """
     import sys
     import threading as _t
     import types
 
     ap = types.ModuleType("tools.approval")
-    ap._pending = {}
-    ap._lock = _t.Lock()
-    ap._session = set()
-    ap._permanent = set()
-    ap.submit_pending = lambda key, entry: ap._pending.__setitem__(key, entry)
-    ap.approve_session = lambda key, pat: ap._session.add((key, pat))
-    ap.approve_permanent = lambda pat: ap._permanent.add(pat)
-    ap.is_approved = lambda key, pat: (key, pat) in ap._session or pat in ap._permanent
+    ap.queues = {}          # session_key -> list of {"data":…, "event":…, "choice":…}
+    ap.notify = {}
+    ap._key = {"v": "default"}
+
+    ap.bound = []           # every key this turn bound, in order
+
+    def set_current_session_key(k):
+        prev = ap._key["v"]
+        ap._key["v"] = k
+        ap.bound.append(k)
+        return prev
+
+    def reset_current_session_key(tok):
+        ap._key["v"] = tok
+
+    def register_gateway_notify(k, cb):
+        ap.notify[k] = cb
+
+    def resolve_gateway_approval(k, choice, resolve_all=False):
+        q = ap.queues.get(k) or []
+        targets = list(q) if resolve_all else q[:1]
+        for t in targets:
+            t["choice"] = choice
+            t["event"].set()
+            q.remove(t)
+        return len(targets)
+
+    def ask(k, data):
+        """What hermes does on the agent thread: queue, notify, block."""
+        entry = {"data": data, "event": _t.Event(), "choice": None}
+        ap.queues.setdefault(k, []).append(entry)
+        cb = ap.notify.get(k)
+        if cb:
+            cb(data)
+        entry["event"].wait(timeout=10)
+        return entry["choice"] or "deny"
+
+    ap.set_current_session_key = set_current_session_key
+    ap.reset_current_session_key = reset_current_session_key
+    ap.register_gateway_notify = register_gateway_notify
+    ap.resolve_gateway_approval = resolve_gateway_approval
+    ap.ask = ask
+
     tools = sys.modules.get("tools") or types.ModuleType("tools")
     tools.approval = ap
     monkeypatch.setitem(sys.modules, "tools", tools)
@@ -233,13 +270,32 @@ def _fake_approval(monkeypatch):
     return ap
 
 
-def test_a_permission_prompt_reaches_the_reader_and_blocks_until_answered(monkeypatch):
-    """The turn must not proceed while it is asking.
+def test_the_approval_hook_is_the_gateway_one_not_the_thread_local(monkeypatch):
+    """`terminal_tool.set_approval_callback` stores into a `threading.local`.
 
-    The previous behaviour refused everything, because the client had no way to
-    answer — which made `terminal` useless: the first command that needed
-    permission failed and the agent was told no by a thing the reader never saw.
+    hermes dispatches tools on its own threads, so a callback registered on the
+    turn's thread is invisible where the question is actually asked; hermes
+    then falls through to an `input()` that nothing will ever answer. Measured
+    on the cluster: `terminal / running`, no events for minutes, the endpoint's
+    only slot held, and `interrupt()` unable to help because it sets a flag the
+    conversation loop reads and the loop was never reached.
+
+    So the turn must bind the session key (a contextvar, inherited by threads)
+    and register a gateway notify — not the thread-local callback.
+
+    Ablation: go back to `terminal_tool.set_approval_callback` and this fails.
     """
+    ap = _fake_approval(monkeypatch)
+    m = _mgr(monkeypatch)
+    s = m.start(session_id="s1", text="x", endpoint=_ep())
+    assert _wait_done(s)
+    # Checked as a HISTORY, not a current value: teardown resets the contextvar
+    # when the turn ends, which is correct and would make a live read useless.
+    assert "s1" in ap.bound, "the session key was never bound for this turn"
+    assert "s1" in ap.notify, "no gateway notify was registered"
+
+
+def test_a_permission_request_reaches_the_reader_and_the_turn_waits(monkeypatch):
     import threading
 
     ap = _fake_approval(monkeypatch)
@@ -248,62 +304,63 @@ def test_a_permission_prompt_reaches_the_reader_and_blocks_until_answered(monkey
     assert _wait_done(s)
 
     out = {}
-    t = threading.Thread(target=lambda: out.setdefault("r", m._ask(s, "rm -rf /tmp/x", "delete a path")))
+    t = threading.Thread(target=lambda: out.setdefault(
+        "r", ap.ask("s1", {"command": "rm -rf /tmp/x", "description": "delete a path"})))
     t.start()
 
-    # The card reaches the reader…
     ev = None
-    for _ in range(200):
+    for _ in range(300):
         ev = next((e for e in s.after(0) if e["kind"] == "approval"), None)
         if ev:
             break
         time.sleep(0.01)
-    assert ev, "no approval event was emitted"
+    assert ev, "no approval card was emitted"
+    assert ev["title"] == "delete a path"
     assert [o["optionId"] for o in ev["options"]] == ["once", "session", "always", "deny"]
-
-    # …and the turn is still waiting on it.
     assert t.is_alive(), "the turn carried on without an answer"
 
-    entry = ap._pending["s1"]
-    assert entry["id"] == ev["id"]
-    entry["answer"]("session")
+    ap.resolve_gateway_approval("s1", "session")
     t.join(timeout=5)
     assert out["r"] == "session"
-    # `session` must approve the key hermes itself checks — its own pattern key
-    # is the DESCRIPTION, so approving the command string would approve nothing.
-    assert ("s1", "delete a path") in ap._session
 
 
-def test_an_already_approved_pattern_does_not_ask_again(monkeypatch):
+def test_stop_releases_a_turn_parked_on_an_approval(monkeypatch):
+    """Interrupt alone cannot reach it.
+
+    `interrupt` sets a flag the conversation loop reads; a turn waiting for
+    permission is parked on the approval queue and never reaches that loop.
+    Pressing Stop with a card on screen is exactly when a reader most wants it
+    to stop, so cancel denies what is pending first.
+
+    The turn is held RUNNING here on purpose — cancel returns early for a
+    finished stream, and a finished turn is not the situation this is about.
+
+    Ablation: drop the `resolve_gateway_approval` call from `cancel` and the
+    waiter never returns.
+    """
+    import threading
+
     ap = _fake_approval(monkeypatch)
-    m = _mgr(monkeypatch)
+    parked = threading.Event()
+    released = {}
+
+    def blocking_run(agent, **kw):
+        # What hermes does: ask, and do not come back until answered.
+        parked.set()
+        released["choice"] = ap.ask("s1", {"command": "rm -rf /", "description": "dangerous"})
+        return {"final_response": "stopped"}
+
+    m = _mgr(monkeypatch, run=blocking_run)
     s = m.start(session_id="s1", text="x", endpoint=_ep())
-    assert _wait_done(s)
-    ap.approve_session("s1", "delete a path")
-    assert m._ask(s, "rm -rf /tmp/x", "delete a path") == "session"
-    assert not [e for e in s.after(0) if e["kind"] == "approval"], "asked anyway"
+    assert parked.wait(timeout=5), "the turn never reached the approval"
+    for _ in range(300):
+        if ap.queues.get("s1"):
+            break
+        time.sleep(0.01)
+    assert s.running, "the turn should still be running while it waits"
+
+    m.cancel(s.stream_id)
+    assert _wait_done(s), "the turn did not finish after stop"
+    assert released.get("choice") == "deny", "stop did not deny the parked approval"
 
 
-def test_the_approval_hook_is_installed_per_turn(monkeypatch):
-    """hermes installs it module-side, which would be a race between concurrent
-    turns — except the hook is a `threading.local` and each turn owns a thread.
-    Assert the interactive flag is set, or `tools.approval` takes the
-    non-interactive AUTO-APPROVE path and a tool that should have asked runs."""
-    import os
-    import sys
-    import types
-
-    installed = {}
-    fake = types.ModuleType("tools.terminal_tool")
-    fake.set_approval_callback = lambda cb: installed.setdefault("cb", cb)
-    pkg = types.ModuleType("tools")
-    pkg.terminal_tool = fake
-    monkeypatch.setitem(sys.modules, "tools", pkg)
-    monkeypatch.setitem(sys.modules, "tools.terminal_tool", fake)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-
-    m = _mgr(monkeypatch)
-    s = m.start(session_id="s1", text="x", endpoint=_ep())
-    assert _wait_done(s)
-    assert callable(installed.get("cb")), "the turn must install its own approval callback"
-    assert os.environ.get("HERMES_INTERACTIVE") == "1"

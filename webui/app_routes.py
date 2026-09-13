@@ -239,48 +239,63 @@ def build_app(
     def _perm_pending(req: Request) -> Response:
         """What this conversation is waiting on.
 
-        Scoped by session on purpose: unscoped, this showed one reader a prompt
-        raised in a conversation they had never opened — and let them answer it.
+        Read from hermes' gateway queue, which is keyed by session and lives in
+        `tools.approval` — the same place the blocked turn is parked. Scoped by
+        session on purpose: unscoped, this showed one reader a prompt raised in
+        a conversation they had never opened, and let them answer it.
         """
         sid = req.query.get("session", "")
+        if not sid:
+            return json_response({"pending": []})
         try:
-            ap = _approval_state()
+            from tools import approval as ap  # noqa: PLC0415
+            with ap._lock:
+                entries = list(ap._gateway_queues.get(sid) or [])
         except Exception:  # noqa: BLE001 -- no approval module, nothing pending
             return json_response({"pending": []})
-        with ap._lock:
-            entry = ap._pending.get(sid) if sid else None
-            rows = [entry] if entry else []
-        # `answer` is a callable and the client has no use for it.
-        return json_response({"pending": [
-            {k: v for k, v in r.items() if k in ("id", "title", "command", "options")}
-            for r in rows if r
-        ]})
+
+        out = []
+        for e in entries[:1]:          # one card at a time; the queue is FIFO
+            data = getattr(e, "data", None) or getattr(e, "approval_data", None) or {}
+            if not isinstance(data, dict):
+                data = {}
+            title = str(data.get("description") or data.get("command") or "需要确认")
+            opts = [{"optionId": "once", "name": "允许一次"},
+                    {"optionId": "session", "name": "本次会话都允许"}]
+            if data.get("allow_permanent", True):
+                opts.append({"optionId": "always", "name": "始终允许"})
+            opts.append({"optionId": "deny", "name": "拒绝"})
+            # The id IS the session key: that is what `resolve_gateway_approval`
+            # takes, and the queue is per-conversation FIFO.
+            out.append({"id": sid, "title": title,
+                        "command": str(data.get("command") or ""), "options": opts})
+        return json_response({"pending": out})
 
     @app.route("POST", "/api/approval/answer")
     def _perm_answer(req: Request) -> Response:
-        """Hand one choice back to the blocked turn."""
+        """Hand one choice back to the blocked turn.
+
+        `resolve_gateway_approval` unblocks it from whichever thread this
+        handler happens to run on — which is the whole reason this path is used
+        instead of `terminal_tool.set_approval_callback`, whose slot is
+        thread-local and therefore invisible here.
+        """
         body = req.json()
-        rid = str(body.get("id") or "")
+        sid = str(body.get("id") or body.get("sessionId") or "")
         choice = str(body.get("optionId") or "deny")
-        if not rid:
+        if choice not in ("once", "session", "always", "deny"):
+            return json_response({"error": f"unknown choice: {choice}"}, status=400)
+        if not sid:
             return json_response({"error": "id is required"}, status=400)
         try:
-            ap = _approval_state()
-        except Exception:  # noqa: BLE001
-            return json_response({"error": "approvals unavailable"}, status=503)
-
-        with ap._lock:
-            key = next((k for k, v in ap._pending.items()
-                        if isinstance(v, dict) and v.get("id") == rid), None)
-            entry = ap._pending.pop(key, None) if key else None
-        if entry is None:
-            # Already answered, or expired. Not an error: two tabs can both
-            # have the card on screen and both press a button.
-            return json_response({"ok": True, "stale": True})
-        fn = entry.get("answer")
-        if callable(fn):
-            fn(choice)
-        return json_response({"ok": True, "id": rid, "optionId": choice})
+            from tools import approval as ap  # noqa: PLC0415
+            n = ap.resolve_gateway_approval(sid, choice)
+        except Exception as e:  # noqa: BLE001
+            log.exception("could not resolve the approval")
+            return json_response({"error": str(e)}, status=503)
+        # Nothing pending is not an error: two tabs can both show the card and
+        # both press a button, and the second one is simply late.
+        return json_response({"ok": True, "resolved": n, "stale": n == 0})
 
     # ── media ──────────────────────────────────────────────────────────────
 
