@@ -73,7 +73,8 @@ ARG AUTUMN_SPEC
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH \
-    PIP_INDEX_URL=${PIP_INDEX_URL}
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    UV_INDEX_URL=${PIP_INDEX_URL}
 COPY --from=rusttool /usr/local/cargo /usr/local/cargo
 COPY --from=rusttool /usr/local/rustup /usr/local/rustup
 RUN set -eux; \
@@ -109,7 +110,13 @@ ARG PIP_INDEX_URL=https://pypi.org/simple/
 ARG HERMES_VERSION=0.17.0
 ARG HERMES_EXTRA_INDEX=
 
+# `uv` does NOT read PIP_INDEX_URL — it reads UV_INDEX_URL. The pipeline passes
+# the aliyun mirror as PIP_INDEX_URL, so every `uv pip install` here went to
+# pypi.org anyway: "Resolved 70 packages in 4m 06s" for the hermes install,
+# which was the largest single cost in the build once the crates mirror was
+# fixed. Set both from the one arg and neither tool is left out.
 ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    UV_INDEX_URL=${PIP_INDEX_URL} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
