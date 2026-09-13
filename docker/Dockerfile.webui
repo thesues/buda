@@ -32,7 +32,14 @@
 ARG AUTUMN_SHA=947bae0396481fe9e8586aae7eefa98852d2247d
 ARG AUTUMN_SPEC=https://codeload.github.com/journeymidnight/autumn-rs/tar.gz/${AUTUMN_SHA}
 # crates.io mirror for the wheel build. Defaulted, not empty: the CN build pool
-# reaches crates.io slowly enough that the wheel step times out without it.
+# reaches crates.io slowly enough to matter — a build that pulled its 178 crates
+# from crates.io direct took 24.5 minutes against the 2.5 this image needed
+# before it carried a Rust step at all.
+#
+# Note for whoever times this next: the pipeline's builder keeps NO layer cache
+# between runs (zero CACHED steps in any build so far), so the wheel is compiled
+# every time even though it only changes when AUTUMN_SHA does. If build time
+# becomes the problem again, that — not the mirror — is the thing to attack.
 ARG CARGO_MIRROR=sparse+https://rsproxy.cn/index/
 
 ARG BASE_REGISTRY=
@@ -57,7 +64,11 @@ FROM ${BASE_REGISTRY}library/rust:1.93-bookworm AS rusttool
 FROM ${BASE_REGISTRY}${PYTHON_IMAGE} AS wheel
 ARG APT_MIRROR=
 ARG PIP_INDEX_URL=https://pypi.org/simple/
-ARG CARGO_MIRROR=
+# NO default here. A stage-level `ARG X=` with its own default OVERRIDES the
+# global one, so re-declaring these with `=` silently emptied them: the build
+# logged `if [ -n "" ]`, wrote no cargo config, and pulled 178 crates straight
+# from crates.io. Bare `ARG` inherits the global value, which is the point.
+ARG CARGO_MIRROR
 ARG AUTUMN_SPEC
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
@@ -70,7 +81,9 @@ RUN set -eux; \
       sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources || true; \
     fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config; \
+    # gcc + libc6-dev, not build-essential: cargo needs a linker and a libc,
+    # not make/dpkg-dev/g++ as well.
+    apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev pkg-config; \
     rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     mkdir -p /autumn-src; \
