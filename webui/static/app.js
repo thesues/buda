@@ -849,8 +849,12 @@ async function openSession(id) {
   // A switch the reader started and then abandoned: they are looking at another
   // session now, so painting this one's history would corrupt what they see.
   if (S.sessionId !== id) return;
-  HISTORY_CACHE.set(id, j.history || []);
-  if (!cached) paintHistory(j.history || []);
+  // `events`, which is what `/api/session/history` returns. Reading `history`
+  // here yielded undefined and painted an empty transcript — invisible until
+  // now only because the old URL 404'd before reaching this line.
+  const events = j.events || [];
+  HISTORY_CACHE.set(id, events);
+  if (!cached) paintHistory(events);
   // Not gated on S.busy any more: with several turns possible, the one that
   // matters is whether THIS conversation is streaming — which the map answers
   // directly. The old check asked "is anything streaming, and is it this one",
@@ -933,7 +937,11 @@ function renderAttachments() {
   });
 }
 
-async function attach(file) {
+// `attachFile`, not `attach`: `attach(streamId, seq)` is the SSE subscriber
+// and was here first. Shadowing it made `attach(liveStream, 0)` — the call that
+// reconnects to a turn already running — upload a stream id as if it were a
+// file, so a conversation that was replying rendered nothing at all.
+async function attachFile(file) {
   const ext = (file.name.split(".").pop() || "").toLowerCase();
   const ok = ["png", "jpg", "jpeg", "webp", "gif"];
   if (!ok.includes(ext)) { status(`不支持的图片格式：${ext || "?"}`); return; }
@@ -961,7 +969,7 @@ function wireAttachments() {
   const input = $("#input");
   $("#attach").onclick = () => $("#file-input").click();
   $("#file-input").onchange = (e) => {
-    [...e.target.files].forEach(attach);
+    [...e.target.files].forEach(attachFile);
     e.target.value = "";             // same file twice in a row must still fire
   };
   // Paste. A screenshot arrives as a file with no name, so give it one.
@@ -969,7 +977,7 @@ function wireAttachments() {
     const files = [...(e.clipboardData?.files || [])];
     if (!files.length) return;
     e.preventDefault();
-    files.forEach((f) => attach(f.name ? f : new File([f], `pasted.${(f.type.split("/")[1] || "png")}`, { type: f.type })));
+    files.forEach((f) => attachFile(f.name ? f : new File([f], `pasted.${(f.type.split("/")[1] || "png")}`, { type: f.type })));
   });
   // Drop, on the whole composer rather than the textarea alone — aiming at a
   // one-line input is a worse target than the box around it.
@@ -980,7 +988,7 @@ function wireAttachments() {
     form.addEventListener(t, () => form.classList.remove("dropping")));
   form.addEventListener("drop", (e) => {
     e.preventDefault();
-    [...(e.dataTransfer?.files || [])].forEach(attach);
+    [...(e.dataTransfer?.files || [])].forEach(attachFile);
   });
 }
 

@@ -325,3 +325,49 @@ def test_the_client_only_calls_api_paths_the_server_registers():
     asked = {u.split("?", 1)[0] for u in _client_api_urls() - KNOWN_UNBUILT}
     missing = sorted(a for a in asked if "${" not in a and a not in registered)
     assert not missing, f"client calls paths the server does not register: {missing}"
+
+
+def test_the_client_reads_the_key_the_history_route_actually_returns():
+    """Same class as the path mismatches, one layer down: the URL is right and
+    the KEY is wrong.
+
+    `/api/session/history` answers `{"events": [...]}`. `app.js` read
+    `j.history`, got undefined, and painted an empty transcript — which nobody
+    saw while the old URL still 404'd before reaching that line. Fixing the path
+    is what exposed it.
+
+    Ablation: change `j.events` back to `j.history` in `openSession` and this
+    goes red.
+    """
+    root = Path(__file__).resolve().parents[1]
+    routes = (root / "app_routes.py").read_text()
+    js = (root / "static" / "app.js").read_text()
+
+    # What the route puts in the body.
+    hist = routes[routes.index('@app.route("GET", "/api/session/history")'):]
+    hist = hist[:hist.index("@app.route", 10)]
+    assert '"events"' in hist, "the history route no longer answers an `events` key"
+
+    # What the client pulls out of it.
+    call = js[js.index("/api/session/history"):]
+    call = call[:call.index("HISTORY_CACHE.set") + 200]
+    assert "j.events" in call, (
+        "app.js does not read `events` from the history response; the route "
+        "returns no other key, so the transcript would paint empty"
+    )
+    assert "j.history" not in call, "app.js still reads the key the route never sends"
+
+
+def test_the_upload_helper_does_not_shadow_the_sse_subscriber():
+    """`attach(streamId, seq)` subscribes to a running turn. A file-upload
+    helper called `attach` shadowed it, so reconnecting to a live conversation
+    uploaded a stream id as a file and rendered nothing.
+
+    Ablation: rename `attachFile` back to `attach` and this goes red.
+    """
+    js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
+    defs = re.findall(r"^\s*(?:async\s+)?function\s+attach\s*\(([^)]*)\)", js, re.M)
+    assert len(defs) == 1, f"`attach` is defined {len(defs)} times: {defs}"
+    # The one that owns the name takes (streamId, afterSeq).
+    assert "seq" in defs[0].lower(), f"the surviving `attach` is not the subscriber: attach({defs[0]})"
+    assert "function attachFile(" in js, "the upload helper should be `attachFile`"

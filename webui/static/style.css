@@ -325,13 +325,24 @@ header h1 em { color:var(--accent); font-style:italic; }
    Above the textarea, not inside it: what the composer sends is a URL, and
    the thumbnail is there so you can see what you attached and take it back
    off before sending. */
+/* `#composer` is a single flex ROW with no wrap. A full-width child inside it
+   takes the whole line and squeezes the textarea and the send button into a
+   corner — which is exactly what happened. Let the form wrap and give this its
+   own line above the input.
+
+   And `[hidden]` must win: `hidden` is only the UA stylesheet's `display:none`,
+   so ANY explicit display here overrides it and an empty attachment strip
+   keeps its line forever. */
+#composer { flex-wrap: wrap; }
 #attachments {
   display: flex;
   flex-wrap: wrap;
   gap: .4rem;
   padding: .4rem .2rem 0;
-  width: 100%;
+  flex: 0 0 100%;
+  order: -1;
 }
+#attachments[hidden] { display: none; }
 #attachments .chip {
   position: relative;
   display: inline-flex;
