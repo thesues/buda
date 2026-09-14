@@ -157,7 +157,9 @@ function harness({ current = null, streaming = {}, store = new Map(), server: sh
     ],
     nextStream: 1,
   };
-  const reply = (j) => Promise.resolve({ ok: true, status: 200, json: async () => j, text: async () => "" });
+  // A JSON round trip, like the wire: handing the client the server's own
+  // objects let a server-side change mutate client state behind its back.
+  const reply = (j) => Promise.resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(j)), text: async () => "" });
   const fetch = (url, opts = {}) => {
     const u = new URL(String(url), "http://x");
     const body = opts.body ? JSON.parse(opts.body) : null;
@@ -167,14 +169,14 @@ function harness({ current = null, streaming = {}, store = new Map(), server: sh
         return reply({ sessions: server.sessions, current: server.current, streaming: server.streaming, endpoints: server.endpoints });
       case "/api/status":
         return reply({ endpoints: server.endpoints, defaultEndpoint: "dsv4" });
-      case "/api/chat/start": {
+      case "/api/chat/start": return (server.startGate || Promise.resolve()).then(() => {
         const sid = body.new || !body.sessionId ? `new-${server.nextStream}` : body.sessionId;
         const stream = `s${server.nextStream++}`;
         server.streaming[sid] = stream;
         server.current = sid;
         if (!server.sessions.find((r) => r.id === sid)) server.sessions.unshift({ id: sid, title: body.text, messageCount: 0 });
         return reply({ streamId: stream, sessionId: sid, endpoint: body.endpoint });
-      }
+      });
       case "/api/chat/cancel": return reply({ ok: true });
       case "/api/chat/status": {
         const id = u.searchParams.get("stream_id");
@@ -451,6 +453,120 @@ const posts = (h, p) => h.calls.filter((c) => c.path === p);
   await settle();
   assert.strictEqual(h.S().sessionId, "rotated", "a rotation on the session's own stream is no longer followed");
   assert.ok(h.$("#messages").textContent.includes("after-rotation"));
+}
+
+/* ---------- 8. races and leftovers the pi review found ---------- */
+const withOld = (h) => {
+  h.server.sessions.push({ id: "old", title: "old question", messageCount: 2 });
+  h.server.history.old = [
+    { kind: "history_user", text: "old question" },
+    { kind: "delta", text: "old answer", thought: false },
+  ];
+};
+const rowOf = (h, title) => h.$("#sessions").querySelectorAll("li").find((li) => li.textContent.includes(title));
+const count = (hay, needle) => hay.split(needle).length - 1;
+
+// #1 an approval left behind must not lock the composer everywhere else
+{
+  const h = harness(); await settle();
+  h.type("run a command"); h.$("#send").click(); await settle();
+  const sid = h.S().sessionId, stream = h.S().streamId;
+  h.push(stream, { kind: "approval", id: sid, title: "rm -rf /tmp/x", options: [], seq: 2, session: sid });
+  assert.ok(h.S().awaitingPerm);
+  h.$("#new-session").click(); await settle();
+  h.pick("mm2"); h.type("elsewhere"); h.$("#send").click(); await settle();
+  assert.strictEqual(posts(h, "/api/chat/start").length, 2,
+    `a pending approval in another conversation blocked this send: ${h.$("#run-status").textContent}`);
+}
+
+// #4 a double-click on one row paints the transcript once
+{
+  const h = harness(); withOld(h); await settle();
+  h.run("loadSessions()"); await settle();
+  rowOf(h, "old question").onclick(); rowOf(h, "old question").onclick();
+  await settle(); await settle();
+  assert.strictEqual(count(h.$("#messages").textContent, "old answer"), 1,
+    `a double-click drew the transcript twice: ${JSON.stringify(h.$("#messages").textContent)}`);
+}
+
+// #5 a stream the sidebar still lists as live, but which has finished, is not
+//    replayed on top of the transcript that already contains its turn
+{
+  const h = harness(); await settle();
+  h.type("q1"); h.$("#send").click(); await settle();
+  const sid = h.S().sessionId, stream = h.S().streamId;
+  h.push(stream, { kind: "user", text: "q1", seq: 1, session: sid });
+  h.push(stream, { kind: "delta", text: "a1-final", seq: 2, session: sid });
+  h.$("#new-session").click(); await settle();
+  // The turn ends server-side between two sidebar polls: this page never hears
+  // it (its feed dropped), and S.streaming still says the session is live.
+  h.sources.filter((es) => es.url.includes(`stream_id=${stream}&`)).forEach((es) => es.close());
+  delete h.server.streaming[sid];
+  h.server.history[sid] = [{ kind: "history_user", text: "q1" }, { kind: "delta", text: "a1-final", thought: false }];
+  h.server.events[stream].push({ kind: "end", error: null, seq: 3, session: sid });
+  assert.ok(h.S().streaming[sid], "precondition: the client's streaming map is stale");
+  rowOf(h, "q1").onclick(); await settle(); await settle();
+  assert.strictEqual(count(h.$("#messages").textContent, "a1-final"), 1,
+    `the finished turn was painted from the store AND replayed: ${JSON.stringify(h.$("#messages").textContent)}`);
+  assert.ok(!h.S().busy, "a finished turn left the view busy");
+}
+
+// #6 a click during boot is not overridden by boot reopening the saved view
+{
+  const store = new Map([["hermes.view", "saved"]]);
+  const h = harness({ store });
+  withOld(h);
+  h.server.sessions.push({ id: "saved", title: "saved question", messageCount: 2 });
+  h.server.history.saved = [{ kind: "history_user", text: "saved question" }];
+  h.run('openSession("old")');          // the reader clicks before boot settles
+  await settle(); await settle();
+  assert.strictEqual(h.S().sessionId, "old", "boot reopened the saved view over the reader's click");
+  assert.ok(!h.$("#messages").textContent.includes("saved question"));
+}
+
+// #7 another session's end does not remove this view's 思考中 row
+{
+  const h = harness(); await settle();
+  h.type("A"); h.$("#send").click(); await settle();
+  const sidA = h.S().sessionId, streamA = h.S().streamId;
+  h.$("#new-session").click(); await settle();
+  h.pick("mm2"); h.type("B"); h.$("#send").click(); await settle();
+  assert.ok(h.$("#pending"), "precondition: B shows its pending row");
+  h.push(streamA, { kind: "end", error: null, seq: 5, session: sidA });
+  await settle();
+  assert.ok(h.$("#pending"), "a background turn's end removed this conversation's 思考中 row");
+}
+
+// #3 leaving the view while the send is in flight keeps its reply out of the new view
+{
+  const h = harness(); withOld(h); await settle();
+  h.run("loadSessions()"); await settle();
+  let release; h.server.startGate = new Promise((r) => { release = r; });
+  h.type("asked from the fresh view"); h.$("#send").click();
+  await settle();
+  rowOf(h, "old question").onclick(); await settle(); await settle();
+  release(); await settle(); await settle();
+  assert.strictEqual(h.S().sessionId, "old", "the send's response took over the view the reader moved to");
+  assert.strictEqual(h.store.get("hermes.view"), "old");
+  const [start] = posts(h, "/api/chat/start");
+  const stream = `s1`;
+  h.push(stream, { kind: "delta", text: "reply-to-fresh", seq: 2, session: start && "new-1" });
+  await settle();
+  assert.ok(!h.$("#messages").textContent.includes("reply-to-fresh"),
+    "the moved-away send's reply was drawn into the conversation on screen");
+  assert.ok(!h.S().owns, "the view offers 停止 for a turn it does not show");
+  // ...and the conversation it started is still reachable and live.
+  h.run("loadSessions()"); await settle();
+  assert.ok(h.S().streaming["new-1"], "the started turn vanished from the sidebar");
+
+  // 新会话 during the send: the fresh view stays fresh and pending.
+  const h2 = harness(); await settle();
+  let rel2; h2.server.startGate = new Promise((r) => { rel2 = r; });
+  h2.type("first"); h2.$("#send").click(); await settle();
+  h2.$("#new-session").click(); await settle();
+  rel2(); await settle(); await settle();
+  assert.ok(h2.S().pendingNew && !h2.S().sessionId && h2.$(".chat").classList.contains("fresh"),
+    "新会话 during a send was overridden by the send's response");
 }
 
 console.log("ok - a new session leaves the running one alone");

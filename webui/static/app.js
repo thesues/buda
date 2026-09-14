@@ -88,6 +88,8 @@ const S = {
   actIndex: 0,           // its position in the transcript, for the open-state key
   sessionId: null,
   switching: null,      // a history read in flight; sending must wait for it
+  viewGen: 0,           // bumped whenever the view changes (openSession/newSession);
+                        // an await that returns to a different gen must not touch it
   pendingNew: false,    // "new session" clicked; the ACP move happens on send
   ownStream: null,      // the stream THIS view started, before it has an id
   sessionRows: [],      // last list from the server, so a click can repaint now
@@ -803,8 +805,8 @@ function endTurn(error, owner, from) {
       : (!from || from === S.streamId);
   if (owner) HISTORY_CACHE.delete(owner);
   if (S.sessionId) HISTORY_CACHE.delete(S.sessionId);
-  clearPending();
   if (shown) {
+    clearPending();         // only ours: a foreign end took this view's 思考中 row
     finalizeSeg();
     S.activity = null;      // the next turn opens its own group
     setBusy(false);
@@ -1040,6 +1042,16 @@ function paintHistory(history) {
 }
 
 async function openSession(id) {
+  // Every await below re-checks this. A second click on the row already
+  // loading used to paint the transcript twice: both calls passed a "still
+  // this session id" check. The first call's generation is stale, so it stops.
+  const gen = ++S.viewGen;
+  // An approval card belongs to the conversation being left, and its card is
+  // about to be erased. Left raised, every send in the tab answered
+  // "先回答上方的确认请求" with nothing on screen to answer — and nothing lowers
+  // it, because the approval poll stops with the busy state. Returning to that
+  // conversation replays the approval and raises it again.
+  S.awaitingPerm = false;
   clearFresh();
   S.ownStream = null;       // whatever we started, we are not looking at it now
   // Leaving a pending 新会话 for a real conversation. Left raised, the next
@@ -1079,6 +1091,19 @@ async function openSession(id) {
   S.switching = id;
   status(cached ? "切换中…" : "载入中…");
 
+  // `S.streaming` is up to one sidebar poll old. A turn that ended since then
+  // is committed to the store, so replaying its stream as well painted that
+  // turn twice. Ask — BEFORE the history read: a turn ending between the two
+  // then costs a duplicate, never a missing turn, which the other order would.
+  let liveStream = S.streaming[id] || null;
+  if (liveStream) {
+    try {
+      const st = await (await fetch(`/api/chat/status?stream_id=${encodeURIComponent(liveStream)}`)).json();
+      if (!st.running) { delete S.streaming[id]; liveStream = null; }
+    } catch (_) { /* unreachable: trust the map, the replay reports what it finds */ }
+    if (gen !== S.viewGen) return;
+  }
+
   let j;
   try {
     // Query string, not a path segment. The server's router is an exact
@@ -1086,19 +1111,22 @@ async function openSession(id) {
   // the path matches no route and 404s.
   j = await (await fetch(`/api/session/history?id=${encodeURIComponent(id)}`)).json();
   } catch (_) {
-    S.switching = null; status("载入会话失败"); return;
+    if (gen === S.viewGen) { S.switching = null; status("载入会话失败"); }
+    return;
   }
+  // A switch the reader started and then abandoned: they are looking at another
+  // view now, so painting this one's history would corrupt what they see. The
+  // generation, not the id: 打开 A → 新会话 → 打开 A leaves the id equal while
+  // the first call's view is long gone.
+  if (gen !== S.viewGen) return;
   S.switching = null;
   if (j.error) { status(`载入失败: ${j.error}`); return; }
-  // A switch the reader started and then abandoned: they are looking at another
-  // session now, so painting this one's history would corrupt what they see.
-  if (S.sessionId !== id) return;
   // An EMPTY transcript for a session the sidebar says has messages means the
   // row is gone (deleted in another tab) or never persisted. Say so — a silent
   // empty panel read as "the messages are lost". Not for a LIVE session: a
   // first turn persists only when it ends, so its store is empty while it
   // runs — returning here left a reloaded page never attaching to the reply.
-  if (!(j.events || []).length && !S.streaming[id]) {
+  if (!(j.events || []).length && !liveStream) {
     const row = (S.sessionRows || []).find((r) => r.id === id);
     finalizeSeg();
     addMsg("note", (row && row.messageCount) ? "这个会话的内容已不可读（可能已在别处删除）" : "这个会话还没有内容");
@@ -1118,7 +1146,6 @@ async function openSession(id) {
   // matters is whether THIS conversation is streaming — which the map answers
   // directly. The old check asked "is anything streaming, and is it this one",
   // and its first half is no longer a useful question.
-  const liveStream = S.streaming[id];
   if (liveStream) {
     // Back on a conversation that is running. The store stops where the
     // committed transcript does, so replay the live turn from the top rather
@@ -1178,6 +1205,9 @@ async function newSession() {
   // titleless zero-message rows exactly that way. The intent is recorded and
   // the session is created by the send that gives it something to hold.
   S.pendingNew = true;
+  S.viewGen++;
+  S.switching = null;       // a history read still in flight is for a view now gone
+  S.awaitingPerm = false;   // see openSession: the card leaves with the view
   S.ownStream = null;       // nothing on screen is ours until we send
   // The turn in flight keeps running and keeps its stream; only the drawing
   // stops, because `apply` now checks who each event belongs to. Detaching or
@@ -1213,6 +1243,7 @@ async function send() {
   S.seg = null;
   S.activity = null;
   S.skipUserEcho = true;
+  const gen = S.viewGen;    // the view this send was typed into
   let j;
   try {
     j = await (await fetch("/api/chat/start", {
@@ -1232,6 +1263,23 @@ async function send() {
       }),
     })).json();
   } catch (_) { status("发送失败"); return; }
+  if (gen !== S.viewGen) {
+    // The reader moved — clicked a row or 新会话 — while the request was out.
+    // Adopting the response now would stamp this conversation onto THAT view:
+    // its id, its saved position, and its reply drawn under someone else's
+    // transcript. The turn itself started and keeps running; record it so the
+    // sidebar marks it live and opening it replays the reply from the top.
+    S.skipUserEcho = false;
+    if (j.error) {
+      if ((j.busy || j.taken) && !input.value) input.value = text;   // never eat what was typed
+      status(j.error);
+    } else if (j.sessionId && j.streamId) {
+      S.streaming[j.sessionId] = j.streamId;
+      if (j.endpoint) { S.sessionEp[j.sessionId] = j.endpoint; saveSessionEp(); }
+    }
+    loadSessions();
+    return;
+  }
   if (j.error) {
     // Two ways a send can be refused, and neither may eat what was typed:
     // `busy` is the server at capacity (the composer should already have been
@@ -1303,8 +1351,12 @@ async function boot() {
     localStorage.removeItem("hermes.streamId"); localStorage.removeItem("hermes.lastSeq");
   } catch (_) {}
   const view = recallView();
+  const gen = S.viewGen;
   await loadSessions();
-  if (view && ((S.sessionRows || []).some((r) => r.id === view) || S.streaming[view])) {
+  if (gen !== S.viewGen) {
+    // The reader already chose — the sidebar rendered during the await and
+    // they clicked a row or 新会话. Reopening the saved view would override it.
+  } else if (view && ((S.sessionRows || []).some((r) => r.id === view) || S.streaming[view])) {
     openSession(view);
   } else {
     // Nothing to reopen: this IS a fresh conversation, so say so rather than
