@@ -657,6 +657,10 @@ function apply(ev, from) {
   // (Live events always carry `session` and come with `from` set; the gate
   // below exists to route THOSE.)
   const replay = from === undefined;
+  // openSession is reading this conversation's history, and a live turn will
+  // then be replayed from seq 0 — a frame drawn now would be drawn twice. `end`
+  // still runs: it closes the feed, and the replay delivers it again.
+  if (!replay && S.switching && ev.session === S.switching && ev.kind !== "end") return;
   const fresh = S.pendingNew && !S.sessionId;
   // hermes ROTATES the session id under a long conversation (context
   // compression continues under a new id). Frames after the rotation carry the
@@ -1042,6 +1046,11 @@ async function openSession(id) {
   // send went out as `new: true` and opened ANOTHER conversation instead of
   // continuing the one on screen.
   S.pendingNew = false;
+  // The focus stream belongs to the conversation being LEFT. Kept, the rotation
+  // rule in apply() read that turn's next token as "the session on screen was
+  // renamed" and pulled the view back to it, drawing its reply under this
+  // transcript. attach() below sets it again if THIS session is live.
+  S.streamId = null;
   S.sessionId = id;
   rememberView(id);
   // The picker follows the conversation: show the model THIS session uses.
@@ -1175,7 +1184,8 @@ async function newSession() {
   // calling `endTurn` here would abandon a live reply.
   $("#messages").textContent = "";
   S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
-  rememberView(null);       // a reload now opens on 新的对话, as the screen does
+  S.streamId = null;        // the left conversation's turn is no longer the focus
+  rememberView(null);      // a reload now opens on 新的对话, as the screen does
   showFresh();
   setBusy(false);    // the new view owns nothing — same as openSession on an idle
                      // conversation. The other turn's feed stays in S.ess.

@@ -404,4 +404,53 @@ const posts = (h, p) => h.calls.filter((c) => c.path === p);
     `a send after 新会话 → reopen went to ${JSON.stringify(last.body)}`);
 }
 
+/* ---------- 7. leaving a live session does not get pulled back to it ---------- */
+{
+  // Production: "hello dsv4" replying, the reader clicks "hello mini" — the
+  // dsv4 tokens kept drawing under mini's transcript and the view jumped back
+  // to dsv4. The rotation rule in apply() adopts a frame's session when it
+  // arrives on the FOCUS stream, and leaving a session never cleared the focus,
+  // so the next dsv4 token read as "this conversation was renamed".
+  const h = harness();
+  h.server.sessions.push({ id: "mini", title: "hello mini", messageCount: 2 });
+  h.server.history.mini = [
+    { kind: "history_user", text: "hello mini" },
+    { kind: "delta", text: "mini answer", thought: false },
+  ];
+  await settle();
+  h.pick("dsv4"); h.type("hello dsv4"); h.$("#send").click(); await settle();
+  const sidD = h.S().sessionId, streamD = h.S().streamId;
+  h.push(streamD, { kind: "user", text: "hello dsv4", seq: 1, session: sidD });
+  h.push(streamD, { kind: "delta", text: "dsv4-token-1", seq: 2, session: sidD });
+
+  const rowFor = (title) => h.$("#sessions").querySelectorAll("li").find((li) => li.textContent.includes(title));
+  h.run("loadSessions()"); await settle();
+  rowFor("hello mini").onclick(); await settle(); await settle();
+  h.push(streamD, { kind: "delta", text: "dsv4-token-2", seq: 3, session: sidD });
+  await settle(); await settle();
+
+  assert.strictEqual(h.S().sessionId, "mini", "the view was pulled back to the session still replying");
+  const shown = h.$("#messages").textContent;
+  assert.ok(shown.includes("mini answer") && !shown.includes("dsv4-token-2"),
+    `another session's tokens were drawn into the one on screen: ${JSON.stringify(shown)}`);
+  assert.strictEqual(h.store.get("hermes.view"), "mini");
+  assert.ok(!h.S().owns, "the idle view offers 停止 for the other session's turn");
+
+  // Back to dsv4: its live turn is replayed, and a real rotation on ITS
+  // stream is still followed.
+  rowFor("hello dsv4").onclick();
+  // A token lands while the history read is still in flight: the replay from
+  // seq 0 will deliver it, so drawing it now as well would show it twice.
+  h.push(streamD, { kind: "delta", text: "|mid-switch|", seq: 4, session: sidD });
+  await settle(); await settle();
+  const back = h.$("#messages").textContent;
+  assert.ok(back.includes("dsv4-token-2"), "returning to the live session lost its reply");
+  assert.strictEqual(back.split("|mid-switch|").length - 1, 1,
+    `a token that arrived during the switch was drawn twice: ${JSON.stringify(back)}`);
+  h.push(streamD, { kind: "delta", text: "after-rotation", seq: 5, session: "rotated" });
+  await settle();
+  assert.strictEqual(h.S().sessionId, "rotated", "a rotation on the session's own stream is no longer followed");
+  assert.ok(h.$("#messages").textContent.includes("after-rotation"));
+}
+
 console.log("ok - a new session leaves the running one alone");
