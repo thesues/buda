@@ -284,8 +284,10 @@ def build_app(
             return json_response({"pending": []})
         try:
             from tools import approval as ap  # noqa: PLC0415
+            # A rotated turn still queues under the id it started with.
+            key = manager.approval_key_for(sid)
             with ap._lock:
-                entries = list(ap._gateway_queues.get(sid) or [])
+                entries = list(ap._gateway_queues.get(key) or [])
         except Exception:  # noqa: BLE001 -- no approval module, nothing pending
             return json_response({"pending": []})
 
@@ -302,7 +304,7 @@ def build_app(
             opts.append({"optionId": "deny", "name": "拒绝"})
             # The id IS the session key: that is what `resolve_gateway_approval`
             # takes, and the queue is per-conversation FIFO.
-            out.append({"id": sid, "title": title,
+            out.append({"id": key, "title": title,
                         "command": str(data.get("command") or ""), "options": opts})
         return json_response({"pending": out})
 

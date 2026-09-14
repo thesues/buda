@@ -258,6 +258,10 @@ class TurnManager:
             os.environ["HERMES_GATEWAY_SESSION"] = "1"
             os.environ["HERMES_INTERACTIVE"] = "1"
             key = self._approval_key(stream)
+            # Pinned. hermes queues approvals under HERMES_SESSION_KEY, which
+            # compression does not move (it moves HERMES_SESSION_ID), so after a
+            # rotation the queue, the notify and the teardown all stay here.
+            stream.approval_key = key  # type: ignore[attr-defined]
 
             # BOTH, and the env var is the one that carries.
             #
@@ -287,7 +291,14 @@ class TurnManager:
     def _approval_key(stream: TurnStream) -> str:
         """One key per CONVERSATION, so "allow for this session" means what a
         reader thinks it means and a reconnect finds its own pending card."""
-        return str(stream.session_id or stream.stream_id)
+        return str(getattr(stream, "approval_key", None) or stream.session_id or stream.stream_id)
+
+    def approval_key_for(self, session_id: str) -> str:
+        """The gateway queue a conversation's approvals wait in. The session id
+        itself — unless its live turn rotated, in which case the queue is still
+        under the id the turn started with."""
+        live = self.live_for(session_id)
+        return self._approval_key(live) if live is not None else session_id
 
     def _notify_approval(self, stream: TurnStream, key: str, data: dict) -> None:
         """hermes has something to ask. Put it on this turn's stream.
@@ -334,6 +345,22 @@ class TurnManager:
         except Exception:  # noqa: BLE001
             log.debug("approval teardown skipped", exc_info=True)
 
+    def _rotated(self, stream: TurnStream, old: str, new: str) -> None:
+        """hermes compressed the context and continued under a new session id.
+
+        Everything keyed by the conversation moves with it: the live map (so
+        the sidebar marks the new row, and a second prompt into it is `taken`)
+        and the agent cache (so the next turn under the new id continues with
+        the agent that rotated, reading the child session's history). The old
+        row stays in the store as the parent; nothing here deletes it.
+        """
+        with self._lock:
+            if self._live.get(old) is stream:
+                self._live.pop(old, None)
+                self._live[new] = stream
+        self._pool.rename(old, new)
+        log.info("session %s rotated to %s mid-turn (stream %s)", old, new, stream.stream_id)
+
     def _run_turn(
         self, stream: TurnStream, session_id: str, text: str, endpoint: Endpoint
     ) -> None:
@@ -342,6 +369,12 @@ class TurnManager:
             agent = self._pool.acquire(session_id, endpoint)
             self._pool.note_running(stream.stream_id, agent)
             self._install_approval(stream)
+            # After the approval key is pinned: it stays the id the hook was
+            # registered under even if hermes rotates the session.
+            stream.follow(
+                lambda: getattr(agent, "session_id", None),
+                lambda old, new: self._rotated(stream, old, new),
+            )
             from hermes_agent import bind_callbacks
 
             # EVERY turn, cached agent or fresh: a reused agent still carries the

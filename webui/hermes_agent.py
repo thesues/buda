@@ -302,6 +302,16 @@ class AgentPool:
                 log.debug("agent cache: evicted %s", evicted_id)
         return agent
 
+    def rename(self, old: str, new: str) -> None:
+        """hermes rotated this conversation's id (context compression): the
+        agent that rotated IS the continuation, so the next turn under the new
+        id must find it rather than build one that starts from the child row."""
+        with self._lock:
+            entry = self._cache.pop(old, None)
+            if entry is not None:
+                self._cache[new] = entry
+                self._cache.move_to_end(new)
+
     def evict(self, session_id: str) -> None:
         with self._lock:
             self._cache.pop(session_id, None)

@@ -238,6 +238,11 @@ def _fake_approval(monkeypatch):
     def register_gateway_notify(k, cb):
         ap.notify[k] = cb
 
+    ap.unregistered = []
+
+    def unregister_gateway_notify(k):
+        ap.unregistered.append(k)
+
     def resolve_gateway_approval(k, choice, resolve_all=False):
         q = ap.queues.get(k) or []
         targets = list(q) if resolve_all else q[:1]
@@ -260,6 +265,7 @@ def _fake_approval(monkeypatch):
     ap.set_current_session_key = set_current_session_key
     ap.reset_current_session_key = reset_current_session_key
     ap.register_gateway_notify = register_gateway_notify
+    ap.unregister_gateway_notify = unregister_gateway_notify
     ap.resolve_gateway_approval = resolve_gateway_approval
     ap.ask = ask
 
@@ -453,3 +459,107 @@ def test_saturated_pool_still_runs_the_turn(monkeypatch):
     b = m.start(session_id="s2", text="y", endpoint=_ep("e2", 1))
     gate.set()
     assert _wait_done(a) and _wait_done(b)
+
+
+# ── session id rotation ─────────────────────────────────────────────────────
+#
+# hermes' context compression ROTATES the session mid-turn
+# (`agent/conversation_compression.py`, 0.17): it ends the old session, sets
+# `agent.session_id` to a fresh id, creates a child row and persists the rest
+# of the turn there. The stream used to keep stamping the id it was created
+# with, `_live` and the agent cache stayed keyed by it, and the next send went
+# out under the OLD id — handing the agent the pre-compression history while it
+# wrote to the new session.
+
+
+class _RotatingAgent(FakeAgent):
+    def __init__(self, session_id):
+        super().__init__()
+        self.session_id = session_id
+
+
+def _rotating_mgr(monkeypatch, run, history=None):
+    built = []
+
+    def build(session_id, ep):
+        a = _RotatingAgent(session_id)
+        built.append(a)
+        return a
+
+    monkeypatch.setattr(ha, "build_agent", build)
+    return TurnManager(ha.AgentPool(), history=history or (lambda sid: []), run=run), built
+
+
+def test_a_rotation_mid_turn_is_carried_on_the_stream(monkeypatch):
+    """Frames after the rotation, and the end, name the NEW session — that is
+    what the client follows. Ablation: drop the stream's session source and the
+    later frames keep the old id."""
+    gate = threading.Event()
+
+    def run(agent, **kw):
+        agent.stream_delta_callback("before")
+        agent.session_id = "s1-rot"          # compression fired
+        agent.stream_delta_callback("after")
+        gate.wait(3)
+        return {}
+
+    _fake_approval(monkeypatch)
+    m, _ = _rotating_mgr(monkeypatch, run)
+    s = m.start(session_id="s1", text="long", endpoint=_ep())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not any(e.get("text") == "after" for e in s.after(0)):
+        time.sleep(0.005)
+    by_text = {e.get("text"): e["session"] for e in s.after(0) if e["kind"] == "delta"}
+    assert by_text == {"before": "s1", "after": "s1-rot"}, by_text
+    # Live bookkeeping follows it: the sidebar marks the new row, and a second
+    # prompt into the continuation is refused as taken rather than run twice.
+    assert m.running() == {"s1-rot": s.stream_id}
+    assert m.live_for("s1-rot") is s and m.live_for("s1") is None
+    with pytest.raises(Refused) as r:
+        m.start(session_id="s1-rot", text="again", endpoint=_ep())
+    assert r.value.reason == "taken"
+    # A reader polling approvals for the rotated conversation must find the
+    # queue the turn registered, which is still under the id it started with.
+    assert m.approval_key_for("s1-rot") == "s1"
+    assert m.approval_key_for("elsewhere") == "elsewhere"
+    gate.set()
+    assert _wait_done(s)
+    assert s.after(0)[-1] == {**s.after(0)[-1], "kind": "end", "session": "s1-rot"}
+
+
+def test_the_next_turn_continues_the_rotated_session_with_its_own_agent(monkeypatch):
+    """After a rotation the conversation lives under the new id: sending there
+    must reuse the agent that rotated (cache re-keyed) and read THAT session's
+    history. Ablation: drop the pool rename and a fresh agent is built."""
+    seen = []
+
+    def run(agent, **kw):
+        seen.append((kw["session_id"], agent.session_id))
+        if agent.session_id == "s1":
+            agent.session_id = "s1-rot"
+        agent.stream_delta_callback("x")
+        return {}
+
+    histories = []
+    m, built = _rotating_mgr(monkeypatch, run, history=lambda sid: histories.append(sid) or [])
+    assert _wait_done(m.start(session_id="s1", text="one", endpoint=_ep()))
+    assert _wait_done(m.start(session_id="s1-rot", text="two", endpoint=_ep()))
+    assert len(built) == 1, "the rotated conversation was handed a freshly built agent"
+    assert histories == ["s1", "s1-rot"]
+    assert seen[-1] == ("s1-rot", "s1-rot")
+
+
+def test_a_rotation_does_not_strand_the_approval_wiring(monkeypatch):
+    """The approval hook is registered under the key the turn STARTED with;
+    teardown must release that key, not the rotated one, or the old entry is
+    left in hermes' gateway queue for the next approval to queue behind."""
+    ap = _fake_approval(monkeypatch)
+
+    def run(agent, **kw):
+        agent.session_id = "s1-rot"
+        agent.stream_delta_callback("x")
+        return {}
+
+    m, _ = _rotating_mgr(monkeypatch, run)
+    assert _wait_done(m.start(session_id="s1", text="x", endpoint=_ep()))
+    assert ap.unregistered == ["s1"], f"teardown released {ap.unregistered}, not the key it registered"

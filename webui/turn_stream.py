@@ -51,10 +51,44 @@ class TurnStream:
         self.finished_at: float | None = None
         self.error: str | None = None
         self._cv = threading.Condition()
+        # Where the conversation's CURRENT id comes from, once a turn has an
+        # agent. hermes rotates the session mid-turn when it compresses context;
+        # without following it, every later frame named a session the rest of
+        # the turn was no longer being written to.
+        self._session_source = None
+        self._on_rotate = None
+        self._rotate_lock = threading.Lock()
+
+    def follow(self, source, on_rotate=None) -> None:
+        """Stamp frames with `source()` from now on; call `on_rotate(old, new)`
+        once per change, before the first frame that carries the new id."""
+        self._session_source = source
+        self._on_rotate = on_rotate
+
+    def _check_rotation(self) -> None:
+        source = self._session_source
+        if source is None:
+            return
+        try:
+            current = source()
+        except Exception:  # noqa: BLE001 -- a broken source must not lose the frame
+            return
+        if not current or current == self.session_id:
+            return
+        # Several hermes threads emit at once (concurrent tools); one rotation
+        # must be reported once. Outside the condition on purpose: the hook
+        # takes the manager's lock, and no path may hold both.
+        with self._rotate_lock:
+            if current == self.session_id:
+                return
+            old, self.session_id = self.session_id, current
+            if self._on_rotate is not None:
+                self._on_rotate(old, current)
 
     # ── producer side (the agent's worker thread) ──────────────────────────
 
     def emit(self, kind: str, **data) -> None:
+        self._check_rotation()
         with self._cv:
             self.seq += 1
             if len(self.events) == self.events.maxlen:
