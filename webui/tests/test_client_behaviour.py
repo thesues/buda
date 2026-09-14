@@ -101,21 +101,21 @@ def test_a_new_session_does_not_stop_the_one_still_replying():
     r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-800:]
 
-def test_a_finished_turn_does_not_leave_its_cursor_in_local_storage():
-    """The client half of the same bug.
+def test_a_reload_reopens_the_conversation_not_a_stream_cursor():
+    """The stream cursor is retired; the reload path is pinned by running it.
 
-    `apply()` persists the cursor AFTER the switch, and the switch is where
-    `end` runs `endTurn()` -> `forget()`. Persisting unconditionally therefore
-    undid the forget one line later, and the next reload reattached to a stream
-    that had nothing left to send. Ablation: drop the `S.busy` guard and this
-    goes red.
+    The cursor version resumed a stream after `lastSeq` into a page the reload
+    had just emptied, and a finished stream left saved made every later reload
+    highlight a row over an empty transcript. `new_session_bystander.mjs`
+    reloads the real page repeatedly; this only keeps the cursor from coming
+    back under another name.
     """
     src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
-    line = next(l for l in src.splitlines() if "remember(S.streamId, ev.seq)" in l)
-    assert "S.busy" in line, (
-        "apply() persists the stream cursor unconditionally; `end` clears it "
-        f"earlier in the same call and this line writes it back: {line.strip()}"
+    assert "remember(" not in src and "recall()" not in src, (
+        "a stream cursor is being persisted for reload recovery again"
     )
+    boot = src[src.index("async function boot()"):]
+    assert "openSession(view)" in boot, "boot no longer reopens the conversation on screen"
 
 def test_opening_a_session_is_not_gated_on_a_running_turn():
     """A reader may look wherever they like while a turn streams.

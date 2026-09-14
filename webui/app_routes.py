@@ -348,8 +348,19 @@ def build_app(
         # any validator existed sits heuristically fresh for hours and never
         # revalidates, which is exactly how a fixed bug kept "not working".
         # A changed URL cannot be served from any cache, by construction.
-        version = hashlib.sha256(body).hexdigest()[:12]
-        for asset in (b"app.js", b"style.css", b"vendor/marked.min.js", b"vendor/purify.min.js"):
+        #
+        # The hash covers the ASSETS too, not only this page. Hashed alone, a
+        # deploy that changed just app.js — most of them — kept the same `?v=`,
+        # so the URL promised a new bundle and could still be served the old.
+        assets = (b"app.js", b"style.css", b"vendor/marked.min.js", b"vendor/purify.min.js")
+        h = hashlib.sha256(body)
+        for asset in assets:
+            try:
+                h.update((static_dir / asset.decode()).read_bytes())
+            except OSError:
+                pass   # a missing asset 404s on its own; it must not 500 the page
+        version = h.hexdigest()[:12]
+        for asset in assets:
             body = body.replace(
                 b"/static/" + asset, b"/static/" + asset + b"?v=" + version.encode()
             )

@@ -372,3 +372,16 @@ def test_index_versioned_the_static_urls(app_server):
     import re
     v = re.search(r"app\.js\?v=([0-9a-f]+)", html).group(1)
     urllib.request.urlopen(f"{base}/static/app.js?v={v}")
+
+
+def test_a_changed_bundle_changes_the_version(app_server, tmp_path):
+    """Most deploys change app.js and nothing else. Hashing only index.html
+    kept `?v=` identical across them, so the cache bust did not bust."""
+    import re
+    base, _, _ = app_server
+    get_v = lambda: re.search(
+        r"app\.js\?v=([0-9a-f]+)", urllib.request.urlopen(base + "/").read().decode()
+    ).group(1)
+    before = get_v()
+    (tmp_path / "app.js").write_text("console.log(2)")
+    assert get_v() != before, "app.js changed but its versioned URL did not"

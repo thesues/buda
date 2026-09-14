@@ -143,13 +143,14 @@ function page() {
 }
 
 /* ---------- a fake server ---------- */
-function harness({ current = null, streaming = {} } = {}) {
+function harness({ current = null, streaming = {}, store = new Map(), server: shared = null } = {}) {
   const { document } = page();
   const calls = [];
   const sources = [];
-  const store = new Map();
-  const server = {
-    current, streaming: { ...streaming }, sessions: [],
+  // Pass `store` and `server` from a previous harness to model a RELOAD: same
+  // localStorage, same server, fresh page.
+  const server = shared || {
+    current, streaming: { ...streaming }, sessions: [], history: {}, events: {},
     endpoints: [
       { key: "dsv4", label: "DSV4", model: "dsv4", maxConcurrent: 1, running: 0 },
       { key: "mm2", label: "MM2", model: "mm2", maxConcurrent: 1, running: 0 },
@@ -170,17 +171,30 @@ function harness({ current = null, streaming = {} } = {}) {
         const sid = body.new || !body.sessionId ? `new-${server.nextStream}` : body.sessionId;
         const stream = `s${server.nextStream++}`;
         server.streaming[sid] = stream;
+        server.current = sid;
+        if (!server.sessions.find((r) => r.id === sid)) server.sessions.unshift({ id: sid, title: body.text, messageCount: 0 });
         return reply({ streamId: stream, sessionId: sid, endpoint: body.endpoint });
       }
       case "/api/chat/cancel": return reply({ ok: true });
-      case "/api/chat/status": return reply({ known: true, running: true });
-      case "/api/session/history": return reply({ events: [] });
+      case "/api/chat/status": {
+        const id = u.searchParams.get("stream_id");
+        return reply({ known: true, running: Object.values(server.streaming).includes(id) });
+      }
+      case "/api/session/history": return reply({ events: server.history[u.searchParams.get("id")] || [] });
       case "/api/approval/pending": return reply({ pending: [] });
       default: return reply({});
     }
   };
+  // Like TurnStream: a stream keeps its events, and a (re)connect replays
+  // everything after `after_seq` before following.
   class EventSource {
-    constructor(url) { this.url = url; this.closed = false; sources.push(this); }
+    constructor(url) {
+      this.url = url; this.closed = false; sources.push(this);
+      const q = new URL(url, "http://x").searchParams;
+      const id = q.get("stream_id"), after = Number(q.get("after_seq") || 0);
+      setTimeout(() => (server.events[id] || []).filter((e) => e.seq > after)
+        .forEach((e) => { if (!this.closed) this.onmessage({ data: JSON.stringify(e) }); }), 0);
+    }
     close() { this.closed = true; }
   }
   const ctx = vm.createContext({
@@ -200,11 +214,23 @@ function harness({ current = null, streaming = {} } = {}) {
   vm.runInContext(SRC, ctx);
   const $ = (s) => document.querySelector(s);
   const S = () => vm.runInContext("S", ctx);
-  const feed = (streamId) => sources.filter((s) => s.url.includes(`stream_id=${streamId}&`)).at(-1);
-  const push = (streamId, ev) => feed(streamId).onmessage({ data: JSON.stringify(ev) });
+  const push = (streamId, ev) => {
+    (server.events[streamId] ||= []).push(ev);
+    sources.filter((s) => !s.closed && s.url.includes(`stream_id=${streamId}&`))
+      .forEach((s) => s.onmessage({ data: JSON.stringify(ev) }));
+  };
+  // The turn ends server-side: its end event, then the store holds the
+  // transcript and the session stops streaming.
+  const finish = (sid, streamId, question, answer) => {
+    const seq = (server.events[streamId] || []).length + 1;
+    delete server.streaming[sid];
+    server.history[sid] = [{ kind: "history_user", text: question }, { kind: "delta", text: answer, thought: false }];
+    const row = server.sessions.find((r) => r.id === sid); if (row) row.messageCount = 2;
+    push(streamId, { kind: "end", error: null, seq, session: sid });
+  };
   const type = (text) => { $("#input").value = text; };
   const pick = (key) => { $("#endpoint").value = key; $("#endpoint").dispatch("change", { target: $("#endpoint") }); };
-  return { ctx, $, S, calls, sources, server, store, push, type, pick, run: (code) => vm.runInContext(code, ctx) };
+  return { ctx, $, S, calls, sources, server, store, push, finish, type, pick, run: (code) => vm.runInContext(code, ctx) };
 }
 const settle = () => new Promise((r) => setTimeout(r, 20));
 const posts = (h, p) => h.calls.filter((c) => c.path === p);
@@ -262,12 +288,13 @@ const posts = (h, p) => h.calls.filter((c) => c.path === p);
   h.pick("mm2"); h.type("B"); h.$("#send").click(); await settle();
   const sidB = h.S().sessionId, streamB = h.S().streamId;
   assert.notStrictEqual(streamA, streamB);
-  h.push(streamB, { kind: "delta", text: "b", seq: 3, session: sidB });
-  h.push(streamA, { kind: "delta", text: "a", seq: 40, session: sidA });
-  assert.strictEqual(h.store.get("hermes.streamId"), streamB);
-  assert.strictEqual(h.store.get("hermes.lastSeq"), "3",
-    "a background turn's seq was saved as the focus stream's cursor — a reload would skip the focus turn's events up to it");
-  assert.strictEqual(h.S().lastSeq, 3);
+  h.push(streamB, { kind: "delta", text: "b-token", seq: 3, session: sidB });
+  h.push(streamA, { kind: "delta", text: "a-token", seq: 40, session: sidA });
+  await settle();
+  assert.strictEqual(h.S().lastSeq, 3,
+    "a background turn's seq became the focus stream's cursor");
+  assert.ok(!h.$("#messages").textContent.includes("a-token"),
+    "a background turn's tokens were drawn into the conversation on screen");
 }
 
 /* ---------- 3. the bystander ending does not repaint the fresh view ---------- */
@@ -295,6 +322,86 @@ const posts = (h, p) => h.calls.filter((c) => c.path === p);
   const [start] = posts(h, "/api/chat/start");
   assert.ok(start.body.new === true && !start.body.sessionId,
     `a page showing 新的对话 sent into ${JSON.stringify(start.body.sessionId)}`);
+}
+
+/* ---------- 5. a reload shows the conversation, however many times ---------- */
+{
+  // Production, after the first fix: two conversations answered, the page
+  // reloaded a few times — then a reload came up with a row highlighted and
+  // an EMPTY transcript. A reload must repaint what the reader was looking at
+  // from the store, every time, and follow a turn that is still running.
+  const text = (h) => h.$("#messages").textContent;
+  const reload = async (prev) => { const h = harness({ store: prev.store, server: prev.server }); await settle(); await settle(); return h; };
+
+  let h = harness();
+  await settle();
+  h.pick("dsv4"); h.type("hello A"); h.$("#send").click(); await settle();
+  const sidA = h.S().sessionId, streamA = h.S().streamId;
+  h.push(streamA, { kind: "user", text: "hello A", seq: 1, session: sidA });
+  h.push(streamA, { kind: "delta", text: "answer-A", seq: 2, session: sidA });
+  h.$("#new-session").click(); await settle();
+  h.pick("mm2"); h.type("hello B"); h.$("#send").click(); await settle();
+  const sidB = h.S().sessionId, streamB = h.S().streamId;
+  h.push(streamB, { kind: "user", text: "hello B", seq: 1, session: sidB });
+  h.push(streamB, { kind: "delta", text: "partial-B", seq: 2, session: sidB });
+
+  // Reload while B is mid-answer, A too.
+  h = await reload(h);
+  assert.ok(text(h).includes("hello B") && text(h).includes("partial-B"),
+    `a reload mid-turn lost the conversation on screen: ${JSON.stringify(text(h))}`);
+  assert.ok(!text(h).includes("answer-A"), "a reload painted the other conversation's reply");
+  assert.strictEqual(h.S().sessionId, sidB);
+
+  // Both finish while this page is open; then reload, several times.
+  h.finish(sidA, streamA, "hello A", "answer-A");
+  h.push(streamB, { kind: "delta", text: "-done", seq: 3, session: sidB });
+  h.finish(sidB, streamB, "hello B", "partial-B-done");
+  await settle();
+  for (let i = 1; i <= 4; i++) {
+    h = await reload(h);
+    const shown = text(h);
+    const cur = h.$("#sessions").querySelector("li.cur");
+    assert.ok(shown.includes("hello B") && shown.includes("partial-B-done"),
+      `reload #${i} came up empty (row ${cur ? "highlighted" : "not highlighted"}): ${JSON.stringify(shown)}`);
+    assert.strictEqual(h.S().sessionId, sidB, `reload #${i} is looking at the wrong conversation`);
+    assert.ok(!h.S().busy, `reload #${i} believes a finished turn is still running`);
+  }
+
+  // Open A, reload: A comes back.
+  h.run(`openSession(${JSON.stringify(sidA)})`); await settle();
+  h = await reload(h);
+  assert.ok(text(h).includes("answer-A"), `reload after opening A: ${JSON.stringify(text(h))}`);
+
+  // 新会话 then reload: the fresh view, not the last conversation.
+  h.$("#new-session").click(); await settle();
+  h = await reload(h);
+  assert.ok(h.$(".chat").classList.contains("fresh") && !h.S().sessionId,
+    "a reload after 新会话 reopened an old conversation");
+}
+
+/* ---------- 6. clicking a conversation in the sidebar draws it ---------- */
+{
+  const h = harness();
+  h.server.sessions.push({ id: "old", title: "old question", messageCount: 2 });
+  h.server.history.old = [
+    { kind: "history_user", text: "old question" },
+    { kind: "delta", text: "old answer", thought: false },
+  ];
+  await settle();
+  h.run("loadSessions()"); await settle();
+  const row = h.$("#sessions").querySelector("li");
+  row.onclick(); await settle(); await settle();
+  const shown = h.$("#messages").textContent;
+  assert.ok(shown.includes("old question") && shown.includes("old answer"),
+    `opening a conversation drew ${JSON.stringify(shown)} — history replays were dropped as foreign frames`);
+
+  // 新会话, then back to the old conversation, then send: it continues THAT one.
+  h.$("#new-session").click(); await settle();
+  h.$("#sessions").querySelector("li").onclick(); await settle(); await settle();
+  h.type("follow-up"); h.$("#send").click(); await settle();
+  const last = posts(h, "/api/chat/start").at(-1);
+  assert.ok(last.body.sessionId === "old" && !last.body.new,
+    `a send after 新会话 → reopen went to ${JSON.stringify(last.body)}`);
 }
 
 console.log("ok - a new session leaves the running one alone");

@@ -23,8 +23,7 @@ const el = (tag, cls, text) => {
   return n;
 };
 
-const LS_STREAM = "hermes.streamId";
-const LS_SEQ = "hermes.lastSeq";
+const LS_VIEW = "hermes.view";      // the conversation on screen; a reload reopens it
 const LS_OPEN = "hermes.open";      // which activity groups the reader had open
 const LS_EP = "hermes.endpoint";    // last-used endpoint: the DEFAULT new sessions start on
 const LS_SESS_EP = "hermes.sessionEndpoints";   // session_id -> endpoint, so the picker
@@ -115,19 +114,22 @@ const S = {
 };
 
 /* ---------- just enough state to recover ---------- */
-function remember(id, seq) {
+// A reload remembers WHICH CONVERSATION was on screen, not a stream cursor.
+// The cursor version resumed a stream after `lastSeq` into a page the reload
+// had just emptied — so everything already painted was gone — and it cleared
+// itself only if `forget()` ran at exactly the right moment. When it did not, a
+// finished stream stayed saved and every later reload attached to it, drew
+// nothing, and highlighted a row over an empty transcript. Reopening the
+// session repaints from the store and replays a live turn from the top, which
+// is the path a sidebar click already takes.
+function rememberView(sid) {
   try {
-    if (id) localStorage.setItem(LS_STREAM, id);
-    if (seq != null) localStorage.setItem(LS_SEQ, String(seq));
-  } catch (_) { /* private mode: recovery degrades, chat still works */ }
+    if (sid) localStorage.setItem(LS_VIEW, sid);
+    else localStorage.removeItem(LS_VIEW);
+  } catch (_) { /* private mode: a reload opens on 新的对话 */ }
 }
-function forget() {
-  try { localStorage.removeItem(LS_STREAM); localStorage.removeItem(LS_SEQ); } catch (_) {}
-}
-function recall() {
-  try {
-    return { id: localStorage.getItem(LS_STREAM), seq: Number(localStorage.getItem(LS_SEQ) || 0) };
-  } catch (_) { return { id: null, seq: 0 }; }
+function recallView() {
+  try { return localStorage.getItem(LS_VIEW); } catch (_) { return null; }
 }
 
 /* ---------- chrome ---------- */
@@ -664,6 +666,7 @@ function apply(ev, from) {
   if (!fresh && ev.session && S.sessionId && ev.session !== S.sessionId
       && from === S.streamId) {
     S.sessionId = ev.session;
+    rememberView(ev.session);
     noteSessionEndpoint(ev.session);
     loadSessions();
   }
@@ -684,15 +687,15 @@ function apply(ev, from) {
   // back the PREVIOUS session, relabelling the new conversation as the old one.
   if (mine && fresh && ev.session) {
     S.sessionId = ev.session;
+    rememberView(ev.session);
     noteSessionEndpoint(ev.session);   // the pending choice belongs to this id now
     S.pendingNew = false;
     loadSessions();
   }
   if (!mine && ev.kind !== "end") {
-    // Advance the cursor only for the FOCUS stream. A background turn's seq
-    // saved under the focus stream's id made a reload resume the focus turn
-    // past events it never delivered.
-    if (ev.seq && from === S.streamId) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
+    // Advance the cursor only for the FOCUS stream: a background turn's seq
+    // is not a position in the turn on screen.
+    if (ev.seq && from === S.streamId) S.lastSeq = ev.seq;
     return;
   }
   switch (ev.kind) {
@@ -716,16 +719,8 @@ function apply(ev, from) {
     case "gap": finalizeSeg(); addMsg("note", "（断线期间有部分输出未能保留）"); break;
     case "end": endTurn(ev.error, ev.session, from); break;
   }
-  // Only while a turn is actually live. `endTurn()` clears the saved cursor,
-  // and this line runs AFTER the switch that called it — so persisting
-  // unconditionally put the finished stream straight back into localStorage,
-  // and the next reload reattached to a turn that had nothing left to say.
-  // Per-stream now: a BACKGROUND feed's frames must not advance the FOCUS
-  // stream's saved cursor.
-  if (ev.seq && from === S.streamId) {
-    S.lastSeq = ev.seq;
-    if (S.busy) remember(from, ev.seq);
-  }
+  // Per-stream: a BACKGROUND feed's frames must not advance the focus cursor.
+  if (ev.seq && from === S.streamId) S.lastSeq = ev.seq;
 }
 
 function attach(streamId, afterSeq, opts) {
@@ -772,7 +767,6 @@ function attach(streamId, afterSeq, opts) {
         closeEs(streamId);
         finalizeSeg();
         setBusy(false);
-        if (recall().id === streamId) forget();
         addMsg("note", "服务重启，这一轮的回复已丢失");
         status("就绪");
       } else if (!st.running) {
@@ -814,9 +808,6 @@ function endTurn(error, owner, from) {
     S.awaitingPerm = false;
     if (error) addMsg("error", `⚠ ${error}`);
   }
-  // Reload recovery follows the FOCUS stream only; a background turn ending
-  // leaves the saved cursor alone.
-  if (!from || from === S.streamId) forget();
   if (shown) {
     const wasStopping = S.stopping;
     S.stopping = false;
@@ -1005,10 +996,10 @@ function watchWhileOthersRun() {
 async function loadSessions() {
   let j;
   try { j = await (await fetch("/api/sessions")).json(); } catch (_) { return; }
-  // `j.current` is the session prompted most recently, which is not where the
-  // reader is looking — that is the whole point of being able to browse
-  // mid-turn. Adopt it only when the reader has no session of their own yet,
-  // and never while a brand-new one is waiting for hermes to assign it an id.
+  // `j.current` is deliberately NOT adopted. Setting S.sessionId here moved the
+  // sidebar highlight without painting that transcript, and aimed the next
+  // send at a conversation the reader could not see. Only openSession and a
+  // send decide what is on screen; boot() decides what a reload reopens.
   const was = S.streaming;
   S.streaming = j.streaming || {};
   // A turn can now finish in a conversation this page is not watching, and its
@@ -1017,9 +1008,6 @@ async function loadSessions() {
   // copy taken before the reply landed.
   Object.keys(was).forEach((id) => { if (!S.streaming[id]) HISTORY_CACHE.delete(id); });
   watchWhileOthersRun();
-  if (!S.sessionId && !S.pendingNew) {
-    S.sessionId = Object.keys(S.streaming)[0] || j.current || null;
-  }
   S.sessionRows = j.sessions || [];
   if (j.endpoints) setEndpoints(j.endpoints, null);
   setBusy(S.busy);          // capacity changed under it; re-render the composer
@@ -1039,14 +1027,23 @@ function paintHistory(history) {
   // a blank bubble the reader cannot account for.
   history
     .filter((ev) => ev.kind !== "delta" || (ev.text || "").length)
-    .forEach(apply);   // history carries no seq — a finished transcript
+    // NOT `.forEach(apply)`: forEach passes the INDEX as the second argument,
+    // so `from` arrived as 0, 1, 2… instead of undefined, the replay test in
+    // apply() never matched, and every history event was dropped as foreign —
+    // opening any conversation drew an empty panel.
+    .forEach((ev) => apply(ev));
   finalizeSeg();
 }
 
 async function openSession(id) {
   clearFresh();
   S.ownStream = null;       // whatever we started, we are not looking at it now
+  // Leaving a pending 新会话 for a real conversation. Left raised, the next
+  // send went out as `new: true` and opened ANOTHER conversation instead of
+  // continuing the one on screen.
+  S.pendingNew = false;
   S.sessionId = id;
+  rememberView(id);
   // The picker follows the conversation: show the model THIS session uses.
   // A session from another tab has no recorded choice — it falls to the
   // last-used default; a stale key (endpoint gone) falls to the first.
@@ -1089,8 +1086,10 @@ async function openSession(id) {
   if (S.sessionId !== id) return;
   // An EMPTY transcript for a session the sidebar says has messages means the
   // row is gone (deleted in another tab) or never persisted. Say so — a silent
-  // empty panel read as "the messages are lost".
-  if (!(j.events || []).length) {
+  // empty panel read as "the messages are lost". Not for a LIVE session: a
+  // first turn persists only when it ends, so its store is empty while it
+  // runs — returning here left a reloaded page never attaching to the reply.
+  if (!(j.events || []).length && !S.streaming[id]) {
     const row = (S.sessionRows || []).find((r) => r.id === id);
     finalizeSeg();
     addMsg("note", (row && row.messageCount) ? "这个会话的内容已不可读（可能已在别处删除）" : "这个会话还没有内容");
@@ -1158,8 +1157,10 @@ async function removeSession(s) {
     status(`删除失败：${e.message}`);
     return;
   }
-  if (S.sessionId === id) S.sessionId = null;
-  loadSessions();
+  // The conversation on screen is gone: say so with the fresh view rather than
+  // a transcript of something that no longer exists.
+  if (S.sessionId === id) newSession();
+  else loadSessions();
 }
 
 async function newSession() {
@@ -1174,6 +1175,7 @@ async function newSession() {
   // calling `endTurn` here would abandon a live reply.
   $("#messages").textContent = "";
   S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
+  rememberView(null);       // a reload now opens on 新的对话, as the screen does
   showFresh();
   setBusy(false);    // the new view owns nothing — same as openSession on an idle
                      // conversation. The other turn's feed stays in S.ess.
@@ -1254,12 +1256,12 @@ async function send() {
   S.ownStream = j.streamId;
   if (j.sessionId) {
     S.sessionId = j.sessionId; noteSessionEndpoint(j.sessionId); S.pendingNew = false;
+    rememberView(j.sessionId);
     // Known now, not at the next /api/sessions: `owns` reads this map, and
     // until it says so the view would offer 发送 on its own running turn.
     S.streaming[j.sessionId] = j.streamId;
   }
   loadSessions();
-  remember(j.streamId, 0);
   showPending();
   attach(j.streamId, 0);
 }
@@ -1281,24 +1283,23 @@ async function boot() {
   // recomputes what the composer is allowed to do under the new choice.
   $("#endpoint").addEventListener("change", (e) => pickEndpoint(e.target.value));
 
-  // Reattach BEFORE accepting input: a turn that survived the reload should come
-  // up visibly running, not look idle and invite a second prompt.
-  const { id, seq } = recall();
-  if (id) {
-    try {
-      const st = await (await fetch(`/api/chat/status?stream_id=${encodeURIComponent(id)}`)).json();
-      if (st.known) {
-        S.skipUserEcho = false;   // nothing drawn yet — the echo must paint it
-        if (st.running) status("接回上一次未完成的回复…");
-        attach(id, seq);   // finished-but-unseen still needs its tail collected
-      } else forget();
-    } catch (_) { forget(); }
-  } else if (!$("#messages").firstChild) {
-    // Nothing to reattach and nothing on screen: this IS a fresh conversation,
-    // so say so rather than opening on a blank panel that reads as loading.
-    // And MEAN it: without pendingNew, loadSessions adopts the server's
-    // `current` and the first message typed under 新的对话 was appended to
-    // this browser's previous conversation.
+  // Reopen what was on screen BEFORE accepting input — through openSession, the
+  // same path a sidebar click takes: the transcript comes from the store, and a
+  // turn still running is replayed from its first event, so a reply that
+  // survived the reload comes up visibly running rather than looking idle.
+  // The session list comes first: it is what says whether the view still
+  // exists and which stream, if any, is live in it.
+  try {   // the retired stream cursor; left behind, it is only noise
+    localStorage.removeItem("hermes.streamId"); localStorage.removeItem("hermes.lastSeq");
+  } catch (_) {}
+  const view = recallView();
+  await loadSessions();
+  if (view && ((S.sessionRows || []).some((r) => r.id === view) || S.streaming[view])) {
+    openSession(view);
+  } else {
+    // Nothing to reopen: this IS a fresh conversation, so say so rather than
+    // opening on a blank panel that reads as loading — and MEAN it, so the
+    // first message starts a new conversation.
     S.pendingNew = true;
     showFresh();
   }
