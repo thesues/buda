@@ -194,6 +194,93 @@ def resolve_toolsets(cfg: dict | None) -> list[str]:
     return list(DEFAULT_TOOLSETS)
 
 
+# ── auxiliary compression model ─────────────────────────────────────────────
+
+
+def _compression_keys(model: str, base_url: str, context_length: int) -> list[str]:
+    return [
+        f"    model: {model}",
+        f"    base_url: {base_url}",
+        f"    context_length: {context_length}",
+    ]
+
+
+def ensure_compression_model(config_path: Path, endpoints, min_context: int | None = None) -> bool:
+    """Seed `auxiliary.compression` so compression survives a small endpoint.
+
+    hermes summarises overflowing history through an auxiliary model and, with
+    nothing configured, falls back to the ACTIVE endpoint's model — then
+    refuses the whole session when that model's window is under hermes' 32K
+    floor. The MiniMax endpoint exposed this for real: freetoken sizes
+    max_model_len from spare VRAM, a 4090 has ~3 GiB of that after weights,
+    and MiniMax-M2's ~248 KiB/token of KV leaves a 4K window that no flag can
+    honestly raise. Pointing compression at the first endpoint that declares
+    at least `min_context` keeps a small-window endpoint usable as a chat
+    model without making its engine lie about the window.
+
+    Seed, not set, like the toolsets: a `compression:` mapping that already
+    has any key is the operator's choice and is never rewritten. Returns True
+    if the file changed.
+    """
+    if min_context is None:
+        try:
+            from agent.model_metadata import MINIMUM_CONTEXT_LENGTH as min_context
+        except Exception:  # noqa: BLE001 — hermes moved it; the deploy's floor holds
+            min_context = 32000
+
+    ep = next(
+        (e for e in (endpoints or [])
+         if getattr(e, "context", 0) and e.context >= min_context),
+        None,
+    )
+    if ep is None:
+        log.info("hermes config: no endpoint with context >= %s; compression stays unseeded", min_context)
+        return False
+
+    keys = _compression_keys(ep.model, ep.base_url, ep.context)
+    lines = config_path.read_text().splitlines() if config_path.exists() else []
+    start = next((i for i, ln in enumerate(lines) if ln.rstrip() == "auxiliary:"), None)
+    if start is None:
+        new = [*lines, *([""] if lines and lines[-1].strip() else []),
+               "auxiliary:", "  compression:", *keys]
+        _write(config_path, new)
+        log.info("hermes config: seeded auxiliary.compression -> %s @ %s (%s tokens)",
+                 ep.model, ep.base_url, ep.context)
+        return True
+
+    # The block runs to the next line at column 0 that is not blank — the
+    # same indentation rule hermes' own writer produces.
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if ln.strip() and not ln[0].isspace():
+            end = i
+            break
+    block = lines[start:end]
+    comp = next((i for i, ln in enumerate(block) if ln.strip() == "compression:"), None)
+    if comp is None:
+        # Dangling `auxiliary:` (or one holding other tasks): the seed belongs
+        # UNDER the existing key, not as a second block.
+        block = block + ["  compression:", *keys]
+    else:
+        # compression:'s children sit at indent >= 4; the next task key
+        # (`  vision:` et al, indent 2) ends the subsection.
+        stop = len(block)
+        for i in range(comp + 1, len(block)):
+            if block[i].strip() and len(block[i]) - len(block[i].lstrip()) < 4:
+                stop = i
+                break
+        if any(block[i].strip() for i in range(comp + 1, stop)):
+            log.info("hermes config: auxiliary.compression already set; the file owns it")
+            return False
+        block = [*block[: comp + 1], *keys, *block[stop:]]
+
+    _write(config_path, [*lines[:start], *block, *lines[end:]])
+    log.info("hermes config: seeded auxiliary.compression -> %s @ %s (%s tokens)",
+             ep.model, ep.base_url, ep.context)
+    return True
+
+
 # NOTE: an `ensure_disabled_toolsets` used to live here and was REMOVED, because
 # it did not work on the ACP path: `acp_adapter/session.py` hardcoded its
 # toolset list, so nothing in config.yaml reached the session and only

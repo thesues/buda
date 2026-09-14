@@ -118,7 +118,8 @@ class Endpoint:
     cache signature covers both fields.
     """
 
-    __slots__ = ("key", "label", "model", "base_url", "provider", "api_key", "max_concurrent")
+    __slots__ = ("key", "label", "model", "base_url", "provider", "api_key",
+                 "max_concurrent", "context")
 
     def __init__(
         self,
@@ -129,6 +130,7 @@ class Endpoint:
         provider: str = "custom",
         api_key: str = "none",
         max_concurrent: int = 4,
+        context: int = 0,
     ) -> None:
         self.key = key
         self.label = label
@@ -141,6 +143,12 @@ class Endpoint:
         # `--max-running-requests 1`; whatever serves the next endpoint has its
         # own number, and one global limit can only be right for one of them.
         self.max_concurrent = max(1, int(max_concurrent))
+        # The endpoint's real context window (the engine's own /v1/models
+        # max_model_len), 0 when undeclared. Read by the compression seeding:
+        # hermes refuses a session whose auxiliary compression model cannot
+        # hold its 32K floor, and only a declared window can say which
+        # endpoint qualifies.
+        self.context = max(0, int(context))
 
     def as_json(self) -> dict:
         return {"key": self.key, "label": self.label, "model": self.model,
@@ -176,6 +184,7 @@ def load_endpoints(raw: str | None, default_home_model: str = "") -> list[Endpoi
                     provider=str(e.get("provider") or "custom"),
                     api_key=str(e.get("api_key") or "none"),
                     max_concurrent=int(e.get("maxConcurrent") or 4),
+                    context=int(e.get("context") or 0),
                 )
                 for e in items
             ]

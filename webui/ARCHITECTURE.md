@@ -47,9 +47,17 @@ One deployment serves several providers, and the browser picks among them.
 
 The server is the source of truth for WHICH endpoints exist: `BUDA_ENDPOINTS`
 (JSON list, first entry the default) is parsed once at startup into `Endpoint`
-records — key, label, model, base_url, provider, api_key, and a
-`maxConcurrent` that is PER ENDPOINT because the ceiling is the model behind
-it, not the process. `/api/status` and `/api/sessions` advertise the list
+records — key, label, model, base_url, provider, api_key, a `maxConcurrent`
+that is PER ENDPOINT because the ceiling is the model behind it, not the
+process, and a `context` — the engine's REAL window, which feeds the boot
+seed of hermes' auxiliary compression model: hermes summarises overflowing
+history through an auxiliary model, defaults that slot to the ACTIVE
+endpoint's model, and refuses a session when that model's window is under
+its 32K floor. `ensure_compression_model` points the slot (seed-only, the
+file wins once written) at the first endpoint declaring >= 32K, so an
+endpoint whose engine honestly reports a small window stays usable for chat
+without hermes refusing every session on it.
+`/api/status` and `/api/sessions` advertise the list
 (plus each endpoint's running count, so the composer can gate on the picker's
 choice); `/api/chat/start` takes an `endpoint` key and echoes the one it
 actually used, which is how a stale saved choice finds out it fell back.

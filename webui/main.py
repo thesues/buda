@@ -124,6 +124,23 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         log.error("could not seed platform_toolsets: %s", e)
 
+    # Context compression summarises an overflowing conversation through an
+    # auxiliary model, which defaults to the ACTIVE endpoint's model — and
+    # hermes refuses the session outright when that model's window is under
+    # its 32K floor (the MiniMax endpoint's real, VRAM-derived ceiling).
+    # Point the slot at the first endpoint that declares enough window;
+    # seed-only, because a compression: mapping in the file is the operator's
+    # choice, exactly like platform_toolsets.
+    try:
+        from hermes_agent import load_endpoints
+        from hermes_config import ensure_compression_model
+
+        ensure_compression_model(
+            hermes_cfg, load_endpoints(os.environ.get("BUDA_ENDPOINTS", ""))
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("could not seed auxiliary.compression: %s", e)
+
     # Say what actually resolved — the file won this boot or the seed did, and
     # the log is where the difference is visible without opening a shell.
     try:

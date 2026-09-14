@@ -1,10 +1,13 @@
-"""`hermes_config`'s toolset half: the config file owns what a session can do.
+"""`hermes_config`: the config file owns what a session can do and with what.
 
 `ensure_mcp_server` has been covered indirectly by the deploy for a while;
-these tests pin the toolset functions it grew when the env-var lookup was
-retired: the seed must not clobber, the resolution must degrade in order,
-and terminal must be in the default — an agent that cannot run anything is
-not a degraded agent, it is a broken one.
+these tests pin the seeders it grew afterwards: the toolset list, and the
+auxiliary compression model (hermes refuses a session whose compression
+model cannot hold its 32K floor, and the slot defaults to the ACTIVE
+endpoint — so a small-window endpoint must be served by a declared bigger
+one). In both cases the seed must not clobber, the resolution must degrade
+in order, and terminal must be in the default — an agent that cannot run
+anything is not a degraded agent, it is a broken one.
 """
 
 from __future__ import annotations
@@ -81,6 +84,98 @@ def test_a_dangling_platform_toolsets_key_still_gets_cli(tmp_path):
     text = p.read_text()
     assert text.count("platform_toolsets:") == 1
     assert "  cli:" in text and "    - file" in text
+
+
+# ── ensure_compression_model ────────────────────────────────────────────────
+
+
+class _EP:
+    """Endpoint stand-in: only the fields the compression seeding reads."""
+
+    def __init__(self, context, model="m", base_url="http://b/v1"):
+        self.context = context
+        self.model = model
+        self.base_url = base_url
+
+
+def test_compression_seeds_from_the_first_qualifying_endpoint(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("mcp_servers:\n  memory:\n    url: http://mcp\n")
+    eps = [_EP(4096, model="small", base_url="http://small/v1"),
+           _EP(62080, model="big", base_url="http://big/v1")]
+
+    assert hc.ensure_compression_model(p, eps, min_context=32000) is True
+    text = p.read_text()
+    assert "  compression:" in text
+    assert "    model: big" in text and "    base_url: http://big/v1" in text
+    assert "    context_length: 62080" in text
+    assert "url: http://mcp" in text, "the block this touched is the only one that moved"
+
+
+def test_compression_skips_when_no_endpoint_qualifies(tmp_path):
+    p = tmp_path / "config.yaml"
+
+    assert hc.ensure_compression_model(p, [_EP(4096)], min_context=32000) is False
+    assert not p.exists(), "nothing to seed means nothing to write"
+
+
+def test_compression_never_clobbers_an_operators_choice(tmp_path):
+    """Seed, not set — same contract as platform_toolsets. A model-only
+    mapping is a deliberate override even if it omits base_url."""
+    p = tmp_path / "config.yaml"
+    p.write_text("auxiliary:\n  compression:\n    model: mine\n")
+
+    assert hc.ensure_compression_model(p, [_EP(62080)], min_context=32000) is False
+    assert "model: mine" in p.read_text()
+
+
+def test_compression_fills_under_an_existing_auxiliary_key(tmp_path):
+    """Other auxiliary tasks (vision, web_extract) must survive."""
+    p = tmp_path / "config.yaml"
+    p.write_text("auxiliary:\n  vision:\n    provider: auto\n")
+
+    assert hc.ensure_compression_model(
+        p, [_EP(62080, model="big", base_url="http://big/v1")], min_context=32000
+    ) is True
+    text = p.read_text()
+    assert text.count("auxiliary:") == 1
+    assert "  vision:" in text and "    provider: auto" in text
+    assert "  compression:" in text and "    model: big" in text
+
+
+def test_compression_fills_an_empty_compression_key(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("auxiliary:\n  compression:\n")
+
+    assert hc.ensure_compression_model(
+        p, [_EP(62080, model="big", base_url="http://big/v1")], min_context=32000
+    ) is True
+    text = p.read_text()
+    assert text.count("compression:") == 1
+    assert "    model: big" in text
+
+
+def test_compression_seeding_is_idempotent(tmp_path):
+    p = tmp_path / "config.yaml"
+    eps = [_EP(62080, model="big", base_url="http://big/v1")]
+
+    assert hc.ensure_compression_model(p, eps, min_context=32000) is True
+    first = p.read_text()
+    assert hc.ensure_compression_model(p, eps, min_context=32000) is False
+    assert p.read_text() == first
+
+
+def test_compression_floor_defaults_to_hermes_when_importable(tmp_path, monkeypatch):
+    """Without an explicit floor the number must come from hermes itself, not
+    a second copy that can drift."""
+    fake = types.ModuleType("agent.model_metadata")
+    fake.MINIMUM_CONTEXT_LENGTH = 40000
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", fake)
+
+    p = tmp_path / "config.yaml"
+    assert hc.ensure_compression_model(p, [_EP(32000)]) is False  # below 40K
+    assert hc.ensure_compression_model(p, [_EP(40000)]) is True
 
 
 # ── resolve_toolsets ────────────────────────────────────────────────────────
