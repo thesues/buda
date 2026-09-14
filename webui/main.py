@@ -132,7 +132,6 @@ def main() -> None:
     # seed-only, because a compression: mapping in the file is the operator's
     # choice, exactly like platform_toolsets.
     try:
-        from hermes_agent import load_endpoints
         from hermes_config import ensure_compression_model
 
         ensure_compression_model(
