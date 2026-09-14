@@ -924,14 +924,33 @@ function renderSessions() {
     let cls = s.id === S.sessionId ? "sess cur" : "sess";
     if (s.is_streaming) cls += " streaming";
     const li = el("li", cls);
-    li.append(el("div", "t", s.title || "(未命名)"), el("div", "p", s.preview || ""));
+    // A compression chain renders N rows with the SAME title (every segment
+    // opens with the same question), so `preview` duplicates `title` and the
+    // rows are indistinguishable — which is how two segments got deleted as
+    // "duplicates". When the second line would say nothing new, say WHEN and
+    // HOW MUCH instead: that is what tells one segment from another.
+    const sub = (s.preview && s.preview !== s.title)
+      ? s.preview
+      : [fmtWhen(s.lastActive), s.messageCount != null ? `${s.messageCount} 条` : ""]
+          .filter(Boolean).join(" · ") || "";
+    li.append(el("div", "t", s.title || "(未命名)"), el("div", "p", sub));
     li.onclick = () => openSession(s.id);
     const del = el("button", "del", "×");
     del.title = "删除会话";
-    del.onclick = (e) => { e.stopPropagation(); removeSession(s.id, s.title); };
+    del.onclick = (e) => { e.stopPropagation(); removeSession(s); };
     li.appendChild(del);
     ul.appendChild(li);
   });
+}
+
+function fmtWhen(ts) {
+  // Sidebar-sized timestamp: today shows the clock, earlier shows the date
+  // too. Server timestamps are seconds.
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (d.toDateString() === new Date().toDateString()) return hm;
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${hm}`;
 }
 
 function watchWhileOthersRun() {
@@ -1068,13 +1087,16 @@ async function openSession(id) {
   loadSessions();
 }
 
-async function removeSession(id, title) {
-  // Ask first. This control is invisible until hover and covers the right
-  // 2.4rem of the row at full height, so it sits exactly where a hand goes to
-  // click the row itself — and the delete is immediate, schema-aware, and has
-  // no undo. Three conversations went that way.
-  const name = (title || "").trim() || id.slice(0, 8);
-  if (!confirm(`删除会话「${name}」?此操作不可撤销。`)) return;
+async function removeSession(s) {
+  // Ask first — and name the row SPECIFICALLY. The chain segments share one
+  // title, so a confirm that says only 删除会话「什么是怨憎会苦」 deletes a
+  // different conversation than the one the reader thinks they named. Time
+  // and size are what actually identify the row.
+  const id = s.id;
+  const name = (s.title || "").trim() || id.slice(0, 8);
+  const meta = [fmtWhen(s.lastActive), s.messageCount != null ? `${s.messageCount} 条消息` : ""]
+    .filter(Boolean).join(" · ");
+  if (!confirm(`删除会话「${name}」${meta ? `（${meta}）` : ""}?此操作不可撤销。`)) return;
   // POST to a real route, and SHOW a failure. The old call was
   // `DELETE /api/session/<id>` — a path the exact-match router cannot serve —
   // with `.catch(() => {})` on the end, so every delete 404'd silently and the
