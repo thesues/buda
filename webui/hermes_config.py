@@ -218,11 +218,13 @@ def ensure_compression_model(config_path: Path, endpoints, min_context: int | No
     nothing configured, falls back to the ACTIVE endpoint's model — then
     refuses the whole session when that model's window is under hermes' 32K
     floor. The MiniMax endpoint exposed this for real: freetoken sizes
-    max_model_len from spare VRAM, a 4090 has ~3 GiB of that after weights,
-    and MiniMax-M2's ~248 KiB/token of KV leaves a 4K window that no flag can
-    honestly raise. Pointing compression at the first endpoint that declares
-    at least `min_context` keeps a small-window endpoint usable as a chat
-    model without making its engine lie about the window.
+    max_model_len from its KV budget, and MHA KV at ~244 KiB/token means a
+    small GPU seats a tiny window no flag can honestly raise (the engine ran
+    on a 4090 whose ~2.9 GiB spare gave 4K — below hermes' own system prompt;
+    it has since moved to an H20, but any endpoint can be the next small
+    one). Pointing compression at the first endpoint that declares at least
+    `min_context` keeps a small-window endpoint usable as a chat model
+    without making its engine lie about the window.
 
     Seed, not set, like the toolsets: a `compression:` mapping that already
     has any key is the operator's choice and is never rewritten. Returns True

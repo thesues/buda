@@ -26,18 +26,35 @@
 #   --expert-load parallel       explicit because the SERIAL NVFP4 expert
 #                                build is the one that hung (zero CPU, zero
 #                                I/O) — the reason freetoken-l3 left MiniMax.
+#   --kv-reserve-tokens 65536    the engine SIZES the KV pool to exactly this
+#                                many tokens (logged: "Allocating N tokens for
+#                                KV cache, K + V = x GiB") — it is a knob, not
+#                                a leftover. 4096 was the 4090's whole budget;
+#                                65536 (15.5 GiB) fits the H20 with room to
+#                                spare and clears hermes' ~10K system prompt.
 #   memory 160Gi, pin 170        MiniMax's expert banks are ~118 GiB (vs
 #                                DSV4's 155); 160Gi was computed for exactly
 #                                this model. The pin budget is a CAP, not an
 #                                allocation — 170 over 118 costs nothing.
 #
-# ── Contention, known and accepted ───────────────────────────────────────────
-# A second engine on 192.168.3.2 contends for CPU-MoE with freetoken-l3:
-# measured 1.68x, not 2x, and erratic (freetoken.yaml's note). Both endpoints
-# cap maxConcurrent at 1 and there is one human on the webui, so the engines
-# mostly take turns; the degradation only shows when both stream at once.
-# The node is a constraint, not a preference — driver r580+ rules out every
-# other node (see freetoken-l3.yaml).
+# ── Node: the H20 (192.168.1.2), verified before the move ────────────────
+# freetoken-l3's header calls 192.168.3.2 the only r580+ node, but that was
+# written before the H20 joined: 192.168.1.2 runs the SAME driver 580.105.08
+# and the SAME Xeon Platinum 8457C with avx512_bf16 + avx_vnni — the top tier
+# FreeToken's CPU-MoE dispatches to. Nothing is lost by moving, and one thing
+# is gained: MiniMax's MHA KV costs ~244 KiB/token (62 layers × 8 kv_heads ×
+# 128 head_dim × K+V × bf16), so a 4090's ~2.9 GiB of spare VRAM only ever
+# seated a 4K window — below hermes' ~10K system prompt, let alone a
+# conversation. The H20's 96 GiB seats 65536 tokens (15.5 GiB of KV) with
+# ~60 GiB still free. Moving also retires the old node's CPU-MoE contention
+# between this engine and freetoken-l3 (measured 1.68x, not 2x).
+#
+# ftcache caveat: the volumeClaimTemplate's EBS PV is zone-locked, and the
+# H20 sits in cn-beijing-e while the old PV was in cn-beijing-c. The cache
+# only holds ft bench bw profiles (keyed by GPU UUID — invalid anyway after a
+# card change), so the PVC is deleted on purpose and recreated in the new
+# zone. kubectl does NOT do this for you: delete ftcache-freetoken-mm2-0
+# before applying, or the pod sits Pending on a node-affinity conflict.
 #
 # Applied directly with `kubectl apply -f` after substituting the image:
 #   sed "s|IMAGE_FREETOKEN_L3|<repo>/freetoken-l3:<sha>|" k8s/freetoken-mm2.yaml |
@@ -76,7 +93,7 @@ spec:
     spec:
       enableServiceLinks: false
       nodeSelector:
-        kubernetes.io/hostname: "192.168.3.2"
+        kubernetes.io/hostname: "192.168.1.2"
 
       initContainers:
         # Lift autumn-fuse at deploy time, not build time — same WIRE-lockstep
@@ -161,7 +178,7 @@ spec:
                 --page-size 64 \
                 --max-running-requests 1 \
                 --memory-ratio 0.85 \
-                --kv-reserve-tokens 4096 \
+                --kv-reserve-tokens 65536 \
                 --expert-load parallel \
                 --tool-call-parser minimax --reasoning-parser minimax
           ports:
