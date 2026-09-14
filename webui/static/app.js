@@ -646,6 +646,13 @@ function apply(ev, from) {
   // "did MY send start this stream", not "does this id match". Asking the id
   // there matched everything, because null matches nothing and the check let it
   // through: another session's reply drew straight into the new one.
+  //
+  // paintHistory() replays a committed transcript through this same router:
+  // those events carry no session and arrive with no source stream. The store
+  // is the authority on what a conversation said — trust them outright.
+  // (Live events always carry `session` and come with `from` set; the gate
+  // below exists to route THOSE.)
+  const replay = from === undefined;
   const fresh = S.pendingNew && !S.sessionId;
   // hermes ROTATES the session id under a long conversation (context
   // compression continues under a new id). Frames after the rotation carry the
@@ -658,16 +665,18 @@ function apply(ev, from) {
     noteSessionEndpoint(ev.session);
     loadSessions();
   }
-  const mine = fresh
-    ? (!!S.ownStream && from === S.ownStream)
-    // Every frame carries its session (TurnStream.emit injects it), so ids
-    // decide — EXCEPT the reload-recovery view, whose S.sessionId is still
-    // null: there the FOCUS stream is the recovered turn and is trusted, and
-    // a session-LESS frame likewise only on the focus stream. With several
-    // feeds open, another turn's frames must not paint here.
-    : (!S.sessionId || !ev.session)
-      ? from === S.streamId
-      : ev.session === S.sessionId;
+  const mine = replay
+    ? true
+    : fresh
+      ? (!!S.ownStream && from === S.ownStream)
+      // Every frame carries its session (TurnStream.emit injects it), so ids
+      // decide — EXCEPT the reload-recovery view, whose S.sessionId is still
+      // null: there the FOCUS stream is the recovered turn and is trusted, and
+      // a session-LESS frame likewise only on the focus stream. With several
+      // feeds open, another turn's frames must not paint here.
+      : (!S.sessionId || !ev.session)
+        ? from === S.streamId
+        : ev.session === S.sessionId;
   // The stream is the authority on which conversation this turn belongs to.
   // Reading `acp.session_id` instead raced hermes assigning it and could hand
   // back the PREVIOUS session, relabelling the new conversation as the old one.

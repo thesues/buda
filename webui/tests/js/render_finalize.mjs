@@ -40,4 +40,28 @@ finalize();
 assert.strictEqual(bubbles.length, 1, 'one assistant bubble');
 assert.strictEqual(bubbles[0].innerHTML, '关于剃度，语料库中的依据如下。',
   'the whole answer must be painted; an empty bubble is the bug this pins');
+
+// The ownership gate inside apply(), replayed exactly as it is written:
+// paintHistory() calls apply(ev) with NO source stream, and history events
+// carry no session — the store is the authority on what was said, so a replay
+// frame is trusted outright. Live frames are routed by session id; a frame
+// from another session must still be dropped.
+function gate(ev, from, sessionId, streamId, pendingNew, ownStream) {
+  const replay = from === undefined;
+  const fresh = pendingNew && !sessionId;
+  if (replay) return true;
+  return fresh
+    ? !!ownStream && from === ownStream
+    : (!sessionId || !ev.session)
+      ? from === streamId
+      : ev.session === sessionId;
+}
+
+assert.strictEqual(gate({ kind: 'history_user' }, undefined, 's1', 'sx', false, null), true,
+  'a history replay frame paints');
+assert.strictEqual(gate({ kind: 'delta' }, 'sx', 's1', 'sx', false, null), true,
+  'the focus stream paints');
+assert.strictEqual(gate({ kind: 'delta', session: 'other' }, 'sx', 's1', 'sx', false, null), false,
+  'another turn\'s frame does not paint here');
+
 console.log('ok - a loaded transcript renders in full');
