@@ -71,7 +71,10 @@ const renderMD = (src) => {
 const S = {
   streamId: null,
   lastSeq: 0,
-  es: null,
+  ess: new Map(),       // streamId -> its live EventSource. ONE per turn, not one
+                        // per view: two endpoints mean two turns can run at once,
+                        // and a single slot made watching session B freeze session A
+                        // (attach closed A's feed; switching back orphaned B).
   busy: false,
   seg: null,           // { kind: "think"|"out", body, text, refs }
   tools: new Map(),
@@ -623,7 +626,14 @@ function apply(ev, from) {
   const fresh = S.pendingNew && !S.sessionId;
   const mine = fresh
     ? (!!S.ownStream && from === S.ownStream)
-    : (!ev.session || !S.sessionId || ev.session === S.sessionId);
+    // Every frame carries its session (TurnStream.emit injects it), so ids
+    // decide — EXCEPT the reload-recovery view, whose S.sessionId is still
+    // null: there the FOCUS stream is the recovered turn and is trusted, and
+    // a session-LESS frame likewise only on the focus stream. With several
+    // feeds open, another turn's frames must not paint here.
+    : (!S.sessionId || !ev.session)
+      ? from === S.streamId
+      : ev.session === S.sessionId;
   // The stream is the authority on which conversation this turn belongs to.
   // Reading `acp.session_id` instead raced hermes assigning it and could hand
   // back the PREVIOUS session, relabelling the new conversation as the old one.
@@ -656,35 +666,53 @@ function apply(ev, from) {
       break;
     case "note": finalizeSeg(); addMsg("note", ev.text); break;
     case "gap": finalizeSeg(); addMsg("note", "（断线期间有部分输出未能保留）"); break;
-    case "end": endTurn(ev.error, ev.session); break;
+    case "end": endTurn(ev.error, ev.session, from); break;
   }
   // Only while a turn is actually live. `endTurn()` clears the saved cursor,
   // and this line runs AFTER the switch that called it — so persisting
   // unconditionally put the finished stream straight back into localStorage,
   // and the next reload reattached to a turn that had nothing left to say.
-  if (ev.seq) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
+  // Per-stream now: a BACKGROUND feed's frames must not advance the FOCUS
+  // stream's saved cursor.
+  if (ev.seq && from === S.streamId) {
+    S.lastSeq = ev.seq;
+    if (S.busy) remember(from, ev.seq);
+  }
 }
 
-function attach(streamId, afterSeq) {
-  detach();
-  S.streamId = streamId;
+function attach(streamId, afterSeq, opts) {
+  // One EventSource PER TURN, held in `S.ess`, not one slot per view. Two
+  // endpoints mean two turns can run at once, and closing the previous feed
+  // on every attach was how watching a second session froze the first: the
+  // orphaned turn kept running server-side (streams buffer regardless of
+  // readers) while its view starved — and switching back re-orphaned the
+  // other one. A seesaw; both ends look dead.
+  S.streamId = streamId;   // where 停止 and reload-recovery aim
   S.lastSeq = afterSeq || 0;
   setBusy(true);
+  // `replay` (openSession): the view was just cleared and repainted from the
+  // store, so the live turn must be re-delivered from the top, not resumed
+  // from a cursor pointing into a feed this DOM no longer contains.
+  if (opts && opts.replay) closeEs(streamId);
+  if (S.ess.has(streamId)) return;   // already subscribed; its cursor is live
   const es = new EventSource(
     `/api/chat/stream?stream_id=${encodeURIComponent(streamId)}&after_seq=${S.lastSeq}`
   );
-  S.es = es;
+  S.ess.set(streamId, es);
   es.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch (_) { return; }
     apply(ev, streamId);
   };
   es.onerror = async () => {
-    if (!S.busy) return;
     // EventSource retries forever on its own, so "reconnecting" can outlive the
     // thing it claims to be reconnecting to: a server restart drops every live
     // stream AND the in-process turn behind it, and the banner then sits there
-    // permanently while nothing is coming. Ask before claiming.
+    // permanently while nothing is coming. Ask before claiming. A BACKGROUND
+    // feed (not the one on screen) fails silently: close it, keep the screen
+    // honest, let the next openSession resubscribe if the turn is still there.
+    if (streamId !== S.streamId) { closeEs(streamId); return; }
+    if (!S.busy) return;
     status("连接中断,重连中…");
     try {
       const st = await (await fetch(
@@ -693,10 +721,10 @@ function attach(streamId, afterSeq) {
       if (!st.known) {
         // The turn is gone with the process that held it. Say so plainly rather
         // than pretending a reconnect is in progress.
-        detach();
+        closeEs(streamId);
         finalizeSeg();
         setBusy(false);
-        forget();
+        if (recall().id === streamId) forget();
         addMsg("note", "服务重启，这一轮的回复已丢失");
         status("就绪");
       } else if (!st.running) {
@@ -708,25 +736,37 @@ function attach(streamId, afterSeq) {
   };
 }
 
-function detach() { if (S.es) { S.es.close(); S.es = null; } }
+function closeEs(streamId) {
+  const es = S.ess.get(streamId);
+  if (es) { es.close(); S.ess.delete(streamId); }
+}
 
-function endTurn(error, owner) {
-  // The turn's own session, which is not necessarily the one on screen.
+
+function endTurn(error, owner, from) {
+  // One turn ended. Only ITS feed closes — other live turns keep streaming;
+  // only the SCREEN's mutations happen — a foreign end must not unfreeze this
+  // view's composer or clear its drawing.
+  if (from) closeEs(from);
   const shown = !owner || !S.sessionId || owner === S.sessionId;
   if (owner) HISTORY_CACHE.delete(owner);
   if (S.sessionId) HISTORY_CACHE.delete(S.sessionId);
-  detach();
   clearPending();
-  finalizeSeg();
-  S.activity = null;      // the next turn opens its own group
-  setBusy(false);
-  S.tools.clear();
-  S.awaitingPerm = false;
-  forget();
-  if (error && shown) addMsg("error", `⚠ ${error}`);
-  const wasStopping = S.stopping;
-  S.stopping = false;
-  status(error ? "出错" : wasStopping ? "已停止" : "就绪");
+  if (shown) {
+    finalizeSeg();
+    S.activity = null;      // the next turn opens its own group
+    setBusy(false);
+    S.tools.clear();
+    S.awaitingPerm = false;
+    if (error) addMsg("error", `⚠ ${error}`);
+  }
+  // Reload recovery follows the FOCUS stream only; a background turn ending
+  // leaves the saved cursor alone.
+  if (!from || from === S.streamId) forget();
+  if (shown) {
+    const wasStopping = S.stopping;
+    S.stopping = false;
+    status(error ? "出错" : wasStopping ? "已停止" : "就绪");
+  }
   loadSessions();   // the turn may have created or retitled a session
 }
 
@@ -975,11 +1015,15 @@ async function openSession(id) {
     // Back on a conversation that is running. The store stops where the
     // committed transcript does, so replay the live turn from the top rather
     // than showing a reply that appears to have stopped mid-sentence.
+    // `replay` re-opens THIS turn's feed even if one was already open — the
+    // repaint above erased what it had drawn — while every OTHER live feed
+    // stays connected, which is the whole point of the per-stream map.
     S.skipUserEcho = false;
-    attach(liveStream, 0);
+    attach(liveStream, 0, { replay: true });
     status("回复中…");
   } else {
-    detach();
+    // No global detach: other sessions' feeds stay subscribed in the
+    // background, filtered out by `apply` until their turn is on screen.
     setBusy(false);
     // setBusy just decided this; asking it again here is how the line and the
     // button drifted apart.
