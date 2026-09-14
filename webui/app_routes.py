@@ -342,7 +342,19 @@ def build_app(
             return json_response({"error": "index missing"}, status=500)
         # Same contract as the static handler: no-cache + ETag, so a deploy's
         # new bundle cannot be trapped behind a heuristically-cached index.
-        etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+        #
+        # Version every static URL with the page's own hash. The no-cache
+        # header only helps a browser that ASKS again — a copy cached BEFORE
+        # any validator existed sits heuristically fresh for hours and never
+        # revalidates, which is exactly how a fixed bug kept "not working".
+        # A changed URL cannot be served from any cache, by construction.
+        version = hashlib.sha256(body).hexdigest()[:12]
+        for asset in (b"app.js", b"style.css", b"vendor/marked.min.js", b"vendor/purify.min.js"):
+            body = body.replace(
+                b"/static/" + asset, b"/static/" + asset + b"?v=" + version.encode()
+            )
+        body = body.replace(b"@@BUILD@@", version.encode())
+        etag = f'"{version}"'
         if req.headers.get("If-None-Match") == etag:
             return Response(304, [("ETag", etag), ("Cache-Control", "no-cache")])
         return Response(200, [("Content-Type", "text/html; charset=utf-8"),

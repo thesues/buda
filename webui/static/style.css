@@ -101,6 +101,7 @@ header h1 em { color:var(--accent); font-style:italic; }
 .spacer { flex:1; }
 .meta { display:flex; gap:1.1rem; font-size:0.7rem; color:var(--text-dim); align-items:baseline; }
 .meta b { color:var(--accent); font-weight:500; }
+#build { color:var(--text-muted); font-size:0.62rem; opacity:.7; }
 
 /* The endpoint picker, when there is more than one to pick. A quiet text
    control, not a form widget: appearance:none strips the UA arrow, the data-URI

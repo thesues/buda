@@ -48,7 +48,10 @@ class FakeSessions:
 @pytest.fixture
 def app_server(monkeypatch, tmp_path):
     monkeypatch.setattr(ha, "build_agent", lambda session_id, ep: FakeAgent())
-    (tmp_path / "index.html").write_text("<html>buda</html>")
+    (tmp_path / "index.html").write_text(
+        '<html><link rel="stylesheet" href="/static/style.css">'
+        '<script src="/static/app.js"></script></html>'
+    )
     gate = threading.Event()
     gate.set()
     state = {"gate": gate, "sessions": FakeSessions()}
@@ -354,3 +357,17 @@ def test_the_real_row_shadows_the_synthesized_one(app_server, monkeypatch):
     monkeypatch.setattr(mgr, "running", lambda: {})   # nothing live
     rows = _get(base, "/api/sessions")["sessions"]
     assert sum(1 for r in rows if r["id"] == "s-old") == 1
+
+
+def test_index_versioned_the_static_urls(app_server):
+    """A heuristically-cached, validator-less app.js cannot be revalidated —
+    the no-cache fix itself never reached that browser. A URL that changes
+    with every build is the only bust that works by construction."""
+    base, _, _ = app_server
+    html = urllib.request.urlopen(base + "/").read().decode()
+    assert "app.js?v=" in html and "style.css?v=" in html, "statics must be versioned"
+    assert "@@BUILD@@" not in html, "the build marker must be injected"
+    # and the versioned URL still serves
+    import re
+    v = re.search(r"app\.js\?v=([0-9a-f]+)", html).group(1)
+    urllib.request.urlopen(f"{base}/static/app.js?v={v}")
