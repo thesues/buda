@@ -155,6 +155,34 @@ def test_compression_fills_an_empty_compression_key(tmp_path):
     assert "    model: big" in text
 
 
+def test_compression_fills_the_wizards_empty_template_in_place(tmp_path):
+    """hermes' setup wizard writes provider: auto and empty-string values —
+    an absence wearing a mapping. The seed must fill THAT (replacing the
+    empty model/base_url lines, no duplicate keys) instead of honouring it,
+    or the slot keeps falling back to the active endpoint's model."""
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "auxiliary:\n"
+        "  compression:\n"
+        "    provider: auto\n"
+        "    model: ''\n"
+        "    base_url: ''\n"
+        "    api_key: ''\n"
+    )
+
+    assert hc.ensure_compression_model(
+        p, [_EP(62080, model="big", base_url="http://big/v1")], min_context=32000
+    ) is True
+    text = p.read_text()
+    assert text.count("model:") == 1 and "    model: big" in text
+    assert text.count("base_url:") == 1 and "    base_url: http://big/v1" in text
+    assert "    context_length: 62080" in text
+    # provider must be REWRITTEN, not kept: with `auto` the resolver ignores
+    # the seeded base_url entirely and falls back to the main runtime.
+    assert text.count("provider:") == 1 and "    provider: custom" in text
+    assert "    api_key: ''" in text, "sibling keys stay"
+
+
 def test_compression_seeding_is_idempotent(tmp_path):
     p = tmp_path / "config.yaml"
     eps = [_EP(62080, model="big", base_url="http://big/v1")]

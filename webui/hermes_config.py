@@ -198,7 +198,13 @@ def resolve_toolsets(cfg: dict | None) -> list[str]:
 
 
 def _compression_keys(model: str, base_url: str, context_length: int) -> list[str]:
+    # provider: custom is load-bearing, not decoration: the resolver honours a
+    # config base_url only when api_key is non-empty OR provider != auto —
+    # and the setup wizard's template leaves `provider: auto`, which made it
+    # return ("auto", model, None, None) and fall back to the main runtime,
+    # i.e. the very fallback this seed exists to override.
     return [
+        "    provider: custom",
         f"    model: {model}",
         f"    base_url: {base_url}",
         f"    context_length: {context_length}",
@@ -271,9 +277,30 @@ def ensure_compression_model(config_path: Path, endpoints, min_context: int | No
                 stop = i
                 break
         if any(block[i].strip() for i in range(comp + 1, stop)):
-            log.info("hermes config: auxiliary.compression already set; the file owns it")
-            return False
-        block = [*block[: comp + 1], *keys, *block[stop:]]
+            # hermes' own setup wizard writes an EMPTY template (provider:
+            # auto, model/base_url/api_key: '') — an absence wearing a
+            # mapping, not a choice. Only a line that actually names a model
+            # or endpoint is the operator's and is left alone.
+            def _names_something(ln: str) -> bool:
+                v = ln.partition(":")[2].strip().strip("'\"")
+                return bool(v) and v.lower() != "auto"
+            if any(_names_something(block[i]) for i in range(comp + 1, stop)):
+                log.info("hermes config: auxiliary.compression already set; the file owns it")
+                return False
+            # Empty template: fill in place — replace the model/base_url
+            # lines it already has (a duplicate `model:` key would leave
+            # which one wins to the parser) and add context_length.
+            for key_line in keys:
+                k = key_line.strip().partition(":")[0]
+                at = next((i for i in range(comp + 1, stop)
+                           if block[i].strip().startswith(f"{k}:")), None)
+                if at is not None:
+                    block[at] = key_line
+                else:
+                    block.insert(stop, key_line)
+                    stop += 1
+        else:
+            block = [*block[: comp + 1], *keys, *block[stop:]]
 
     _write(config_path, [*lines[:start], *block, *lines[end:]])
     log.info("hermes config: seeded auxiliary.compression -> %s @ %s (%s tokens)",
