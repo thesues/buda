@@ -148,6 +148,32 @@ def build_app(
         running = manager.running()
         for r in rows:
             r["is_streaming"] = r.get("id") in running
+        # A live turn's session row does not exist in the store until hermes
+        # persists its first message — which happens when the TURN ends
+        # (`_persist_session` sits on the exit paths of the conversation loop).
+        # A first turn runs tens of seconds on these engines, and for all of it
+        # the sidebar had nothing to show; if the turn died before persisting,
+        # nothing ever. Synthesize the row from the live stream's own user
+        # event; the real row replaces it when the turn ends and loadSessions
+        # reads the store again.
+        known = {r.get("id") for r in rows}
+        for sid, stream_id in running.items():
+            if sid in known:
+                continue
+            stream = manager.stream(stream_id)
+            prompt = next(
+                (e.get("text", "") for e in (stream.after(0) if stream else [])
+                 if e.get("kind") == "user"),
+                "",
+            )
+            first_line = (prompt or "").strip().splitlines()[0] if prompt.strip() else ""
+            rows.insert(0, {
+                "id": sid,
+                "title": first_line[:40] or "新会话",
+                "preview": "回复中…",
+                "messageCount": 0,
+                "is_streaming": True,
+            })
         return json_response({
             "sessions": rows,
             "current": last_session.get(req.client_id),

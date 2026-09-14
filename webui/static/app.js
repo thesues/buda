@@ -646,6 +646,17 @@ function apply(ev, from) {
   // there matched everything, because null matches nothing and the check let it
   // through: another session's reply drew straight into the new one.
   const fresh = S.pendingNew && !S.sessionId;
+  // hermes ROTATES the session id under a long conversation (context
+  // compression continues under a new id). Frames after the rotation carry the
+  // new id and would fail the ownership test forever — the view starves
+  // mid-answer. On the FOCUS stream the frame's id is authoritative: adopt it
+  // BEFORE the test, or the rotation frame itself is dropped as foreign.
+  if (!fresh && ev.session && S.sessionId && ev.session !== S.sessionId
+      && from === S.streamId) {
+    S.sessionId = ev.session;
+    noteSessionEndpoint(ev.session);
+    loadSessions();
+  }
   const mine = fresh
     ? (!!S.ownStream && from === S.ownStream)
     // Every frame carries its session (TurnStream.emit injects it), so ids
@@ -1027,7 +1038,10 @@ async function openSession(id) {
   // now only because the old URL 404'd before reaching this line.
   const events = j.events || [];
   HISTORY_CACHE.set(id, events);
-  if (!cached) paintHistory(events);
+  // Paint the fetched events whenever the cached copy is empty — a session
+  // clicked once WHILE its first turn was running got cached as [], and the
+  // old `if (!cached)` guard turned that into an empty panel forever.
+  if (!cached || !cached.length) paintHistory(events);
   // Not gated on S.busy any more: with several turns possible, the one that
   // matters is whether THIS conversation is streaming — which the map answers
   // directly. The old check asked "is anything streaming, and is it this one",

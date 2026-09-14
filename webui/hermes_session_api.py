@@ -68,7 +68,19 @@ def _provisional_title(preview: str) -> str:
 def list_sessions(limit: int, include_empty: bool) -> list[dict]:
     # exclude_sources=["tool"] mirrors the CLI's default: hide third-party tool
     # sessions, which are not conversations anyone opened.
-    rows = _db().list_sessions_rich(source=None, exclude_sources=["tool"], limit=limit)
+    #
+    # include_children + project_compression_tips=False is deliberate, against
+    # the CLI's defaults: context compression ROTATES the session id — the old
+    # row becomes a child and the conversation continues under a new one — and
+    # the CLI's projection collapses each chain into ONE row keyed to wherever
+    # its tip happens to be. A chain whose tip died mid-turn (a restart, a
+    # killed pod) projected NOWHERE and the whole conversation vanished from
+    # the sidebar — “全没了”. Physical rows never disappear: every session the
+    # reader had is still here, at the id its transcript actually lives under.
+    rows = _db().list_sessions_rich(
+        source=None, exclude_sources=["tool"], limit=limit,
+        include_children=True, project_compression_tips=False,
+    )
     out = []
     for r in rows:
         # A session with no messages is a ghost. They carry no title or preview

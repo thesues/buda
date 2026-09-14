@@ -325,3 +325,32 @@ def test_delete_refuses_a_session_that_is_mid_reply(app_server, monkeypatch):
     code, body = _post(base, "/api/session/delete", {"sessionId": "s-old"})
     assert code == 409
     assert "先停止再删除" in body["error"]
+
+
+def test_a_live_turns_session_shows_in_the_sidebar_before_the_store_has_it(app_server):
+    """hermes persists a session row only when the turn ENDS, so a first turn
+    ran its whole life invisible to /api/sessions — "new sessions appear late,
+    sometimes never". The route must synthesize the row from the live stream."""
+    base, mgr, state = app_server
+    state["gate"].clear()   # keep the turn running
+    try:
+        code, body = _post(base, "/api/chat/start",
+                           {"text": "什么是缘起", "sessionId": "s-live", "endpoint": "dsv4"})
+        assert code == 200, body
+        rows = _get(base, "/api/sessions")["sessions"]
+        row = next((r for r in rows if r["id"] == "s-live"), None)
+        assert row is not None, "a running turn must be visible in the sidebar"
+        assert row["is_streaming"] is True
+        assert "什么是缘起" in row["title"]
+    finally:
+        state["gate"].set()
+
+
+def test_the_real_row_shadows_the_synthesized_one(app_server, monkeypatch):
+    """Once the store has the row (turn ended), the merge must not duplicate it."""
+    base, mgr, state = app_server
+    fake = FakeSessions()
+    fake.rows.append({"id": "s-old", "title": "昨天的问题", "messageCount": 4})
+    monkeypatch.setattr(mgr, "running", lambda: {})   # nothing live
+    rows = _get(base, "/api/sessions")["sessions"]
+    assert sum(1 for r in rows if r["id"] == "s-old") == 1
