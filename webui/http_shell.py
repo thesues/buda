@@ -26,6 +26,7 @@ file is the transport.
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -178,12 +179,12 @@ class App:
         if fn is not None:
             return fn(req)
         if req.method == "GET" and self.static_dir is not None:
-            static = self.serve_static(req.path)
+            static = self.serve_static(req)
             if static is not None:
                 return static
         return json_response({"error": "not found"}, status=404)
 
-    def serve_static(self, path: str) -> Response | None:
+    def serve_static(self, req: Request) -> Response | None:
         """Files under `static_dir`, addressed under `/static/`, nothing else.
 
         The prefix is part of the contract, not decoration. `index.html` asks
@@ -200,6 +201,7 @@ class App:
         """
         if self.static_dir is None:
             return None
+        path = req.path
         if not path.startswith(STATIC_PREFIX):
             return None
         rel = path[len(STATIC_PREFIX):]
@@ -215,7 +217,17 @@ class App:
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
             ctype += "; charset=utf-8"
-        return Response(200, [("Content-Type", ctype)], body)
+        # no-cache + ETag, not no-store: the app's JS carries the fixes the
+        # reader is supposed to see, and a response with NO cache validator let
+        # browsers heuristically pin an old bundle — deploys shipped, the page
+        # kept running code from before them, and every client-side bug fix
+        # looked like it did nothing. no-cache revalidates every load; the
+        # content hash makes the revalidation a 304 unless the file changed.
+        etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+        if req.headers.get("If-None-Match") == etag:
+            return Response(304, [("ETag", etag), ("Cache-Control", "no-cache")])
+        return Response(200, [("Content-Type", ctype), ("ETag", etag),
+                              ("Cache-Control", "no-cache")], body)
 
 
 class _Handler(BaseHTTPRequestHandler):

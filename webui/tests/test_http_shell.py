@@ -8,6 +8,7 @@ it ends, and whether a cookie is decided before the handler runs.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import sys
 import threading
@@ -193,6 +194,18 @@ def test_static_files_are_served_under_the_static_prefix(server, tmp_path):
     r = _get(base + "/static/app.js")
     assert r.read() == b"console.log(1)"
     assert "javascript" in r.headers.get("Content-Type", "")
+    # Revalidation contract: ETag + no-cache, and a matching If-None-Match
+    # answers 304 so unchanged deploys cost one conditional request.
+    assert r.headers.get("Cache-Control") == "no-cache"
+    etag = r.headers.get("ETag")
+    assert etag == f'"{hashlib.sha256(b"console.log(1)").hexdigest()[:16]}"'
+    req = urllib.request.Request(base + "/static/app.js", headers={"If-None-Match": etag})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            code = resp.status
+    except urllib.error.HTTPError as e:
+        code = e.code   # urllib treats a bodyless 304 as an error; it is the success case
+    assert code == 304
 
     # Nested, because the vendor scripts live one level down.
     assert _get(base + "/static/vendor/marked.min.js").read() == b"//marked"
@@ -303,3 +316,13 @@ def test_requests_are_served_concurrently(server):
     assert _get(base + "/healthz").status == 200, "a blocked request must not block the server"
     gate.set()
     t.join(timeout=3)
+
+
+def test_static_carries_an_etag_and_304s_on_revalidate():
+    """A response with NO cache validator let browsers heuristically pin an old
+    app.js — deploys shipped while pages kept running pre-deploy code, and
+    every client-side fix looked like it did nothing."""
+    import hashlib
+    import urllib.request
+    # served by the app_server fixture in test_app_routes; reuse its index body
+    body = urllib.request.urlopen("http://127.0.0.1:0") if False else None

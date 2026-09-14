@@ -106,6 +106,7 @@ const S = {
   // find ITS stream, not the one that happened to be recorded last.
   streaming: {},
   watchTimer: null,     // refreshes the sidebar while a turn runs somewhere else
+  watchPeriod: null,    // ms; 3s while anything streams, 15s idle
   stopping: false,
   startedAt: 0,
   timer: null,
@@ -956,14 +957,16 @@ function fmtWhen(ts) {
 function watchWhileOthersRun() {
   // The page follows ONE stream at a time — the conversation on screen. A turn
   // running anywhere else has no connection to this tab at all, so nothing
-  // would ever tell the sidebar it finished. This is that: a slow poll, alive
-  // only while something is streaming, stopping the moment nothing is.
+  // would ever tell the sidebar it finished. This is that poll — fast while
+  // something streams, and SLOW forever otherwise: sessions deleted elsewhere
+  // (another tab, an operator) used to leave their rows standing until some
+  // unrelated action happened to re-fetch. One list query per 15 s is nothing.
   const anyLive = Object.keys(S.streaming).length > 0;
-  if (anyLive && !S.watchTimer) {
-    S.watchTimer = setInterval(loadSessions, 3000);
-  } else if (!anyLive && S.watchTimer) {
-    clearInterval(S.watchTimer);
-    S.watchTimer = null;
+  const want = anyLive ? 3000 : 15000;
+  if (S.watchPeriod !== want) {
+    if (S.watchTimer) clearInterval(S.watchTimer);
+    S.watchTimer = setInterval(loadSessions, want);
+    S.watchPeriod = want;
   }
 }
 
@@ -1052,6 +1055,16 @@ async function openSession(id) {
   // A switch the reader started and then abandoned: they are looking at another
   // session now, so painting this one's history would corrupt what they see.
   if (S.sessionId !== id) return;
+  // An EMPTY transcript for a session the sidebar says has messages means the
+  // row is gone (deleted in another tab) or never persisted. Say so — a silent
+  // empty panel read as "the messages are lost".
+  if (!(j.events || []).length) {
+    const row = (S.sessionRows || []).find((r) => r.id === id);
+    finalizeSeg();
+    addMsg("note", (row && row.messageCount) ? "这个会话的内容已不可读（可能已在别处删除）" : "这个会话还没有内容");
+    status("就绪");
+    return;
+  }
   // `events`, which is what `/api/session/history` returns. Reading `history`
   // here yielded undefined and painted an empty transcript — invisible until
   // now only because the old URL 404'd before reaching this line.

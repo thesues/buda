@@ -19,6 +19,7 @@ Two contracts worth restating because they are easy to break silently:
 from __future__ import annotations
 
 import logging
+import hashlib
 import json
 from pathlib import Path
 
@@ -339,6 +340,12 @@ def build_app(
             body = index_html.read_bytes()
         except OSError:
             return json_response({"error": "index missing"}, status=500)
-        return Response(200, [("Content-Type", "text/html; charset=utf-8")], body)
+        # Same contract as the static handler: no-cache + ETag, so a deploy's
+        # new bundle cannot be trapped behind a heuristically-cached index.
+        etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+        if req.headers.get("If-None-Match") == etag:
+            return Response(304, [("ETag", etag), ("Cache-Control", "no-cache")])
+        return Response(200, [("Content-Type", "text/html; charset=utf-8"),
+                              ("ETag", etag), ("Cache-Control", "no-cache")], body)
 
     return app
