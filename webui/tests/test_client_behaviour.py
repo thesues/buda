@@ -82,6 +82,25 @@ def test_the_prompt_is_painted_once():
     r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-400:]
 
+def test_a_new_session_does_not_stop_the_one_still_replying():
+    """发送 in a new conversation cancelled the turn running in another.
+
+    The button's click handler branched on `S.busy`, which a turn left running
+    elsewhere keeps raised, so it ran `cancelTurn()` at that turn's stream and
+    its reply was lost (production: the row stayed at "1 条"). Runs the REAL
+    app.js under node — the source-grep tests all passed while this shipped.
+    Also pins: a background turn's seq never becomes the focus cursor, its end
+    is not painted into the new view, and a page opening on 新的对话 sends a
+    new conversation rather than appending to the server's `current`.
+    """
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    script = Path(__file__).parent / "js" / "new_session_bystander.mjs"
+    r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-800:]
+
 def test_a_finished_turn_does_not_leave_its_cursor_in_local_storage():
     """The client half of the same bug.
 

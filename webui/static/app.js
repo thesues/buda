@@ -78,7 +78,9 @@ const S = {
                         // and a single slot made watching session B freeze session A
                         // (attach closed A's feed; switching back orphaned B).
   busy: false,
-  seg: null,           // { kind: "think"|"out", body, text, refs }
+  owns: false,          // the conversation ON SCREEN has a live turn; decided in
+                        // setBusy. Send/stop gate on this, never on `busy`.
+  seg: null,          // { kind: "think"|"out", body, text, refs }
   tools: new Map(),
   approvalTimer: null,
   awaitingPerm: false,
@@ -687,7 +689,10 @@ function apply(ev, from) {
     loadSessions();
   }
   if (!mine && ev.kind !== "end") {
-    if (ev.seq) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
+    // Advance the cursor only for the FOCUS stream. A background turn's seq
+    // saved under the focus stream's id made a reload resume the focus turn
+    // past events it never delivered.
+    if (ev.seq && from === S.streamId) { S.lastSeq = ev.seq; if (S.busy) remember(S.streamId, ev.seq); }
     return;
   }
   switch (ev.kind) {
@@ -790,7 +795,14 @@ function endTurn(error, owner, from) {
   // only the SCREEN's mutations happen — a foreign end must not unfreeze this
   // view's composer or clear its drawing.
   if (from) closeEs(from);
-  const shown = !owner || !S.sessionId || owner === S.sessionId;
+  // A view with no id is either a pending 新会话 — only ITS own send's end is
+  // shown, or another conversation's error lands in the empty view — or a
+  // reload recovery, which shows its focus stream.
+  const shown = S.sessionId && owner
+    ? owner === S.sessionId
+    : S.pendingNew && !S.sessionId
+      ? (!!from && from === S.ownStream)
+      : (!from || from === S.streamId);
   if (owner) HISTORY_CACHE.delete(owner);
   if (S.sessionId) HISTORY_CACHE.delete(S.sessionId);
   clearPending();
@@ -817,7 +829,8 @@ function cancelTurn() {
   // A REQUEST, not an instant stop: the agent finishes the chunk it is on
   // first, measured at ~12 s here. Without saying so the button reads as
   // broken, which is exactly how it was reported.
-  if (!S.busy || S.stopping) return;        // a second click adds nothing
+  if (!S.owns || S.stopping) return;        // a second click adds nothing; and
+                                            // never a turn this view does not show
   S.stopping = true;
   $("#send").textContent = "停止中…";
   $("#send").disabled = true;
@@ -851,9 +864,19 @@ function setBusy(b) {
   // session on screen", so consulting it after navigating away kept claiming a
   // turn left behind in another conversation. It is meaningful only while the
   // view has no id of its own yet, which is the one window ids cannot cover.
+  // With no id and no pending 新会话, the view is a reload recovery: the focus
+  // stream IS the view's turn.
   const owns = b && (S.sessionId
     ? !!S.streaming[S.sessionId]
-    : (!!S.ownStream && S.ownStream === S.streamId));
+    : S.pendingNew
+      ? (!!S.ownStream && S.ownStream === S.streamId)
+      : !!S.streamId);
+  // Stored, because the 停止 button, Enter and the form all have to ask THIS
+  // question. They used to ask `S.busy` — true whenever the tab's focus stream
+  // is live, including a turn left running in another conversation — so 发送
+  // in a new session ran cancelTurn() against that other turn and its reply
+  // was lost.
+  S.owns = !!owns;
 
   // Ask the server how many replies the CHOSEN endpoint can run and how many
   // it is running, instead of reading "a turn exists" as "the composer is
@@ -1152,8 +1175,8 @@ async function newSession() {
   $("#messages").textContent = "";
   S.seg = null; S.tools.clear(); S.activity = null; S.actIndex = 0; S.sessionId = null;
   showFresh();
-  setBusy(S.busy);   // recompute: the new view owns nothing, so a turn that is
-                     // still running now counts as running elsewhere
+  setBusy(false);    // the new view owns nothing — same as openSession on an idle
+                     // conversation. The other turn's feed stays in S.ess.
   status(S.blockedElsewhere ? "另一个会话仍在回复中" : "就绪");
   loadSessions();
 }
@@ -1171,7 +1194,7 @@ async function send() {
     status("⚠ 先回答上方的确认请求");
     return;
   }
-  if (S.busy) return;   // this conversation is already replying
+  if (S.owns) return;   // this conversation is already replying
   if (S.switching) { status("正在切换会话，稍候"); return; }
   input.value = ""; input.style.height = "auto";
   addMsg("user", text);
@@ -1229,7 +1252,12 @@ async function send() {
   // Ours, so `apply` can tell our own turn from one still running elsewhere
   // while this view has no id of its own yet.
   S.ownStream = j.streamId;
-  if (j.sessionId) { S.sessionId = j.sessionId; noteSessionEndpoint(j.sessionId); S.pendingNew = false; }
+  if (j.sessionId) {
+    S.sessionId = j.sessionId; noteSessionEndpoint(j.sessionId); S.pendingNew = false;
+    // Known now, not at the next /api/sessions: `owns` reads this map, and
+    // until it says so the view would offer 发送 on its own running turn.
+    S.streaming[j.sessionId] = j.streamId;
+  }
   loadSessions();
   remember(j.streamId, 0);
   showPending();
@@ -1268,6 +1296,10 @@ async function boot() {
   } else if (!$("#messages").firstChild) {
     // Nothing to reattach and nothing on screen: this IS a fresh conversation,
     // so say so rather than opening on a blank panel that reads as loading.
+    // And MEAN it: without pendingNew, loadSessions adopts the server's
+    // `current` and the first message typed under 新的对话 was appended to
+    // this browser's previous conversation.
+    S.pendingNew = true;
     showFresh();
   }
 
@@ -1306,7 +1338,7 @@ async function boot() {
     }
   });
   $("#send").onclick = (e) => {
-    if (!S.busy) return;                    // not busy: let the form submit
+    if (!S.owns) return;                    // not replying HERE: let the form submit
     e.preventDefault();
     cancelTurn();
   };
@@ -1327,7 +1359,7 @@ async function boot() {
       send();
     }
   });
-  $("#composer").addEventListener("submit", (e) => { e.preventDefault(); if (!S.busy) send(); });
+  $("#composer").addEventListener("submit", (e) => { e.preventDefault(); if (!S.owns) send(); });
 }
 
 boot();
