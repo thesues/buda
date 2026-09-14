@@ -27,6 +27,8 @@ const LS_STREAM = "hermes.streamId";
 const LS_SEQ = "hermes.lastSeq";
 const LS_OPEN = "hermes.open";      // which activity groups the reader had open
 const LS_EP = "hermes.endpoint";    // last-used endpoint: the DEFAULT new sessions start on
+const LS_SESS_EP = "hermes.sessionEndpoints";   // session_id -> endpoint, so the picker
+                        // still shows a conversation's model after a reload
 
 // Keyed by session + the group's index in the transcript, which is stable for a
 // given conversation: reload it, switch away and back, and the rows you opened
@@ -90,7 +92,7 @@ const S = {
   sessionRows: [],      // last list from the server, so a click can repaint now
   endpoints: [],        // what /api/status advertises: {key,label,model,maxConcurrent,running}
   endpoint: null,       // which endpoint THIS session's next send names — read from
-  sessionEp: {},        //   sessionEp[sessionId]; sessions WITHOUT a choice (new, other
+  sessionEp: loadSessionEp(),  //   sessionEp[sessionId]; sessions WITHOUT a choice (new, other
                         //   tab) start on the last-used default. A turn already running
                         //   keeps its own endpoint; switching decides the next turn only.
   // (maxConcurrent/running were flat scalars from the single-endpoint days;
@@ -156,7 +158,26 @@ function endpointFor(sid) {
 function noteSessionEndpoint(sid) {
   // Pin the pending choice onto a session the moment it acquires an id, so
   // the picker follows the conversation instead of the tab.
-  if (sid && S.endpoint) S.sessionEp[sid] = S.endpoint;
+  if (sid && S.endpoint) {
+    S.sessionEp[sid] = S.endpoint;
+    saveSessionEp();
+  }
+}
+
+function saveSessionEp() {
+  // The map must survive a reload — the whole complaint it answers is "the
+  // picker forgot which model this session used". Cap at 200 ids, oldest
+  // inserted first; insertion order is the only order a plain object gives.
+  try {
+    const keys = Object.keys(S.sessionEp);
+    for (const k of keys.slice(0, Math.max(0, keys.length - 200))) delete S.sessionEp[k];
+    localStorage.setItem(LS_SESS_EP, JSON.stringify(S.sessionEp));
+  } catch (_) { /* private mode: the picker degrades to the last-used default */ }
+}
+
+function loadSessionEp() {
+  try { return JSON.parse(localStorage.getItem(LS_SESS_EP)) || {}; }
+  catch (_) { return {}; }
 }
 
 function setEndpoints(list, defaultKey) {
@@ -227,6 +248,7 @@ function pickEndpoint(key) {
   // session answers with `key`, other sessions keep theirs. It also becomes
   // the last-used default, which seeds sessions without a choice.
   S.sessionEp[S.sessionId || ""] = key;
+  saveSessionEp();
   saveEndpoint(key);
   const e = S.endpoints.find((x) => x.key === key);
   status(`本会话下一个回复使用 ${e ? e.label : key}`);
