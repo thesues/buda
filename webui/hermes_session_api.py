@@ -20,7 +20,15 @@ import re
 import sys
 from pathlib import Path
 
-from hermes_state import SessionDB  # hermes venv only
+def _db():
+    """hermes' session store. Imported HERE, not at module scope, so the pure
+    shaping below can be exercised by tests -- which have no hermes. The module
+    still runs only under hermes' interpreter; this just stops an unavailable
+    dependency from making the transcript-shaping untestable, and that shaping
+    is where the bug this file was last changed for actually lived."""
+    from hermes_state import SessionDB  # hermes venv only
+
+    return SessionDB()
 
 # Shared with the LIVE path on purpose. A reload used to re-render the raw
 # `{"output":…,"exit_code":…}` with no command above it -- the very shape the
@@ -28,6 +36,18 @@ from hermes_state import SessionDB  # hermes venv only
 # is stdlib-only, so it imports under either venv.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from turn_stream import DETAIL_MAX, _detail_for, _invocation_text  # noqa: E402
+
+# The LIVE path does not derive the command -- hermes hands it one, built by
+# `build_tool_preview`. Deriving a second version here produced a different
+# string for the same call the moment a tool took more than one argument:
+# `terminal` adds a `timeout`, so a reload showed the whole JSON where the live
+# row had shown `echo …`. Use hermes' own function, which is what live receives.
+# Guarded like every other hermes import here: a version that moved it costs the
+# nicer rendering, not the transcript.
+try:
+    from agent.display import build_tool_preview as _hermes_preview  # noqa: E402
+except Exception:  # noqa: BLE001
+    _hermes_preview = None
 
 
 def _provisional_title(preview: str) -> str:
@@ -48,7 +68,7 @@ def _provisional_title(preview: str) -> str:
 def list_sessions(limit: int, include_empty: bool) -> list[dict]:
     # exclude_sources=["tool"] mirrors the CLI's default: hide third-party tool
     # sessions, which are not conversations anyone opened.
-    rows = SessionDB().list_sessions_rich(source=None, exclude_sources=["tool"], limit=limit)
+    rows = _db().list_sessions_rich(source=None, exclude_sources=["tool"], limit=limit)
     out = []
     for r in rows:
         # A session with no messages is a ghost. They carry no title or preview
@@ -104,7 +124,7 @@ def history(sid: str, limit: int) -> list[dict]:
     this is a chat box, so assistant text and a one-line trace of tool activity
     is all of it.
     """
-    msgs = SessionDB().get_messages(sid) or []
+    msgs = _db().get_messages(sid) or []
     if limit and len(msgs) > limit:
         msgs = msgs[-limit:]
     out: list[dict] = []
@@ -132,7 +152,14 @@ def history(sid: str, limit: int) -> list[dict]:
                         call_args = json.loads(raw)
                     except ValueError:
                         call_args = raw
-                inv = _invocation_text(None, call_args)
+                inv = ""
+                if _hermes_preview is not None and isinstance(call_args, dict):
+                    try:
+                        inv = _hermes_preview(fn.get("name") or "", call_args) or ""
+                    except Exception:  # noqa: BLE001
+                        inv = ""
+                if not inv:
+                    inv = _invocation_text(None, call_args)
                 if cid:
                     invocations[cid] = inv
                 detail = _detail_for(inv, None)
