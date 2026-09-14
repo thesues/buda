@@ -513,13 +513,18 @@ function toolRow(id, title, st, detail, full, duration) {
       el("span", "t-since"),
       el("span", "t-status", st || "")
     );
-    row.querySelector(".t-since").dataset.since = String(Date.now());
     a.body.appendChild(row);
     a.tools += 1;
     S.tools.set(id, row);
   }
   if (title) row.querySelector(".t-name").textContent = title;
   row.querySelector(".t-status").textContent = st || "";
+  // Only a LIVE `running` starts the row's clock. It used to start on creation,
+  // so a call replayed from the store — which is never running — ticked
+  // forever when no result row came to stop it (production: a
+  // mcp_memory_search_docs call read 40s, 43s… under a finished answer).
+  const since = row.querySelector(".t-since");
+  if (st === "running" && since && !since.dataset.since) since.dataset.since = String(Date.now());
   if (detail) {
     let d = row.nextElementSibling;
     if (!d || !d.classList.contains("act-detail")) {
@@ -546,8 +551,12 @@ function toolRow(id, title, st, detail, full, duration) {
     // starts when the row is painted, so it under-reports a tool whose start
     // event arrived late -- the row read 0s for a call the agent timed at 1.0s.
     if (n) { n.removeAttribute("data-since"); if (duration) n.textContent = duration; }
-    if (S.busy) { showPending(); setPendingText("处理检索结果"); }
-  } else if (st) { status(title || "工具执行中"); showPending(); }
+    // `owns`, not `busy`: a transcript replayed while another conversation's
+    // turn kept the tab busy grew a 思考中 row it had nothing to do with.
+    if (S.owns) { showPending(); setPendingText("处理检索结果"); }
+  } else if (st === "running") { status(title || "工具执行中"); showPending(); }
+  // Any other status (a replayed `pending`/`incomplete`, an unnamed progress
+  // event) is a label on the row, not a claim that work is in flight.
   activitySummary();
   scroll();
 }

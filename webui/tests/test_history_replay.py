@@ -100,3 +100,27 @@ def test_the_true_length_is_a_number_not_the_text(monkeypatch):
     assert isinstance(rows[1]["detailFull"], int)
     assert len(rows[1]["detail"]) <= hs.DETAIL_MAX
     assert rows[1]["detailFull"] > len(rows[1]["detail"])
+
+
+def test_a_call_whose_result_was_never_stored_is_not_left_running(monkeypatch):
+    """Captured from production (session "哦"): an assistant message calls
+    `mcp_memory_search_docs`, no `tool` row follows, and the final answer comes
+    next. Replayed as `pending`, the row kept a live timer ticking and put a
+    思考中 row under an idle transcript. It is `incomplete` — never `pending`,
+    and never `completed`, which would claim a result nobody stored."""
+    msgs = [
+        {"role": "user", "content": "为什么拈花"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_mcp_0", "type": "function",
+            "function": {"name": "mcp_memory_search_docs",
+                         "arguments": '{"query": "拈花微笑"}'},
+        }]},
+        {"role": "assistant", "content": "语料库里关于拈花微笑的记载……"},
+    ]
+    rows = _replay(monkeypatch, msgs)
+    assert [r["status"] for r in rows] == ["incomplete"], rows
+    # A call that DID get its result keeps the pairing: the call row may be
+    # provisional, the result row completes it.
+    answered = _replay(monkeypatch, _msgs("echo ok", "ok", 0))
+    assert answered[-1]["status"] == "completed"
+    assert all(r["status"] != "incomplete" for r in answered), answered

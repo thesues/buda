@@ -569,4 +569,40 @@ const count = (hay, needle) => hay.split(needle).length - 1;
     "新会话 during a send was overridden by the send's response");
 }
 
+/* ---------- 9. a replayed tool call never looks like it is still running ---------- */
+{
+  // Production, session "哦": a call with no stored result replayed as
+  // `pending` — its timer ticked (40s, 43s…) and a 思考中 row sat under an idle
+  // transcript. Nothing replayed from the store is running: no timer, no
+  // pending row, whatever status it carries.
+  const h = harness();
+  h.server.sessions.push({ id: "t", title: "为什么拈花", messageCount: 3 });
+  h.server.history.t = [
+    { kind: "history_user", text: "为什么拈花" },
+    { kind: "tool", id: "call_a", title: "skill_view", status: "pending", detail: "", detailFull: 0 },
+    { kind: "tool", id: "call_a", title: "skill_view", status: "completed", detail: "ok", detailFull: 2 },
+    { kind: "tool", id: "call_b", title: "mcp_memory_search_docs", status: "incomplete", detail: "$ 拈花微笑", detailFull: 9 },
+    { kind: "delta", text: "语料库里……", thought: false },
+    // A turn stopped right after a call: no answer follows to clear a pending row.
+    { kind: "history_user", text: "再查一次" },
+    { kind: "tool", id: "call_c", title: "mcp_memory_search_docs", status: "incomplete", detail: "", detailFull: 0 },
+  ];
+  await settle();
+  h.run("loadSessions()"); await settle();
+  rowOf(h, "为什么拈花").onclick(); await settle(); await settle();
+  assert.strictEqual(h.$("#messages").querySelectorAll("[data-since]").length, 0,
+    "a replayed tool row is timing itself as if it were running");
+  assert.ok(!h.$("#pending"), "a replayed transcript shows a 思考中 row");
+  assert.strictEqual(h.$("#run-status").textContent, "就绪");
+
+  // The live path still times a running tool and shows the pending row.
+  h.$("#new-session").click(); await settle();
+  h.type("live"); h.$("#send").click(); await settle();
+  const sid = h.S().sessionId, stream = h.S().streamId;
+  h.push(stream, { kind: "tool", id: "x#1", title: "terminal", status: "running", detail: "", detailFull: 0, seq: 2, session: sid });
+  assert.strictEqual(h.$("#messages").querySelectorAll("[data-since]").length >= 2, true,
+    "a live running tool lost its timer");   // the tool row's and the pending row's
+  assert.ok(h.$("#pending"));
+}
+
 console.log("ok - a new session leaves the running one alone");

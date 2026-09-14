@@ -209,6 +209,14 @@ def history(sid: str, limit: int) -> list[dict]:
                 # made that arithmetic NaN on every replayed tool result.
                 "detail": detail[:DETAIL_MAX], "detailFull": len(detail),
             })
+    # A call no `tool` row ever answered. It happens — captured in production:
+    # a `mcp_memory_search_docs` call followed directly by the final answer —
+    # and `pending` made the client time it as running forever. `incomplete`
+    # says what the store knows; `completed` would claim a result it never had.
+    answered = {e.get("id") for e in out if e.get("kind") == "tool" and e.get("status") != "pending"}
+    for e in out:
+        if e.get("kind") == "tool" and e.get("status") == "pending" and e.get("id") not in answered:
+            e["status"] = "incomplete"
     return out
 
 
