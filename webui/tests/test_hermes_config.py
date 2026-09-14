@@ -168,6 +168,8 @@ def test_compression_fills_the_wizards_empty_template_in_place(tmp_path):
         "    model: ''\n"
         "    base_url: ''\n"
         "    api_key: ''\n"
+        "    timeout: 120\n"
+        "    extra_body: {}\n"
     )
 
     assert hc.ensure_compression_model(
@@ -181,6 +183,10 @@ def test_compression_fills_the_wizards_empty_template_in_place(tmp_path):
     # the seeded base_url entirely and falls back to the main runtime.
     assert text.count("provider:") == 1 and "    provider: custom" in text
     assert "    api_key: ''" in text, "sibling keys stay"
+    assert "    timeout: 120" in text and "    extra_body: {}" in text, "template plumbing stays"
+    # and the template's non-empty-but-generic timeout must NOT be mistaken
+    # for an operator choice that blocks the seed
+    assert "    context_length: 62080" in text
 
 
 def test_compression_seeding_is_idempotent(tmp_path):

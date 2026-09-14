@@ -279,9 +279,17 @@ def ensure_compression_model(config_path: Path, endpoints, min_context: int | No
         if any(block[i].strip() for i in range(comp + 1, stop)):
             # hermes' own setup wizard writes an EMPTY template (provider:
             # auto, model/base_url/api_key: '') — an absence wearing a
-            # mapping, not a choice. Only a line that actually names a model
-            # or endpoint is the operator's and is left alone.
+            # mapping, not a choice. Only the four keys that actually steer
+            # _resolve_task_provider_model count: timeout/extra_body carry
+            # non-empty defaults (`timeout: 120`) that say nothing about
+            # identity, so a generic non-empty check would honour the
+            # template forever and the seed would never fire.
+            identity = ("provider", "model", "base_url", "api_key")
+
             def _names_something(ln: str) -> bool:
+                key = ln.strip().partition(":")[0].strip()
+                if key not in identity:
+                    return False
                 v = ln.partition(":")[2].strip().strip("'\"")
                 return bool(v) and v.lower() != "auto"
             if any(_names_something(block[i]) for i in range(comp + 1, stop)):
