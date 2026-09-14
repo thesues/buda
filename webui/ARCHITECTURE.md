@@ -70,6 +70,36 @@ with the session's history intact — hermes persists the transcript to the
 store, and each turn starts from what the store holds. A turn already running
 keeps the endpoint it started on.
 
+## Toolsets and MCP
+
+Both are owned by ONE file: `HERMES_HOME/config.yaml` — the same file hermes'
+own CLI reads. (The approach is hermes-webui's: it resolves its sessions'
+toolsets from `platform_toolsets.cli` in that file via
+`hermes_cli.tools_config._get_platform_tools`, with a hardcoded fallback.
+buda does the same in `hermes_config.resolve_toolsets`.)
+
+- `platform_toolsets.cli` — the toolset list. Resolution precedence: hermes'
+  own resolver (which honours `agent.disabled_toolsets` and expands composites)
+  → the raw list in the file → a built-in default that includes `terminal`,
+  because a session that cannot run anything is broken, not degraded. On first
+  boot only, `HERMES_ACP_TOOLSETS` seeds the key if the file lacks it; from
+  then on the file is authoritative — edit it, or run `hermes tools`. The seed
+  is load-bearing: without a `platform_toolsets.cli` entry, hermes' resolver
+  returns its FULL CLI composite (browser, tts, vision, delegation, …), which
+  is exactly the surface this UI narrows on purpose.
+- `mcp_servers.<name>.url` / `enabled` — the retrieval server. Written at
+  startup from `MEMORY_MCP_URL` (`ensure_mcp_server`, tracks the env on every
+  boot — deliberately unlike the toolset seed) and connected by
+  `register_mcp_servers` at startup. W10's both-places rule survives the
+  library migration: the config entry names the toolset, the registration
+  connects it, and either alone leaves an agent with no retrieval.
+- `mcp-<name>` toolsets are appended by `build_agent` for every enabled
+  server, NOT left to the resolver. Verified against a real hermes checkout:
+  `_get_platform_tools` only carries MCP toolsets when the config EXPLICITLY
+  lists them — hermes-webui's doc claims auto-append, but the installed
+  version does not, so relying on it would silently drop retrieval on a
+  version bump.
+
 Three parts, and each exists because of a specific failure:
 
 - **Sequence numbers + a bounded backlog.** Lifted from the lerobot console's

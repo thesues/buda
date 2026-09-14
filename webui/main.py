@@ -91,17 +91,48 @@ def main() -> None:
     # leave the first conversation of every restart without retrieval. Loud but
     # not fatal — chat without retrieval beats no chat, and `/api/status`
     # reports what was configured either way.
+    hermes_cfg = Path(
+        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    ) / "config.yaml"
     mcp_url = os.environ.get("MEMORY_MCP_URL", "")
     if mcp_url:
         try:
             from hermes_config import ensure_mcp_server
 
-            cfg = Path(
-                os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
-            ) / "config.yaml"
-            ensure_mcp_server(cfg, os.environ.get("MEMORY_MCP_NAME", "memory"), mcp_url)
+            ensure_mcp_server(
+                hermes_cfg, os.environ.get("MEMORY_MCP_NAME", "memory"), mcp_url
+            )
         except Exception as e:  # noqa: BLE001
             log.error("could not point hermes at %s: %s", mcp_url, e)
+
+    # The toolsets live in the SAME config file, under `platform_toolsets.cli`
+    # — the key hermes' own CLI reads. Seed it only if the file does not have
+    # the key yet: HERMES_ACP_TOOLSETS (what the manifest used to drive
+    # directly) becomes a FIRST-BOOT seed instead of a per-build lookup, and
+    # from then on the file is authoritative — edit it, or run `hermes tools`.
+    # The built-in default includes terminal, so an empty env and an empty file
+    # still yield an agent that can run things.
+    try:
+        from hermes_config import ensure_platform_toolsets
+
+        seed = [
+            t.strip()
+            for t in os.environ.get("HERMES_ACP_TOOLSETS", "").split(",")
+            if t.strip()
+        ]
+        ensure_platform_toolsets(hermes_cfg, seed or None)
+    except Exception as e:  # noqa: BLE001
+        log.error("could not seed platform_toolsets: %s", e)
+
+    # Say what actually resolved — the file won this boot or the seed did, and
+    # the log is where the difference is visible without opening a shell.
+    try:
+        from hermes_cli.config import load_config
+        from hermes_config import resolve_toolsets
+
+        log.info("toolsets: %s", ", ".join(resolve_toolsets(load_config() or {})))
+    except Exception:  # noqa: BLE001
+        log.debug("could not log the resolved toolsets", exc_info=True)
 
     # Writing the server into config.yaml is not connecting to it. The ACP
     # adapter called `register_mcp_servers` itself; nothing in the library path

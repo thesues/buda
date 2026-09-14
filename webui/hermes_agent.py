@@ -202,20 +202,22 @@ def load_endpoints(raw: str | None, default_home_model: str = "") -> list[Endpoi
 # ── the agent itself ────────────────────────────────────────────────────────
 
 
-def _toolsets() -> list[str]:
-    return [t.strip() for t in os.environ.get("HERMES_ACP_TOOLSETS", "").split(",") if t.strip()]
-
-
 def build_agent(session_id: str, ep: Endpoint) -> Any:
     """Construct one `AIAgent` wired to `ep`.
 
     The kwargs mirror what hermes' own ACP adapter passes, minus the parts that
     are about stdio being a JSON-RPC transport. `session_db` is handed in so the
     agent persists into the same store the sidebar reads.
+
+    Toolsets and MCP servers both come from hermes' config.yaml — the one file
+    hermes' own CLI reads. `resolve_toolsets` runs hermes' own platform
+    resolver over it, which also appends `mcp-<name>` for every enabled
+    server; the loop below is a belt-and-braces for the fallback paths.
     """
     from run_agent import AIAgent
 
     mcp_servers = []
+    cfg: dict = {}
     try:
         from hermes_cli.config import load_config
 
@@ -226,9 +228,11 @@ def build_agent(session_id: str, ep: Endpoint) -> Any:
             if not isinstance(c, dict) or c.get("enabled", True) is not False
         ]
     except Exception:  # noqa: BLE001 -- a missing config must not block a turn
-        log.debug("could not read mcp_servers from hermes config", exc_info=True)
+        log.debug("could not read hermes config", exc_info=True)
 
-    toolsets = list(_toolsets())
+    from hermes_config import resolve_toolsets
+
+    toolsets = list(resolve_toolsets(cfg))
     for name in mcp_servers:
         t = f"mcp-{name}"
         if t not in toolsets:

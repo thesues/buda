@@ -13,6 +13,11 @@ and a missing import here would degrade into "chat works, retrieval silently
 does not". hermes writes a plain block-style mapping, so an indentation-aware
 edit is enough and dependency-free. The same reasoning the console applied to
 reading the `model:` block.
+
+Toolsets live in the SAME file, under `platform_toolsets.cli` — the key
+hermes' own CLI reads for itself (see `resolve_toolsets` below). One file owns
+what a session can do; the env vars that used to drive this directly are
+seeds, not sources.
 """
 
 from __future__ import annotations
@@ -21,6 +26,17 @@ import logging
 from pathlib import Path
 
 log = logging.getLogger("webui.config")
+
+
+# The toolsets a session runs with when the config file says nothing. Terminal
+# is in it on purpose: this UI exists so a skill can run something, and a
+# config that predates the key must not silently produce an agent that cannot.
+# (This is also the list the deployment had before the config file owned the
+# knob, carried over unchanged.)
+DEFAULT_TOOLSETS = [
+    "file", "terminal", "todo", "memory", "skills",
+    "search", "web", "session_search", "clarify",
+]
 
 
 def render_block(name: str, url: str) -> list[str]:
@@ -93,15 +109,103 @@ def _write(path: Path, lines: list[str]) -> None:
     tmp.replace(path)
 
 
+# ── toolsets ────────────────────────────────────────────────────────────────
+
+
+def render_toolsets_block(toolsets: list[str]) -> list[str]:
+    # Block style, one entry per line — hermes' own writer produces the same
+    # shape, and a line-scan can tell "configured" from "absent" at a glance.
+    return ["platform_toolsets:", "  cli:", *(f"    - {t}" for t in toolsets)]
+
+
+def ensure_platform_toolsets(config_path: Path, toolsets: list[str] | None = None) -> bool:
+    """Seed `platform_toolsets.cli` into the config file, IF it is not there.
+
+    Returns True if the file changed. Seed, not set: once the key exists the
+    file is authoritative — an operator edits it (or runs `hermes tools`)
+    and this must not clobber their choice back on every restart. That is the
+    deliberate asymmetry with `ensure_mcp_server`, whose value (a URL the pod
+    derives from the environment) should track the env on every boot.
+
+    `toolsets` None means DEFAULT_TOOLSETS.
+    """
+    want = list(toolsets) if toolsets else list(DEFAULT_TOOLSETS)
+    lines = config_path.read_text().splitlines() if config_path.exists() else []
+
+    start = next((i for i, ln in enumerate(lines) if ln.rstrip() == "platform_toolsets:"), None)
+    if start is None:
+        new = [*lines, *( [""] if lines and lines[-1].strip() else [] ), *render_toolsets_block(want)]
+        _write(config_path, new)
+        log.info("hermes config: seeded platform_toolsets.cli -> %s", ", ".join(want))
+        return True
+
+    # The block runs to the next line at column 0 that is not blank — the same
+    # indentation rule hermes' own writer produces.
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if ln.strip() and not ln[0].isspace():
+            end = i
+            break
+    block = lines[start:end]
+    if any(ln.strip().startswith("cli:") for ln in block):
+        log.info("hermes config: platform_toolsets.cli already set; the file owns it")
+        return False
+
+    # platform_toolsets: exists but cli: does not — add the key under it.
+    block = block + ["  cli:", *(f"    - {t}" for t in want)]
+    _write(config_path, [*lines[:start], *block, *lines[end:]])
+    log.info("hermes config: added platform_toolsets.cli -> %s", ", ".join(want))
+    return True
+
+
+def resolve_toolsets(cfg: dict | None) -> list[str]:
+    """The toolsets ONE session should carry, from the config hermes reads.
+
+    Precedence — the first source that yields a non-empty list wins:
+
+    1. hermes' own resolver, `hermes_cli.tools_config._get_platform_tools` —
+       the same function the CLI uses on itself. It reads
+       `platform_toolsets.cli` from the config, expands composite toolset
+       names, honours `agent.disabled_toolsets`, and appends `mcp-<name>`
+       for every enabled `mcp_servers` entry — so the MCP toolsets never
+       have to be listed in the file by hand.
+    2. the raw `platform_toolsets.cli` list from the config. For the case
+       where hermes moved or renamed its resolver: an explicit list in the
+       file is still worth more than a built-in guess.
+    3. DEFAULT_TOOLSETS — for a config with no key at all.
+    """
+    cfg = cfg or {}
+    try:
+        from hermes_cli.tools_config import _get_platform_tools
+
+        got = sorted(_get_platform_tools(cfg, "cli"))
+        if got:
+            return got
+    except Exception:  # noqa: BLE001 — resolver moved/absent; the fallbacks below hold
+        log.debug("hermes toolset resolver unavailable", exc_info=True)
+
+    raw = (cfg.get("platform_toolsets") or {}).get("cli")
+    if isinstance(raw, list):
+        got = [str(t).strip() for t in raw if str(t).strip()]
+        if got:
+            return got
+
+    return list(DEFAULT_TOOLSETS)
+
+
 # NOTE: an `ensure_disabled_toolsets` used to live here and was REMOVED, because
-# it does not work on the ACP path and shipping it would have looked like it did.
-# `acp_adapter/session.py` builds every session with a hardcoded
-# `_expand_acp_enabled_toolsets(["hermes-acp"], ...)`; neither
-# `agent.disabled_toolsets` nor `agent.enabled_toolsets` in config.yaml reaches
-# it, and there is no environment override. Both were tried against 0.17 and the
-# browser tools stayed. Trimming the ACP toolset needs a patch to hermes itself.
+# it did not work on the ACP path: `acp_adapter/session.py` hardcoded its
+# toolset list, so nothing in config.yaml reached the session and only
+# patch_acp_toolsets.py could change it. The library path has no such hole:
+# `build_agent` resolves the toolsets with `resolve_toolsets()` (hermes' own
+# `_get_platform_tools`, which HONOURS `agent.disabled_toolsets`) and hands
+# the result to `AIAgent.__init__` directly. Trimming the toolset is now a
+# config.yaml edit — no patch, no env. The Dockerfile still runs
+# patch_acp_toolsets.py as belt-and-braces for the retired ACP path; it no
+# longer gates anything here.
 #
-# What config.yaml IS still needed for: the same function reads `mcp_servers` to
-# derive each server's `mcp-<name>` toolset. So an MCP server must be in BOTH
-# places -- the file (for the toolset name) and the ACP `session/new` parameter
-# (for the actual connection).
+# What config.yaml IS still needed for: the same `mcp_servers` block both
+# names the `mcp-<name>` toolsets (the resolver appends them) and connects
+# the servers (`register_mcp_servers` at startup). Either alone yields an
+# agent with no retrieval — see W10.
