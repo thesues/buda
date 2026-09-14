@@ -1,0 +1,227 @@
+# A THIRD FreeToken, serving MiniMax-M2.5-NVFP4 as the webui's second endpoint.
+#
+# ── Same image as freetoken-l3, different data ───────────────────────────────
+# The model is not in the image: the converted checkpoint lives on the autumn
+# fs mount at models/minimax-m25-ftw (uploaded by freetoken-ftw-convert.yaml's
+# job). IMAGE_FREETOKEN_L3 below is deliberately the SAME placeholder as
+# freetoken-l3.yaml — one build serves both endpoints, so one sed fills both.
+#
+# ── What is deliberately ABSENT: the autumn L3 KV tier ───────────────────────
+# freetoken-l3's header records the experiment: the L3 page codec is written
+# for DSV4's MLA layout and needs a prefix cache carrying `committed_pages`
+# (SWA radix only). MiniMax keeps plain `radix` and `MHAKVCache`, which has
+# none of the attributes the codec reads, so the tier refuses to build
+# ("'MHAKVCache' object has no attribute 'P'"). Hence no --hicache-* flags at
+# all here: the prefix cache stays in VRAM (L1 only), which a chat endpoint
+# does not miss — L3 exists to survive pod restarts, not to speed a turn up.
+#
+# ── Serve-line departures from freetoken-l3, and why ─────────────────────────
+#   parsers `minimax`            model_type is minimax_m2; its chat template
+#                                delimits reasoning with its own special think
+#                                tags (see chat_template.jinja), which the
+#                                `minimax` parser splits on. `minimax_m3`
+#                                (<mm:think>) is a different family. Both are
+#                                closed argparse enumerations
+#                                and guessing crash-loops the pod (see l3).
+#   --expert-load parallel       explicit because the SERIAL NVFP4 expert
+#                                build is the one that hung (zero CPU, zero
+#                                I/O) — the reason freetoken-l3 left MiniMax.
+#   memory 160Gi, pin 170        MiniMax's expert banks are ~118 GiB (vs
+#                                DSV4's 155); 160Gi was computed for exactly
+#                                this model. The pin budget is a CAP, not an
+#                                allocation — 170 over 118 costs nothing.
+#
+# ── Contention, known and accepted ───────────────────────────────────────────
+# A second engine on 192.168.3.2 contends for CPU-MoE with freetoken-l3:
+# measured 1.68x, not 2x, and erratic (freetoken.yaml's note). Both endpoints
+# cap maxConcurrent at 1 and there is one human on the webui, so the engines
+# mostly take turns; the degradation only shows when both stream at once.
+# The node is a constraint, not a preference — driver r580+ rules out every
+# other node (see freetoken-l3.yaml).
+#
+# Applied directly with `kubectl apply -f` after substituting the image:
+#   sed "s|IMAGE_FREETOKEN_L3|<repo>/freetoken-l3:<sha>|" k8s/freetoken-mm2.yaml |
+#     kubectl apply -f -
+# A raw apply is accepted and then leaves the pod in InvalidImageName (same
+# failure mode webui.yaml's header describes).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: freetoken-mm2
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-mm2 }
+spec:
+  # ClusterIP for the same reason as freetoken-l3: `ft serve` has NO
+  # authentication of any kind. Never expose this outside the cluster.
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-mm2 }
+  ports:
+    - { name: http, port: 1919, targetPort: 1919 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: freetoken-mm2
+  namespace: autumn
+  labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-mm2 }
+spec:
+  replicas: 1
+  serviceName: freetoken-mm2
+  selector:
+    matchLabels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-mm2 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autumn, app.kubernetes.io/component: freetoken-mm2 }
+    spec:
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: "192.168.3.2"
+
+      initContainers:
+        # Lift autumn-fuse at deploy time, not build time — same WIRE-lockstep
+        # argument as freetoken-l3.yaml, which has the full story.
+        - name: fusebin
+          image: dongmao-test-cn-beijing.cr.volces.com/dongmao-test/autumn-rs:c211b626a140ddc43bd101925e3b019c7d0839f9
+          command: ["sh","-c","cp /usr/local/bin/autumn-fuse /fusebin/ && chmod +x /fusebin/autumn-fuse"]
+          volumeMounts:
+            - { name: fusebin, mountPath: /fusebin }
+          resources:
+            requests: { cpu: "1", memory: 256Mi }
+            limits:   { cpu: "1", memory: 256Mi }
+
+      containers:
+        - name: freetoken
+          image: IMAGE_FREETOKEN_L3
+          imagePullPolicy: Always
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Pin CUDA to the GPU the device plugin actually allocated. This
+              # container is privileged, so every /dev/nvidia* on the node is
+              # visible and CUDA would otherwise pick index 0 — which is
+              # freetoken-l3's card, not this pod's allocation.
+              case "${NVIDIA_VISIBLE_DEVICES:-}" in
+                ""|all|void|none) echo "GPU: no specific allocation, leaving CUDA to choose" ;;
+                *) export CUDA_VISIBLE_DEVICES="$NVIDIA_VISIBLE_DEVICES"
+                   echo "GPU: pinned to allocated device(s) $CUDA_VISIBLE_DEVICES" ;;
+              esac
+
+              # autumn's Rust client parses a SocketAddr — IP literals only.
+              M="$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              echo "manager = $M"
+
+              # FUSE mount inside this container, not a sidecar: propagation
+              # between containers measured broken on this cluster, and
+              # Bidirectional propagation wedged five nodes once (see l3).
+              MP=/mnt/autumn; mkdir -p "$MP"
+              if grep -qs " $MP fuse" /proc/mounts; then
+                echo "stale mount at $MP — lazy unmounting"
+                fusermount3 -uz "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
+              fi
+              # direct-read false: the weights are EC-converted, extents hold
+              # RS shards, and autumn refuses direct-read descriptors for them
+              # (a 32 MiB read never returned; the proxy path does 164 MiB/s).
+              /opt/fusebin/autumn-fuse --manager "$M" --mountpoint "$MP" --transport tcp \
+                --direct-read false \
+                --read-io-threads 8 \
+                --credential-file /etc/autumn/cred/fs.cred &
+              FUSE_PID=$!
+              trap 'kill $FUSE_PID 2>/dev/null; fusermount3 -u "$MP" 2>/dev/null' EXIT
+
+              # Readiness = a real READ of the model dir. /proc/mounts and bare
+              # `ls $MP` both go true before FUSE INIT completes; only a file
+              # that cannot exist until the mount is live proves the mount.
+              for i in $(seq 1 120); do
+                ls "$MP/models/minimax-m25-ftw" >/dev/null 2>&1 && break
+                kill -0 $FUSE_PID 2>/dev/null || { echo "autumn-fuse exited during mount"; exit 1; }
+                sleep 1
+              done
+              ls "$MP/models/minimax-m25-ftw" >/dev/null 2>&1 || { echo "mount not serving $MP/models/minimax-m25-ftw after 120s"; exit 1; }
+              echo "mounted after ${i}s; model dir:"; ls "$MP/models/minimax-m25-ftw" | head -3
+
+              # Calibrate the PCIe/CPU hybrid split for THIS GPU. The profile is
+              # keyed by GPU UUID and does not transfer between machines or
+              # cards; without it hybrid runs its default (unmeasured) split.
+              ft bench bw || echo "bench bw failed — hybrid will use its default split"
+
+              # NOTE: no comments inside the command below. A `#` line breaks
+              # the backslash continuation and silently drops every later
+              # argument (that is how --expert-load was lost once on l3).
+              # Parsers and expert-load: see this file's header — minimax_m2
+              # family, and the serial NVFP4 expert build is the known hang.
+              # No --hicache-*: MiniMax's MHAKVCache has no committed_pages for
+              # the autumn L3 codec; the tier would refuse to build.
+              exec ft serve \
+                --model /mnt/autumn/models/minimax-m25-ftw \
+                --host 0.0.0.0 --port 1919 \
+                --moe-backend hybrid \
+                --page-size 64 \
+                --max-running-requests 1 \
+                --memory-ratio 0.85 \
+                --kv-reserve-tokens 4096 \
+                --expert-load parallel \
+                --tool-call-parser minimax --reasoning-parser minimax
+          ports:
+            - { name: http, containerPort: 1919 }
+          env:
+            - { name: FREETOKEN_PIN_BUDGET_GB, value: "170" }
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              # requests == limits (Guaranteed) so the static CPU manager hands
+              # out exclusive cores to the CPU-MoE workers; see freetoken-l3.
+              cpu: "32"
+              memory: 160Gi
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "32"
+              memory: 160Gi
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK"]
+          volumeMounts:
+            - { name: mnt, mountPath: /mnt/autumn }
+            - { name: fusebin, mountPath: /opt/fusebin }
+            - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: ftcache, mountPath: /root/.cache }
+          startupProbe:
+            # /health answers 200 while the model still loads; this is a floor,
+            # not a gate. failureThreshold raised over l3's 120: first boot
+            # streams ~118 GiB of expert banks through the FUSE proxy, and the
+            # probe budget must cover the load, not just the mount.
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 10
+            failureThreshold: 180     # 30 min
+          readinessProbe:
+            httpGet: { path: /health, port: 1919 }
+            periodSeconds: 10
+          livenessProbe:
+            # Budget clears the LOAD: pinning the expert bank stalls the
+            # process past a 1 s probe; 30 s x 40 tolerates ~20 min of it.
+            # See freetoken-l3.yaml for the exit-137 history.
+            httpGet: { path: /health, port: 1919 }
+            timeoutSeconds: 10
+            periodSeconds: 30
+            failureThreshold: 40
+
+      volumes:
+        - { name: mnt, emptyDir: {} }
+        - { name: fusebin, emptyDir: {} }
+        - name: cred
+          secret: { secretName: autumn-credential }
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
+
+  volumeClaimTemplates:
+    - metadata:
+        name: ftcache
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Named explicitly: no default StorageClass in this cluster; an unset
+        # class leaves the claim Pending forever (seen once on l3).
+        storageClassName: ebs-ssd
+        resources: { requests: { storage: 10Gi } }

@@ -221,7 +221,17 @@ spec:
             - name: BUDA_ENDPOINTS
               value: |
                 [{"key":"dsv4","label":"DSV4-Flash","model":"dsv4-flash",
-                  "base_url":"http://freetoken-l3:1919/v1","maxConcurrent":1}]
+                  "base_url":"http://freetoken-l3:1919/v1","maxConcurrent":1},
+                 {"key":"mm2","label":"MiniMax-M2.5","model":"minimax-m25-ftw",
+                  "base_url":"http://freetoken-mm2:1919/v1","maxConcurrent":1}]
+            # The two model ids are the served names each engine reports on
+            # /v1/models (the --model path's basename): dsv4-flash-ftw's pod was
+            # later reverted to dsv4-flash, and sglang echoes any requested name
+            # back, so the entry matches the SPEC, not the currently running
+            # process. mm2 has no such ambiguity. freetoken-mm2.yaml owns the
+            # second engine; without that pod this endpoint is offered but
+            # errors at send time — the composer only greys on occupancy, not
+            # on reachability.
             # The browser toolset's availability check will DOWNLOAD Chromium
             # to decide it is available -- elsewhere a fresh volume grew from
             # 220 KB to 897 MB doing it. These stop that. They do NOT remove the
