@@ -206,7 +206,10 @@ def test_a_tool_row_is_named_after_the_tool_not_the_event():
     assert [r["status"] for r in rows] == ["running", "completed"]
     # Both halves key on the same row, or the panel shows the call twice.
     assert rows[0]["id"] == rows[1]["id"]
-    assert "1.2" in rows[1]["detail"], rows[1]["detail"]
+    # The duration is its OWN field. It used to be the fallback value of
+    # `detail`, which put "1.2s" in the box the tool's output belongs in.
+    assert rows[1]["duration"] == "1.2s", rows[1]
+    assert "1.2s" not in rows[1]["detail"], rows[1]["detail"]
 
 
 def test_a_failed_tool_says_so():
@@ -223,3 +226,90 @@ def test_the_reasoning_channel_is_not_a_tool_row():
         (("reasoning.available", "_thinking", "some thinking", None), {}),
     ])
     assert rows == []
+
+
+# ── what a tool row actually SHOWS ──────────────────────────────────────────
+#
+# The payloads below are captured verbatim from the installed hermes by driving
+# a real turn ("echo HELLO-OK", then "ls /definitely-not-here-xyz") with a
+# recording callback. They are not a guess at the contract.
+#
+# The reader's complaint was that a tool row told them nothing: a failure gave
+# no reason, a success gave no output, and the box under the row contained the
+# duration. All of it was in the callback and thrown away here.
+
+
+def test_the_command_and_its_output_both_reach_the_row():
+    """Ablation: stop reading `preview`/`args` on started, or `result` on
+    completed, and the detail goes back to being empty."""
+    rows = _tool_events([
+        (("tool.started", "terminal", "echo HELLO-OK", {"command": "echo HELLO-OK"}), {}),
+        (("tool.completed", "terminal", None, None),
+         {"duration": 0.0296, "is_error": False,
+          "result": '{"output": "HELLO-OK", "exit_code": 0, "error": null}'}),
+    ])
+    assert "echo HELLO-OK" in rows[0]["detail"]
+    assert "echo HELLO-OK" in rows[1]["detail"], "the command must survive to the result row"
+    assert "HELLO-OK" in rows[1]["detail"]
+    assert rows[0]["id"] == rows[1]["id"]
+
+
+def test_a_nonzero_exit_is_visible_without_being_called_a_failure():
+    """`grep` answers 1 for "no match", so a non-zero exit is not promoted to
+    `failed` -- hermes' own `is_error` decides that. But the code must be ON the
+    row, or a reader cannot tell the two apart at all."""
+    rows = _tool_events([
+        (("tool.started", "terminal", "ls /nope", {"command": "ls /nope"}), {}),
+        (("tool.completed", "terminal", None, None),
+         {"duration": 0.011, "is_error": False,
+          "result": '{"output": "ls: cannot access \'/nope\': No such file or directory",'
+                    ' "exit_code": 2, "error": null}'}),
+    ])
+    assert "No such file or directory" in rows[1]["detail"]
+    assert "exit 2" in rows[1]["detail"]
+    assert rows[1]["status"] == "completed"
+
+
+def test_two_calls_to_one_tool_are_two_rows():
+    """hermes sends no call id on this path, so the id fell back to the TITLE
+    and a second `terminal` call overwrote the first -- one row for two
+    commands, the earlier one gone.
+
+    Ablation: key the row on the title again and these ids collapse."""
+    rows = _tool_events([
+        (("tool.started", "terminal", "echo one", {"command": "echo one"}), {}),
+        (("tool.completed", "terminal", None, None),
+         {"result": '{"output": "one", "exit_code": 0}'}),
+        (("tool.started", "terminal", "echo two", {"command": "echo two"}), {}),
+        (("tool.completed", "terminal", None, None),
+         {"result": '{"output": "two", "exit_code": 0}'}),
+    ])
+    assert rows[0]["id"] == rows[1]["id"]
+    assert rows[2]["id"] == rows[3]["id"]
+    assert rows[0]["id"] != rows[2]["id"], "two calls collapsed onto one row"
+    assert "one" in rows[1]["detail"] and "two" in rows[3]["detail"]
+
+
+def test_a_tools_own_arguments_cannot_rewrite_its_row():
+    """The args dict used to be merged into the event metadata, so a tool with a
+    parameter called `status` or `title` rewrote the row describing it."""
+    rows = _tool_events([
+        (("tool.started", "search_files",
+          "look", {"title": "NOT THE TOOL", "status": "failed"}), {}),
+    ])
+    assert rows[0]["title"] == "search_files"
+    assert rows[0]["status"] == "running"
+
+
+def test_the_true_length_is_sent_so_the_client_can_say_what_was_cut():
+    """`detailFull` is a LENGTH. The client computes "还有 N 字" from it, so a
+    string there made that arithmetic NaN."""
+    big = "x" * 9000
+    rows = _tool_events([
+        (("tool.started", "terminal", "cat big", {"command": "cat big"}), {}),
+        (("tool.completed", "terminal", None, None),
+         {"result": '{"output": "' + big + '", "exit_code": 0}'}),
+    ])
+    assert isinstance(rows[1]["detailFull"], int)
+    assert len(rows[1]["detail"]) <= 4000
+    assert rows[1]["detailFull"] > len(rows[1]["detail"])

@@ -115,7 +115,7 @@ def history(sid: str, limit: int) -> list[dict]:
                     "kind": "tool",
                     "id": tc.get("id") or tc.get("call_id"),
                     "title": fn.get("name") or tc.get("name") or "tool",
-                    "status": "pending", "detail": "", "detailFull": "",
+                    "status": "pending", "detail": "", "detailFull": 0,
                 })
         elif role == "tool":
             # The result arrives as its own row and carries the id the call was
@@ -125,7 +125,10 @@ def history(sid: str, limit: int) -> list[dict]:
                 "id": m.get("tool_call_id"),
                 "title": m.get("tool_name") or "",
                 "status": "completed",
-                "detail": text[:200], "detailFull": text[:4000],
+                # `detailFull` is a LENGTH, not a second copy of the text --
+                # the client computes "还有 N 字" from it. Sending the string
+                # made that arithmetic NaN on every replayed tool result.
+                "detail": text[:4000], "detailFull": len(text),
             })
     return out
 

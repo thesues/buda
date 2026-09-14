@@ -111,6 +111,87 @@ class TurnStream:
             return self.seq > seq or not self.running
 
 
+# How much of a tool's detail crosses the wire. The client clamps its DISPLAY
+# further and offers to expand; this is the transport ceiling, and `detailFull`
+# carries the true length so "there is more" can be told from "that is all".
+DETAIL_MAX = 4000
+
+
+def _invocation_text(preview, call_args) -> str:
+    """What the tool was CALLED with, as one readable line.
+
+    `preview` is hermes' own rendering and is preferred when it says something.
+    Falling back to the argument dict matters for tools that supply no preview,
+    and a single-valued dict reads better unwrapped: `{'command': 'ls'}` is
+    worth showing as `ls`, not as its JSON.
+    """
+    if isinstance(preview, str) and preview.strip():
+        return preview.strip()
+    if isinstance(call_args, dict) and call_args:
+        if len(call_args) == 1:
+            only = next(iter(call_args.values()))
+            if isinstance(only, str) and only.strip():
+                return only.strip()
+        try:
+            import json
+
+            return json.dumps(call_args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(call_args)
+    if isinstance(call_args, str) and call_args.strip():
+        return call_args.strip()
+    return ""
+
+
+def _detail_for(invocation: str, result) -> str:
+    """The row's body: what ran, then what it answered.
+
+    `result` arrives as a JSON STRING from hermes' terminal tool
+    (`{"output":…, "exit_code":N, "error":…}`), as a dict from others, and as
+    plain text from the rest. All three are shown; a shape this does not
+    recognise is printed rather than dropped, because an unreadable result still
+    tells the reader more than an empty box.
+    """
+    import json
+
+    parsed = result
+    if isinstance(result, str):
+        text = result.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = result
+
+    lines: list[str] = []
+    if invocation:
+        lines.append(f"$ {invocation}" if "\n" not in invocation else invocation)
+
+    if isinstance(parsed, dict):
+        out = parsed.get("output")
+        err = parsed.get("error")
+        code = parsed.get("exit_code")
+        body = "" if out is None else str(out)
+        if body:
+            lines.append(body)
+        if err:
+            lines.append(f"error: {err}")
+        # Shown always when non-zero, and when there was nothing else to show --
+        # "exit 0" with no output beats a box that looks like it failed to load.
+        if code not in (None, 0):
+            lines.append(f"exit {code}")
+        elif code == 0 and not body and not err:
+            lines.append("exit 0")
+        if out is None and err is None and code is None:
+            lines.append(json.dumps(parsed, ensure_ascii=False))
+    elif parsed is not None:
+        body = str(parsed).strip()
+        if body:
+            lines.append(body)
+
+    return "\n".join(lines).strip()
+
+
 class EventSink:
     """What `bind_callbacks` hands the agent: a turn's stream, in agent terms.
 
@@ -121,6 +202,12 @@ class EventSink:
 
     def __init__(self, stream: TurnStream) -> None:
         self.stream = stream
+        # Pairing state for tools hermes announces without a call id.
+        self._tool_seq = 0
+        self._open: dict[str, list[str]] = {}
+        # What each open row was invoked with, so the completed event can show
+        # the command ABOVE its output -- `completed` carries neither.
+        self._invocation: dict[str, str] = {}
 
     def delta(self, text: str, thought: bool = False) -> None:
         if not text:
@@ -141,18 +228,31 @@ class EventSink:
     def tool(self, *args, **kwargs) -> None:
         """hermes' tool-progress callback. Positional, with the shape above.
 
-        Still tolerant of a dict, because other call sites and older versions
-        pass one — but the positional form is the one that is actually used,
-        so it is read first rather than guessed at.
-        """
-        info = dict(kwargs)
-        for a in args:
-            if isinstance(a, dict):
-                info.update(a)
+        The row carries WHAT RAN and WHAT CAME BACK. It used to carry neither:
+        `preview`/`args` were dropped on the way in, `result` was dropped on the
+        way out, and `detail` fell back to the duration -- so a reader got a box
+        containing "1.0s" and no way to tell a failure's reason from a success's
+        output. Both were in the callback the whole time.
 
-        pos = [a for a in args if not isinstance(a, dict)]
+        Still tolerant of a dict, but only as a FALLBACK. Merging every dict
+        argument into the metadata put the tool's own arguments there, so a tool
+        with a parameter named `status` or `title` would have rewritten the row.
+        """
+        pos = list(args)
         event = str(pos[0]) if pos and isinstance(pos[0], str) else ""
-        name = pos[1] if len(pos) > 1 and isinstance(pos[1], str) else ""
+        name = str(pos[1]) if len(pos) > 1 and isinstance(pos[1], str) else ""
+        preview = pos[2] if len(pos) > 2 else None
+        call_args = pos[3] if len(pos) > 3 else None
+
+        info = dict(kwargs)
+        if not event:
+            # An older or dict-shaped call site. Only here is merging safe:
+            # there is no positional contract to read instead.
+            for a in args:
+                if isinstance(a, dict):
+                    info.update(a)
+            event = str(info.get("event") or "")
+            name = str(info.get("name") or "")
 
         # `_thinking` is the reasoning channel wearing the tool callback's
         # signature; it has its own pane and is not a tool call.
@@ -161,24 +261,64 @@ class EventSink:
 
         title = str(info.get("title") or name or info.get("name") or event or "tool")
         status = str(info.get("status") or self._EVENT_STATUS.get(event, ""))
+
+        # hermes supplies no call id on this path, so the id used to fall back to
+        # the TITLE -- and two `terminal` calls in one turn then landed on one
+        # row, the second overwriting the first. Pair them here instead: a
+        # `started` opens a row, the next `completed` for that tool closes the
+        # one that is still open.
+        given = info.get("id") or info.get("tool_call_id")
+        if given:
+            row_id = str(given)
+        elif status == "running":
+            self._tool_seq += 1
+            row_id = f"{title}#{self._tool_seq}"
+            self._open.setdefault(title, []).append(row_id)
+        else:
+            waiting = self._open.get(title) or []
+            row_id = waiting.pop(0) if waiting else f"{title}#0"
+
+        invocation = _invocation_text(preview, call_args)
+        if invocation:
+            self._invocation[row_id] = invocation
+
+        detail = str(info.get("detail") or "")
+        if not detail:
+            detail = _detail_for(self._invocation.get(row_id, ""), info.get("result"))
+
+        # `is_error` is hermes' own verdict and the one we keep. A non-zero exit
+        # code is NOT promoted to a failure here: `grep` answers 1 for "no
+        # match", and calling that failed would be wrong. The code is written
+        # into the detail instead, where the reader can see it and judge.
         if info.get("is_error"):
             status = "failed"
-        detail = str(info.get("detail") or "")
-        dur = info.get("duration")
-        if dur and not detail:
-            try:
-                detail = f"{float(dur):.1f}s"
-            except (TypeError, ValueError):
-                pass
+
+        if status != "running":
+            self._open.get(title, [])
+            self._invocation.pop(row_id, None)
+
+        # hermes' own measurement, sent as its OWN field. It used to be the
+        # fallback VALUE of `detail`, so a completed tool showed a box
+        # containing "1.0s" where its output belonged. The row has a slot for
+        # elapsed time already -- it was just counting client-side from when the
+        # row appeared, which is why the row said 0s while the box said 1.0s.
+        dur = ""
+        try:
+            if info.get("duration") is not None:
+                dur = f"{float(info['duration']):.1f}s"
+        except (TypeError, ValueError):
+            dur = ""
 
         self.stream.emit(
             "tool",
-            # Keyed on the tool, so `started` and `completed` land on ONE row
-            # instead of two — which is what the panel groups by.
-            id=str(info.get("id") or info.get("tool_call_id") or title),
+            id=row_id,
             title=title,
             status=status,
-            detail=detail,
+            duration=dur,
+            detail=detail[:DETAIL_MAX],
+            # The TRUE length, so the client can say how much never arrived
+            # rather than silently ending mid-value.
+            detailFull=len(detail),
         )
 
     def step(self, *args, **kwargs) -> None:

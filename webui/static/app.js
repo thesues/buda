@@ -363,7 +363,7 @@ function appendToken(text) {
 }
 
 /* ---------- tools ---------- */
-function toolRow(id, title, st, detail, full) {
+function toolRow(id, title, st, detail, full, duration) {
   const a = activityGroup();
   let row = S.tools.get(id);
   if (!row) {
@@ -389,15 +389,23 @@ function toolRow(id, title, st, detail, full) {
       // activity; a tool's arguments and result are one level further down,
       // which is where the design guide puts them.
       row.classList.add("has-detail");
-      row.onclick = () => { d.hidden = !d.hidden; };
+      row.onclick = () => { d.hidden = !d.hidden; d.dataset.touched = "1"; };
       d.hidden = true;
     }
     renderDetail(d, detail, full || detail.length);
+    // A failure opens itself. The compact activity panel is right for ten
+    // successful calls, but a reader who is told only "failed" has to guess
+    // which row to click to find out why -- and the reason is right here.
+    // Never override a reader who has already opened or closed it themselves.
+    if (st === "failed" && d.dataset.touched !== "1") d.hidden = false;
   }
   row.dataset.status = st || "";
   if (st === "completed" || st === "failed") {
     const n = row.querySelector(".t-since");
-    if (n) n.removeAttribute("data-since");
+    // Stop the client's own count and show the SERVER's measurement. Ours
+    // starts when the row is painted, so it under-reports a tool whose start
+    // event arrived late -- the row read 0s for a call the agent timed at 1.0s.
+    if (n) { n.removeAttribute("data-since"); if (duration) n.textContent = duration; }
     if (S.busy) { showPending(); setPendingText("处理检索结果"); }
   } else if (st) { status(title || "工具执行中"); showPending(); }
   activitySummary();
@@ -531,7 +539,7 @@ function apply(ev, from) {
       break;
     case "history_user": finalizeSeg(); addUserMsg(ev.text); break;
     case "delta": ev.thought ? appendThought(ev.text) : appendToken(ev.text); break;
-    case "tool": toolRow(ev.id, ev.title, ev.status, ev.detail, ev.detailFull); break;
+    case "tool": toolRow(ev.id, ev.title, ev.status, ev.detail, ev.detailFull, ev.duration); break;
     case "approval": showApproval(ev); break;
     case "approval_expired":
       S.awaitingPerm = false;
