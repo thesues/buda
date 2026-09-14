@@ -152,7 +152,14 @@ def build_app(
             "sessions": rows,
             "current": last_session.get(req.client_id),
             "streaming": running,
-            "endpoints": [e.as_json() for e in endpoints],
+            # `running` per endpoint, not a global: the composer gates on the
+            # picker's CHOICE, and one full endpoint must not grey out a send
+            # aimed at another one. `running_on` reads the stream's endpoint_key,
+            # so the count is of turns still going, same as the server refuses on.
+            "endpoints": [
+                {**e.as_json(), "running": manager.running_on(e.key)}
+                for e in endpoints
+            ],
         })
 
     @app.route("GET", "/api/session/history")

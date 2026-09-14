@@ -206,10 +206,18 @@ spec:
             # is per entry because the ceiling is the MODEL behind it: one
             # global number can only be right for one of them, and it is the
             # reason MAX_CONCURRENT_TURNS above could only ever describe
-            # freetoken-l3. Adding a model is a line here — the agent cache
-            # signature carries base_url and provider, so a session that
+            # freetoken-l3. Adding a provider is a line here — the webui's
+            # header picker reads this list from /api/status, and the agent
+            # cache signature carries base_url and provider, so a session that
             # switches misses the cache and is rebuilt against the new one,
             # with no separate switch-model path to keep correct.
+            #
+            # `provider` and `api_key` are optional (custom / none by default);
+            # a keyed cloud endpoint is the same shape with its own values:
+            #   {"key":"cloud","label":"DeepSeek","model":"deepseek-chat",
+            #    "base_url":"https://api.deepseek.com/v1",
+            #    "provider":"custom","api_key":"sk-...","maxConcurrent":4}
+            # — better carried in a Secret than inlined here.
             - name: BUDA_ENDPOINTS
               value: |
                 [{"key":"dsv4","label":"DSV4-Flash","model":"dsv4-flash",

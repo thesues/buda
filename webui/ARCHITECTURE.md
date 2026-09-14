@@ -2,6 +2,13 @@
 
 Session management and a chat box. Nothing else, deliberately.
 
+> **STALENESS NOTE (2026-09-13).** The sections below describing the turn
+> transport as an `hermes acp` subprocess predate 7ba0e96, which drove
+> `run_agent.AIAgent` in process and retired the subprocess. The endpoint
+> model in "Endpoints" is current; the ACP framing in "The shape" and the
+> W-rows about process restarts describe how it USED to be. The lessons
+> survive the migration; the mechanisms mostly did not.
+
 ## The shape
 
 ```
@@ -33,6 +40,35 @@ client, which is also why `session/load` used to read as "move the agent".
     │                                                     ▼
     └──POST /approval/answer──▶ future ◀──parked──── on_permission
 ```
+
+## Endpoints
+
+One deployment serves several providers, and the browser picks among them.
+
+The server is the source of truth for WHICH endpoints exist: `BUDA_ENDPOINTS`
+(JSON list, first entry the default) is parsed once at startup into `Endpoint`
+records — key, label, model, base_url, provider, api_key, and a
+`maxConcurrent` that is PER ENDPOINT because the ceiling is the model behind
+it, not the process. `/api/status` and `/api/sessions` advertise the list
+(plus each endpoint's running count, so the composer can gate on the picker's
+choice); `/api/chat/start` takes an `endpoint` key and echoes the one it
+actually used, which is how a stale saved choice finds out it fell back.
+
+The browser holds only a preference, in localStorage. The rules the picker's
+logic follows (pinned by `tests/js/endpoint_picker.mjs`):
+
+- the saved choice survives reload;
+- a saved key the server no longer advertises falls back to the declared
+  default rather than failing every send;
+- one endpoint renders as a badge, several as a select — a dropdown with one
+  entry reads as broken.
+
+Switching is per TURN, not per conversation, and needs no switch-model path:
+the agent cache signature carries `(model, base_url, provider, api_key)`, so
+the next send on a new endpoint misses the cache and is rebuilt against it,
+with the session's history intact — hermes persists the transcript to the
+store, and each turn starts from what the store holds. A turn already running
+keeps the endpoint it started on.
 
 Three parts, and each exists because of a specific failure:
 
@@ -73,9 +109,9 @@ leak. **None can regress here, because there is no terminal.**
 
 | Depends on | How | Consequence |
 |---|---|---|
-| `hermes` | child process, ACP over stdio | one warm process multiplexing up to `MAX_CONCURRENT_TURNS` sessions; a cold `hermes chat` per turn costs ~10 s |
+| `hermes` | **library** — `run_agent.AIAgent` in this process, on threads | no subprocess to respawn or multiplex; an endpoint is a cache key, so one deployment serves several providers (see "Endpoints"). Import resolves only inside hermes' venv, which is why `main.py` runs under `/opt/hermes/.venv/bin/python` |
 | `memory-mcp` | **HTTP MCP** (`MEMORY_MCP_URL`) | no spawned process, no autumn credential, **not under autumn's WIRE lockstep** |
-| `freetoken` | OpenAI-compatible HTTP | set at startup via `hermes config set`, best-effort |
+| providers | OpenAI-compatible HTTP, from `BUDA_ENDPOINTS` | `hermes config set model.*` still runs at pod start as the fallback single-model path, but a turn's model comes from the `Endpoint` the picker named |
 
 The MCP transport is the load-bearing choice. A stdio MCP server must be spawned
 by its client, so this image would have needed `memory-mcp`'s binary, an autumn

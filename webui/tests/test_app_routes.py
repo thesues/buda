@@ -229,6 +229,25 @@ def test_the_sidebar_marks_which_conversations_are_replying(app_server):
     _drain(mgr.stream(live["streamId"]))
 
 
+def test_each_endpoint_reports_its_own_running_count(app_server):
+    """The client's composer gates on the picker's CHOICE, so the counts must
+    be per endpoint: one full endpoint greying out a send aimed at another is
+    the single-endpoint behaviour wearing a multi-endpoint hat."""
+    base, mgr, state = app_server
+    state["gate"] = threading.Event()
+    _, live = _post(base, "/api/chat/start", {"text": "one"})
+
+    body = _get(base, "/api/sessions")
+    counts = {e["key"]: e["running"] for e in body["endpoints"]}
+    assert counts == {"dsv4": 1, "vision": 0}, counts
+
+    state["gate"].set()
+    _drain(mgr.stream(live["streamId"]))
+    body = _get(base, "/api/sessions")
+    assert {e["key"]: e["running"] for e in body["endpoints"]} == {"dsv4": 0, "vision": 0}, (
+        "a finished turn must not keep the endpoint marked busy")
+
+
 def test_a_sessions_read_that_fails_does_not_take_the_app_down(app_server, monkeypatch):
     base, _, state = app_server
     monkeypatch.setattr(

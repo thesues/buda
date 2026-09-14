@@ -26,6 +26,7 @@ const el = (tag, cls, text) => {
 const LS_STREAM = "hermes.streamId";
 const LS_SEQ = "hermes.lastSeq";
 const LS_OPEN = "hermes.open";      // which activity groups the reader had open
+const LS_EP = "hermes.endpoint";    // the picker's choice, across reloads
 
 // Keyed by session + the group's index in the transcript, which is stable for a
 // given conversation: reload it, switch away and back, and the rows you opened
@@ -84,8 +85,12 @@ const S = {
   pendingNew: false,    // "new session" clicked; the ACP move happens on send
   ownStream: null,      // the stream THIS view started, before it has an id
   sessionRows: [],      // last list from the server, so a click can repaint now
-  maxConcurrent: null,  // replies the server can run at once — it reports it
-  running: null,        // and how many it is running
+  endpoints: [],        // what /api/status advertises: {key,label,model,maxConcurrent,running}
+  endpoint: null,       // the picker's choice — which endpoint the NEXT send names.
+                        // A turn already running keeps its own endpoint; switching
+                        // mid-conversation only decides where the next one goes.
+  // (maxConcurrent/running were flat scalars from the single-endpoint days;
+  // per-endpoint numbers live inside S.endpoints now.)
   // "a turn this view does not own is running, and the pool is full" — decided
   // once in setBusy so the button and the status line cannot contradict.
   blockedElsewhere: false,
@@ -120,6 +125,90 @@ function recall() {
 function status(text) {
   $("#run-status").textContent = text;
   setPendingText(text);          // the tail row mirrors it, where the eye is
+}
+
+/* ---------- the endpoint picker ---------- */
+// The server is the source of truth for WHICH endpoints exist; this page only
+// decides which of them the next send names. The choice persists across
+// reloads, and a saved key that the server no longer advertises falls back to
+// the default rather than failing every send until the reader notices.
+function savedEndpoint() {
+  try { return localStorage.getItem(LS_EP); } catch (_) { return null; }
+}
+function saveEndpoint(key) {
+  try {
+    if (key) localStorage.setItem(LS_EP, key);
+    else localStorage.removeItem(LS_EP);
+  } catch (_) { /* private mode: the choice degrades to the default each load */ }
+}
+
+function setEndpoints(list, defaultKey) {
+  // Merge, don't replace: /api/sessions polls every few seconds WITH running
+  // counts and /api/status answers once without them — replacing wholesale
+  // would zero the other's numbers each time it landed. The fresh list wins
+  // for what it advertises; running counts only carry over when it stayed
+  // silent on them.
+  const fresh = (list || []).map((e) => ({ ...e }));
+  for (const e of fresh) {
+    if (e.running === undefined) {
+      const old = S.endpoints.find((x) => x.key === e.key);
+      if (old) e.running = old.running;
+    }
+  }
+  S.endpoints = fresh;
+
+  // Resolve the choice ONCE here, so both send() and setBusy() read one value.
+  const keys = new Set(S.endpoints.map((e) => e.key));
+  if (!S.endpoint || !keys.has(S.endpoint)) {
+    const saved = savedEndpoint();
+    S.endpoint = (saved && keys.has(saved)) ? saved
+      : (defaultKey && keys.has(defaultKey)) ? defaultKey
+      : (S.endpoints[0] ? S.endpoints[0].key : null);
+    saveEndpoint(S.endpoint);
+  }
+  renderEndpoints();
+  setBusy(S.busy);   // the capacity facts may have changed under the choice
+}
+
+function renderEndpoints() {
+  const sel = $("#endpoint");
+  const badge = $("#model-badge");
+  if (!S.endpoints.length) {
+    badge.textContent = "模型未配置";
+    badge.hidden = false; sel.hidden = true;
+    return;
+  }
+  if (S.endpoints.length === 1) {
+    // One endpoint is not a choice, and a dropdown with one entry reads as
+    // broken. The badge shows what it is; the select stays out of the way.
+    const e = S.endpoints[0];
+    badge.textContent = `${e.label} · ${e.model}`;
+    badge.hidden = false; sel.hidden = true;
+    return;
+  }
+  badge.hidden = true; sel.hidden = false;
+  // Rebuild only when the set changed: replaceChildren on every poll would
+  // close the open dropdown under a reader's hand.
+  const sig = S.endpoints.map((e) => e.key).join(",");
+  if (sel.dataset.sig !== sig) {
+    sel.dataset.sig = sig;
+    sel.replaceChildren(...S.endpoints.map((e) => {
+      const o = el("option");
+      o.value = e.key;
+      o.textContent = e.label;
+      return o;
+    }));
+  }
+  sel.value = S.endpoint || "";
+}
+
+function pickEndpoint(key) {
+  if (!key || key === S.endpoint) return;
+  S.endpoint = key;
+  saveEndpoint(key);
+  const e = S.endpoints.find((x) => x.key === key);
+  status(`下一个回复使用 ${e ? e.label : key}`);
+  setBusy(S.busy);   // the new endpoint's occupancy decides the composer, not the old one's
 }
 
 const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
@@ -663,18 +752,19 @@ function setBusy(b) {
     ? !!S.streaming[S.sessionId]
     : (!!S.ownStream && S.ownStream === S.streamId));
 
-  // Ask the server how many replies it can run and how many it is running,
-  // instead of reading "a turn exists" as "the composer is blocked". Those are
-  // the same statement only while the limit is one, and that limit is a fact
-  // about the ACP pool — not something the frontend gets to decide.
+  // Ask the server how many replies the CHOSEN endpoint can run and how many
+  // it is running, instead of reading "a turn exists" as "the composer is
+  // blocked". The limit is a fact about the MODEL behind the picker's choice —
+  // one endpoint being full must not grey out a send aimed at another.
   // A turn is running that this view does not own. Computed here and stored,
   // because the status line used to decide the same thing for itself and the
   // two disagreed: the line said another session was replying while the button
   // stayed clickable. The button's capacity test fell back to THIS view's busy
   // flag, which is false precisely when the turn belongs to someone else.
   const othersLive = Object.keys(S.streaming).some((id) => id !== S.sessionId);
-  const atCapacity = (S.maxConcurrent != null && S.running != null)
-    ? S.running >= S.maxConcurrent
+  const chosen = S.endpoints.find((e) => e.key === S.endpoint) || null;
+  const atCapacity = chosen && chosen.maxConcurrent != null
+    ? (chosen.running || 0) >= chosen.maxConcurrent
     // Before the first list refresh the counters are unknown. Fall back CLOSED:
     // a composer that accepts a message the pool has no room to run is worse
     // than one that makes the reader wait a moment for the real numbers.
@@ -682,13 +772,16 @@ function setBusy(b) {
   const elsewhere = atCapacity && !owns;
   // The one fact the rest of the UI reads, so nothing recomputes it.
   S.blockedElsewhere = !!elsewhere;
-  const n = S.maxConcurrent || 1;
 
   send.textContent = owns ? "停止" : "发送";
   send.classList.toggle("stop", !!owns);
   send.disabled = !!elsewhere;
   send.title = elsewhere
-    ? `另一个会话正在回复。这台机器一次只跑 ${n} 轮 — 等它结束，或到那个会话里停止它。`
+    ? (chosen
+      // Same words the server refuses with, so the 429 backstop and this
+      // button tell one story.
+      ? `${chosen.label} 已有 ${chosen.running || 0} 个会话在回复，达到上限 ${chosen.maxConcurrent} — 等它结束，或换一个端点`
+      : "另一个会话正在回复 — 等它结束，或到那个会话里停止它")
     : "";
   $(".chat").classList.toggle("blocked", !!elsewhere);
   // Say it in the placeholder rather than in a line under the box. A tooltip
@@ -702,7 +795,9 @@ function setBusy(b) {
     input.dataset.idlePlaceholder = input.placeholder;
   }
   input.placeholder = elsewhere
-    ? `另一个会话正在回复 · 这台机器一次只跑 ${n} 轮`
+    ? (chosen
+      ? `${chosen.label} 已满 · 一次只跑 ${chosen.maxConcurrent} 轮`
+      : "另一个会话正在回复")
     : input.dataset.idlePlaceholder;
   if (b) {
     S.startedAt = Date.now();
@@ -779,8 +874,7 @@ async function loadSessions() {
     S.sessionId = Object.keys(S.streaming)[0] || j.current || null;
   }
   S.sessionRows = j.sessions || [];
-  if (j.maxConcurrent != null) S.maxConcurrent = j.maxConcurrent;
-  if (j.running != null) S.running = j.running;
+  if (j.endpoints) setEndpoints(j.endpoints, null);
   setBusy(S.busy);          // capacity changed under it; re-render the composer
   renderSessions();
 }
@@ -943,6 +1037,11 @@ async function send() {
         // yet; nothing is "moved", so a turn running elsewhere is unaffected.
         sessionId: S.pendingNew ? "" : (S.sessionId || ""),
         new: !!S.pendingNew,
+        // Which endpoint answers. Unset means the server's default; the choice
+        // survives reloads in localStorage. A conversation may switch endpoints
+        // between turns — the agent cache keys on (model, base_url, provider),
+        // so the switch is a rebuild against the new one, history intact.
+        endpoint: S.endpoint || undefined,
       }),
     })).json();
   } catch (_) { status("发送失败"); return; }
@@ -958,6 +1057,15 @@ async function send() {
   }
   if (!j.streamId) { status("没有可用的会话流"); return; }
   S.pendingNew = false;
+  // The server echoes the endpoint it actually used. A saved key the server
+  // no longer advertises falls back to ITS default silently — adopting the
+  // echo here keeps the picker honest about what will answer next time.
+  if (j.endpoint && j.endpoint !== S.endpoint) {
+    S.endpoint = j.endpoint;
+    saveEndpoint(j.endpoint);
+    renderEndpoints();
+    setBusy(S.busy);
+  }
   // `attached` means a turn was ALREADY running and we joined it -- its prompt
   // is not the one we just drew, so let the echo paint it.
   if (j.attached) S.skipUserEcho = false;
@@ -981,7 +1089,16 @@ async function boot() {
   fetch("/api/status").then((r) => r.json()).then((j) => {
     if (j.mcp) $("#mcp-badge").innerHTML = `mcp <b>${j.mcp.name}</b>`;
     else $("#mcp-badge").textContent = "mcp 未接";
-  }).catch(() => {});
+    // The list of endpoints and the default are the server's to declare.
+    setEndpoints(j.endpoints || [], j.defaultEndpoint || null);
+  }).catch(() => {
+    $("#mcp-badge").textContent = "mcp 未接";
+    $("#model-badge").textContent = "模型未配置";
+    $("#model-badge").hidden = false;
+  });
+  // The change handler, not an inline call: it re-renders, persists, and
+  // recomputes what the composer is allowed to do under the new choice.
+  $("#endpoint").addEventListener("change", (e) => pickEndpoint(e.target.value));
 
   // Reattach BEFORE accepting input: a turn that survived the reload should come
   // up visibly running, not look idle and invite a second prompt.

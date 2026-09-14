@@ -102,6 +102,17 @@ header h1 em { color:var(--accent); font-style:italic; }
 .meta { display:flex; gap:1.1rem; font-size:0.7rem; color:var(--text-dim); align-items:baseline; }
 .meta b { color:var(--accent); font-weight:500; }
 
+/* The endpoint picker, when there is more than one to pick. Styled to sit
+   beside the mcp badge as another quiet piece of chrome, not as a form
+   control — its options are the deployment's models, not a setting form. */
+#endpoint { background:transparent; border:1px solid var(--border); color:var(--text-dim);
+            font-family:var(--mono); font-size:0.7rem; border-radius:var(--radius);
+            padding:0.2rem 0.45rem; cursor:pointer; max-width:16rem;
+            transition:all .15s var(--ease); }
+#endpoint:hover { color:var(--accent); border-color:var(--accent-dim); }
+#endpoint:focus-visible { outline:none; border-color:var(--accent-dim); color:var(--accent); }
+#endpoint option { background:var(--surface); color:var(--text); }
+
 .btn { background:rgba(197,160,94,0.1); border:1px solid var(--accent-dim); color:var(--accent);
        font-family:var(--mono); font-size:0.78rem; border-radius:var(--radius);
        padding:0.4rem 1rem; cursor:pointer; transition:all .15s var(--ease); }

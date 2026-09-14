@@ -206,12 +206,18 @@ def test_a_fresh_conversation_looks_different_from_one_with_history():
     assert "clearFresh()" in add[:add.index("\n}") + 2], "the hero survives the first message"
 
 def test_the_composer_blocks_on_reported_capacity_not_on_a_local_flag():
-    """Ablation: go back to `atCapacity = b` and this goes red."""
+    """Ablation: go back to `atCapacity = b` and this goes red.
+
+    The capacity facts are per ENDPOINT now — the limit belongs to the model
+    behind the picker's choice, so the flat `S.maxConcurrent`/`S.running`
+    scalars of the single-endpoint days would grey out a send aimed at an
+    endpoint that has room.
+    """
     src = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text()
     body = src[src.index("function setBusy("):]
     body = body[:body.index("\n  if (b) {")]
-    assert "S.maxConcurrent" in body and "S.running" in body, (
-        "the composer still decides the limit for itself:\n" + body
+    assert "S.endpoints.find" in body and "chosen.running" in body, (
+        "the composer must read the CHOSEN endpoint's occupancy, not a global\n" + body
     )
 
 def test_the_page_follows_the_stream_of_the_session_it_is_showing():
