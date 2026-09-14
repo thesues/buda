@@ -219,6 +219,14 @@ header h1 em { color:var(--accent); font-style:italic; }
 /* ---------- composer ---------- */
 #composer { display:flex; gap:0.6rem; align-items:flex-end; flex:none;
             padding:0.8rem 1rem 1rem; border-top:1px solid var(--border); }
+/* The model picker lives in the composer because it is a property of the open
+   conversation, the way every chat UI does it: the pill shows what THIS
+   session answers with, bottom-left, next to what it answers into. */
+.model-side { flex:none; display:flex; align-items:flex-end; min-width:0; }
+#model-badge { font-size:0.7rem; color:var(--text-dim); white-space:nowrap;
+               border:1px solid var(--border); border-radius:var(--radius);
+               padding:0.5rem 0.65rem; }
+#endpoint { max-width:9rem; text-overflow:ellipsis; }
 #input { flex:1; resize:none; background:var(--bg); border:1px solid var(--border);
          border-radius:var(--radius); color:var(--text); font-family:var(--mono);
          font-size:0.84rem; font-weight:300; line-height:1.6; padding:0.55rem 0.75rem;

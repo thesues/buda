@@ -17,10 +17,6 @@
     <button id="about-btn" class="btn ghost" title="架构说明">架构</button>
     <div class="meta">
       <span id="mcp-badge"></span>
-      <!-- One endpoint renders as a badge; several render as this select.
-           app.js decides which, from what /api/status advertises. -->
-      <span id="model-badge" hidden></span>
-      <select id="endpoint" hidden title="选择回复所用的模型端点"></select>
     </div>
   </header>
 
@@ -37,6 +33,14 @@
       </div>
       <div id="messages"></div>
       <form id="composer">
+        <!-- The model lives here, by the composer, because it is a property of
+             THIS conversation: the picker shows and edits what the open session
+             answers with, the way every chat UI does it. One endpoint renders
+             as a badge; several render as this select — app.js decides. -->
+        <div class="model-side">
+          <span id="model-badge" hidden></span>
+          <select id="endpoint" hidden title="本会话回复所用的模型"></select>
+        </div>
         <textarea id="input" rows="1" placeholder="发消息…  Enter 发送 · Shift+Enter 换行"></textarea>
         <button id="send" type="submit" class="btn">发送</button>
       </form>

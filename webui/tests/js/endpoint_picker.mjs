@@ -76,4 +76,31 @@ assert.strictEqual(atCapacity(eps, "vision"), false,
 assert.strictEqual(atCapacity([{ key: "x", maxConcurrent: 1, running: undefined }], "x"),
   false, "unknown running must not read as at-limit");
 
+// ── the session-scope rule, as endpointFor()/pickEndpoint() apply it ────────
+// The picker is a property of the open CONVERSATION, not of the tab: each
+// session keeps the model it answers with, and switching sessions shows that
+// session's model. A session with no recorded choice (new, other tab) starts
+// on the last-used default.
+const sessionEp = {};   // S.sessionEp
+function endpointFor(sid, saved) {
+  return sessionEp[sid || ""] || saved || null;
+}
+function pick(sid, key, saved) {
+  sessionEp[sid || ""] = key;
+  return key;   // pickEndpoint also saves it as the last-used default
+}
+
+// 8. Each session keeps its own model; the picker follows the open session.
+assert.strictEqual(endpointFor("s1", "dsv4"), "dsv4");
+pick("s1", "vision");
+assert.strictEqual(endpointFor("s1", "dsv4"), "vision",
+  "picking in s1 must change s1's model");
+assert.strictEqual(endpointFor("s2", "dsv4"), "dsv4",
+  "picking in s1 must not reach into s2");
+
+// 9. A session without a choice starts on the last-used default — and that
+//    default is what the last PICK set, not what some other session uses.
+assert.strictEqual(endpointFor("s2", "vision"), "vision",
+  "a fresh session starts on the last-used model");
+
 console.log("ok - the endpoint picker's rules hold");

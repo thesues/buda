@@ -26,7 +26,7 @@ const el = (tag, cls, text) => {
 const LS_STREAM = "hermes.streamId";
 const LS_SEQ = "hermes.lastSeq";
 const LS_OPEN = "hermes.open";      // which activity groups the reader had open
-const LS_EP = "hermes.endpoint";    // the picker's choice, across reloads
+const LS_EP = "hermes.endpoint";    // last-used endpoint: the DEFAULT new sessions start on
 
 // Keyed by session + the group's index in the transcript, which is stable for a
 // given conversation: reload it, switch away and back, and the rows you opened
@@ -86,9 +86,10 @@ const S = {
   ownStream: null,      // the stream THIS view started, before it has an id
   sessionRows: [],      // last list from the server, so a click can repaint now
   endpoints: [],        // what /api/status advertises: {key,label,model,maxConcurrent,running}
-  endpoint: null,       // the picker's choice — which endpoint the NEXT send names.
-                        // A turn already running keeps its own endpoint; switching
-                        // mid-conversation only decides where the next one goes.
+  endpoint: null,       // which endpoint THIS session's next send names — read from
+  sessionEp: {},        //   sessionEp[sessionId]; sessions WITHOUT a choice (new, other
+                        //   tab) start on the last-used default. A turn already running
+                        //   keeps its own endpoint; switching decides the next turn only.
   // (maxConcurrent/running were flat scalars from the single-endpoint days;
   // per-endpoint numbers live inside S.endpoints now.)
   // "a turn this view does not own is running, and the pool is full" — decided
@@ -142,6 +143,19 @@ function saveEndpoint(key) {
   } catch (_) { /* private mode: the choice degrades to the default each load */ }
 }
 
+function endpointFor(sid) {
+  // What session `sid` answers with: its own recorded choice, else the
+  // last-used default. Raw — callers validate against what the server
+  // advertises, because this can run before the first endpoint list lands.
+  return S.sessionEp[sid || ""] || savedEndpoint() || null;
+}
+
+function noteSessionEndpoint(sid) {
+  // Pin the pending choice onto a session the moment it acquires an id, so
+  // the picker follows the conversation instead of the tab.
+  if (sid && S.endpoint) S.sessionEp[sid] = S.endpoint;
+}
+
 function setEndpoints(list, defaultKey) {
   // Merge, don't replace: /api/sessions polls every few seconds WITH running
   // counts and /api/status answers once without them — replacing wholesale
@@ -158,10 +172,11 @@ function setEndpoints(list, defaultKey) {
   S.endpoints = fresh;
 
   // Resolve the choice ONCE here, so both send() and setBusy() read one value.
+  // The base is the OPEN SESSION's choice, not a tab-wide one.
   const keys = new Set(S.endpoints.map((e) => e.key));
   if (!S.endpoint || !keys.has(S.endpoint)) {
-    const saved = savedEndpoint();
-    S.endpoint = (saved && keys.has(saved)) ? saved
+    const want = endpointFor(S.sessionId);
+    S.endpoint = (want && keys.has(want)) ? want
       : (defaultKey && keys.has(defaultKey)) ? defaultKey
       : (S.endpoints[0] ? S.endpoints[0].key : null);
     saveEndpoint(S.endpoint);
@@ -181,7 +196,7 @@ function renderEndpoints() {
   if (S.endpoints.length === 1) {
     // One endpoint is not a choice, and a dropdown with one entry reads as
     // broken. The badge shows what it is; the select stays out of the way.
-    const e = S.endpoints[0];
+    const e = S.endpoints.find((x) => x.key === S.endpoint) || S.endpoints[0];
     badge.textContent = `${e.label} · ${e.model}`;
     badge.hidden = false; sel.hidden = true;
     return;
@@ -205,9 +220,13 @@ function renderEndpoints() {
 function pickEndpoint(key) {
   if (!key || key === S.endpoint) return;
   S.endpoint = key;
+  // A per-conversation property, not a tab-wide one: the next turn in THIS
+  // session answers with `key`, other sessions keep theirs. It also becomes
+  // the last-used default, which seeds sessions without a choice.
+  S.sessionEp[S.sessionId || ""] = key;
   saveEndpoint(key);
   const e = S.endpoints.find((x) => x.key === key);
-  status(`下一个回复使用 ${e ? e.label : key}`);
+  status(`本会话下一个回复使用 ${e ? e.label : key}`);
   setBusy(S.busy);   // the new endpoint's occupancy decides the composer, not the old one's
 }
 
@@ -610,6 +629,7 @@ function apply(ev, from) {
   // back the PREVIOUS session, relabelling the new conversation as the old one.
   if (mine && fresh && ev.session) {
     S.sessionId = ev.session;
+    noteSessionEndpoint(ev.session);   // the pending choice belongs to this id now
     S.pendingNew = false;
     loadSessions();
   }
@@ -900,6 +920,14 @@ async function openSession(id) {
   clearFresh();
   S.ownStream = null;       // whatever we started, we are not looking at it now
   S.sessionId = id;
+  // The picker follows the conversation: show the model THIS session uses.
+  // A session from another tab has no recorded choice — it falls to the
+  // last-used default; a stale key (endpoint gone) falls to the first.
+  const want = endpointFor(id);
+  S.endpoint = S.endpoints.find((e) => e.key === want) ? want
+    : (S.endpoints[0] ? S.endpoints[0].key : null);
+  renderEndpoints();
+  setBusy(S.busy);
   renderSessions();         // the selection moves NOW, not after two round trips
   // No busy guard. Reading a transcript no longer moves the agent, so a turn
   // in flight is none of this function's business — it keeps streaming into
@@ -1066,6 +1094,7 @@ async function send() {
     renderEndpoints();
     setBusy(S.busy);
   }
+  noteSessionEndpoint(S.sessionId);   // pre-existing session: pin what it uses
   // `attached` means a turn was ALREADY running and we joined it -- its prompt
   // is not the one we just drew, so let the echo paint it.
   if (j.attached) S.skipUserEcho = false;
@@ -1076,7 +1105,7 @@ async function send() {
   // Ours, so `apply` can tell our own turn from one still running elsewhere
   // while this view has no id of its own yet.
   S.ownStream = j.streamId;
-  if (j.sessionId) { S.sessionId = j.sessionId; S.pendingNew = false; }
+  if (j.sessionId) { S.sessionId = j.sessionId; noteSessionEndpoint(j.sessionId); S.pendingNew = false; }
   loadSessions();
   remember(j.streamId, 0);
   showPending();
