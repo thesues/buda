@@ -174,7 +174,9 @@ def main() -> None:
     except Exception:  # noqa: BLE001 -- a chat box without retrieval still starts
         log.exception("could not register MCP servers; corpus search will be unavailable")
 
-    manager = TurnManager(AgentPool())
+    # Σ max_concurrent is the exact number of turns admission ever lets run,
+    # so it is the exact worker count the turn pool needs.
+    manager = TurnManager(AgentPool(), workers=sum(e.max_concurrent for e in endpoints))
     app = build_app(
         manager=manager,
         endpoints=endpoints,

@@ -15,13 +15,20 @@ The limit is per endpoint because the real ceiling is the model behind it. A
 endpoint are different numbers, and one global limit can only be right for one
 of them.
 
-`run_conversation` blocks, so each turn owns a thread. Threads are what the
-limit counts; the agents themselves outlive their turns in the pool's LRU.
+`run_conversation` blocks, so a turn occupies a thread for its whole life —
+but it runs on `_TurnPool`, a fixed set of daemon workers sized to the
+admission budget (Σ `max_concurrent`), not a fresh `threading.Thread` per
+turn. Daemon on purpose: `concurrent.futures` workers are non-daemon and
+joined at interpreter exit on 3.9+ (bpo-39812), and a rollout's SIGTERM must
+drop an in-flight turn, not wait out the approval timeout it may be parked
+in. Admission still counts live turns per endpoint — the pool buys reuse and
+a named worker set, it is not the limit.
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import secrets
 import os
 import threading
@@ -53,6 +60,61 @@ class Refused(Exception):
 APPROVAL_TIMEOUT_S = int(os.environ.get("BUDA_APPROVAL_TIMEOUT_S", "600"))
 
 
+class _TurnPool:
+    """Fixed daemon workers pulling from a queue.
+
+    A hand-rolled pool, not `concurrent.futures.ThreadPoolExecutor`, for one
+    property: these workers are daemon threads. Executor workers are joined at
+    interpreter exit since 3.9 (bpo-39812), and SIGTERM here means "lose the
+    turn" — a turn parked in a 600 s approval wait must not hold a rollout.
+
+    Sized by the caller to the admission budget, so an admitted turn always
+    finds a worker. `submit` still checks: if every worker is somehow busy
+    (endpoints grew after boot), the turn spawns its own daemon thread rather
+    than queueing behind a turn that may outlast the reader's patience.
+    Liveness beats tidiness.
+    """
+
+    def __init__(self, workers: int, prefix: str = "turn") -> None:
+        self._q: "queue.SimpleQueue[tuple[str, Any, tuple]]" = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._busy = 0
+        self._workers = max(1, workers)
+        for i in range(self._workers):
+            threading.Thread(target=self._loop, name=f"{prefix}-{i}", daemon=True).start()
+
+    def _loop(self) -> None:
+        while True:
+            name, target, args = self._q.get()
+            with self._lock:
+                self._busy += 1
+            # Carry the turn's stream id into the thread name while it runs —
+            # py-spy dumps and log lines keep pointing at a stream — then
+            # restore it, because this worker outlives many turns.
+            t = threading.current_thread()
+            base = t.name
+            try:
+                t.name = name
+                target(*args)
+            except BaseException:  # noqa: BLE001 -- a dead worker must not die
+                log.exception("turn worker crashed")
+            finally:
+                t.name = base
+                with self._lock:
+                    self._busy -= 1
+
+    def submit(self, name: str, target: Any, *args: Any) -> None:
+        """Run target(name-bearing) on a worker, or on a spare daemon thread
+        if every worker is busy. Never blocks the caller, never queues behind
+        a turn whose stream may already be abandoned."""
+        with self._lock:
+            if self._busy < self._workers:
+                self._q.put((name, target, args))
+                return
+        log.warning("turn pool (%d workers) saturated; spawning a spare thread", self._workers)
+        threading.Thread(target=target, args=args, name=name, daemon=True).start()
+
+
 class TurnManager:
     def __init__(
         self,
@@ -60,7 +122,12 @@ class TurnManager:
         *,
         history: Callable[[str], list] = history_for,
         run: Callable[..., dict] = run_turn,
+        workers: int = 8,
     ) -> None:
+        # 8 is a tests-and-small-deployments default; main() passes the exact
+        # admission budget (Σ max_concurrent), which is the number a turn can
+        # never exceed.
+        self._turns = _TurnPool(workers)
         self._pool = pool
         self._history = history
         self._run = run
@@ -155,12 +222,7 @@ class TurnManager:
         # stream sees the question above the answer even if they arrive late.
         stream.emit("user", text=text)
 
-        threading.Thread(
-            target=self._run_turn,
-            args=(stream, session_id, text, endpoint),
-            name=f"turn-{stream.stream_id}",
-            daemon=True,
-        ).start()
+        self._turns.submit(f"turn-{stream.stream_id}", self._run_turn, stream, session_id, text, endpoint)
         return stream
 
     def _install_approval(self, stream: TurnStream) -> None:

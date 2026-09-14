@@ -409,3 +409,47 @@ def test_the_gateway_context_switch_is_on(monkeypatch):
     s = m.start(session_id="s1", text="x", endpoint=_ep())
     assert _wait_done(s)
     assert os.environ.get("HERMES_GATEWAY_SESSION") == "1"
+
+
+# ── the turn pool ───────────────────────────────────────────────────────────
+
+
+def test_turn_runs_on_a_named_pool_thread(monkeypatch):
+    """A reader of py-spy output or logs must see turn-<stream id>, not turn-3."""
+    seen = {}
+
+    def run(agent, **kw):
+        seen["name"] = threading.current_thread().name
+        return {}
+
+    m = _mgr(monkeypatch, run=run)
+    s = m.start(session_id="s1", text="who", endpoint=_ep())
+    assert _wait_done(s)
+    assert seen["name"] == f"turn-{s.stream_id}"
+
+
+def test_pool_workers_outlive_turns_and_are_daemon(monkeypatch):
+    """Workers persist across turns (that is the point of a pool) and are
+    daemon — SIGTERM must drop an in-flight turn, not join it at exit."""
+    m = _mgr(monkeypatch)
+    s = m.start(session_id="s1", text="warm", endpoint=_ep())
+    assert _wait_done(s)
+    workers = [t for t in threading.enumerate() if t.name.startswith("turn-")]
+    assert workers and all(t.daemon for t in workers)
+
+
+def test_saturated_pool_still_runs_the_turn(monkeypatch):
+    """Admission budget larger than the pool must never stall a turn: the
+    spare thread path exists so mis-sizing degrades to today's behaviour."""
+    gate = threading.Event()
+
+    def run(agent, **kw):
+        gate.wait(3)
+        return {}
+
+    m = _mgr(monkeypatch, run=run)
+    m._turns._workers = 1  # simulate drift: endpoints grew after boot
+    a = m.start(session_id="s1", text="x", endpoint=_ep("e1", 1))
+    b = m.start(session_id="s2", text="y", endpoint=_ep("e2", 1))
+    gate.set()
+    assert _wait_done(a) and _wait_done(b)
