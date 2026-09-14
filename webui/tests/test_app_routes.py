@@ -52,6 +52,7 @@ def app_server(monkeypatch, tmp_path):
         '<html><link rel="stylesheet" href="/static/style.css">'
         '<script src="/static/app.js"></script></html>'
     )
+    (tmp_path / "app.js").write_text("console.log(1)")   # the versioned URL must serve
     gate = threading.Event()
     gate.set()
     state = {"gate": gate, "sessions": FakeSessions()}
