@@ -18,8 +18,16 @@ import ast
 import json
 import re
 import sys
+from pathlib import Path
 
 from hermes_state import SessionDB  # hermes venv only
+
+# Shared with the LIVE path on purpose. A reload used to re-render the raw
+# `{"output":…,"exit_code":…}` with no command above it -- the very shape the
+# live fix removed, handed back the moment the reader refreshed. `turn_stream`
+# is stdlib-only, so it imports under either venv.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from turn_stream import DETAIL_MAX, _detail_for, _invocation_text  # noqa: E402
 
 
 def _provisional_title(preview: str) -> str:
@@ -100,6 +108,9 @@ def history(sid: str, limit: int) -> list[dict]:
     if limit and len(msgs) > limit:
         msgs = msgs[-limit:]
     out: list[dict] = []
+    # call id -> what it was invoked with, so the result row can show the
+    # command above its output the same way a live row does.
+    invocations: dict[str, str] = {}
     for m in msgs:
         role = m.get("role")
         text = m.get("content") or ""
@@ -111,24 +122,53 @@ def history(sid: str, limit: int) -> list[dict]:
                 out.append({"kind": "delta", "text": text, "thought": False})
             for tc in _tool_calls(m.get("tool_calls")):
                 fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                cid = tc.get("id") or tc.get("call_id")
+                # `arguments` is persisted as a JSON STRING; unparsed it is
+                # noise, and it is the only record of what was run.
+                raw = fn.get("arguments")
+                call_args = raw
+                if isinstance(raw, str):
+                    try:
+                        call_args = json.loads(raw)
+                    except ValueError:
+                        call_args = raw
+                inv = _invocation_text(None, call_args)
+                if cid:
+                    invocations[cid] = inv
+                detail = _detail_for(inv, None)
                 out.append({
                     "kind": "tool",
-                    "id": tc.get("id") or tc.get("call_id"),
+                    "id": cid,
                     "title": fn.get("name") or tc.get("name") or "tool",
-                    "status": "pending", "detail": "", "detailFull": 0,
+                    "status": "pending",
+                    "detail": detail[:DETAIL_MAX], "detailFull": len(detail),
                 })
         elif role == "tool":
             # The result arrives as its own row and carries the id the call was
             # announced under, so the client merges it into that same line.
+            cid = m.get("tool_call_id")
+            detail = _detail_for(invocations.get(cid, ""), text)
+            # `is_error` is NOT persisted, so a replayed row cannot reproduce
+            # hermes' own verdict. An explicit `error` in the payload is a
+            # failure by any reading and is honoured; everything else stays
+            # `completed` with the exit code visible in the detail. Claiming
+            # "completed" is a smaller lie than inventing a failure.
+            status = "completed"
+            try:
+                parsed = json.loads(text) if text.lstrip().startswith("{") else None
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    status = "failed"
+            except (ValueError, AttributeError):
+                pass
             out.append({
                 "kind": "tool",
-                "id": m.get("tool_call_id"),
+                "id": cid,
                 "title": m.get("tool_name") or "",
-                "status": "completed",
+                "status": status,
                 # `detailFull` is a LENGTH, not a second copy of the text --
                 # the client computes "还有 N 字" from it. Sending the string
                 # made that arithmetic NaN on every replayed tool result.
-                "detail": text[:4000], "detailFull": len(text),
+                "detail": detail[:DETAIL_MAX], "detailFull": len(detail),
             })
     return out
 

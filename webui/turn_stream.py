@@ -117,6 +117,17 @@ class TurnStream:
 DETAIL_MAX = 4000
 
 
+def _CLOSES_ROW(event: str, status: str) -> bool:
+    """Does this event END a call, rather than merely say something about one?
+
+    Positive, not "anything that is not running". An unknown event kind -- a
+    `tool.progress` upstream adds, or the `subagent.*` pair a delegate toolset
+    brings -- would otherwise consume the open row id, stranding that row at
+    "running" and opening a second one when the real completion lands.
+    """
+    return event == "tool.completed" or status in ("completed", "failed")
+
+
 def _invocation_text(preview, call_args) -> str:
     """What the tool was CALLED with, as one readable line.
 
@@ -183,7 +194,15 @@ def _detail_for(invocation: str, result) -> str:
         elif code == 0 and not body and not err:
             lines.append("exit 0")
         if out is None and err is None and code is None:
-            lines.append(json.dumps(parsed, ensure_ascii=False))
+            # A shape this does not recognise is printed rather than dropped.
+            # Guarded the way `_invocation_text` already guards its own dump:
+            # a set or a datetime in there raises, and hermes wraps each
+            # callback in its own try/except, so the exception would not fail
+            # the turn -- it would silently lose the row, which is worse.
+            try:
+                lines.append(json.dumps(parsed, ensure_ascii=False))
+            except (TypeError, ValueError):
+                lines.append(str(parsed))
     elif parsed is not None:
         body = str(parsed).strip()
         if body:
@@ -245,7 +264,11 @@ class EventSink:
         call_args = pos[3] if len(pos) > 3 else None
 
         info = dict(kwargs)
-        if not event:
+        # Merge dict positionals when the SECOND argument is not the tool name:
+        # that shape is metadata, not the tool's own arguments. Gating this on
+        # `not event` alone lost the name for `tool("tool.started", {...})`,
+        # a shape the pre-positional code did handle.
+        if not event or (len(pos) > 1 and not isinstance(pos[1], str)):
             # An older or dict-shaped call site. Only here is merging safe:
             # there is no positional contract to read instead.
             for a in args:
@@ -256,7 +279,7 @@ class EventSink:
 
         # `_thinking` is the reasoning channel wearing the tool callback's
         # signature; it has its own pane and is not a tool call.
-        if name == "_thinking" or event == "reasoning.available":
+        if name == "_thinking" or event in ("reasoning.available", "_thinking"):
             return
 
         title = str(info.get("title") or name or info.get("name") or event or "tool")
@@ -274,9 +297,19 @@ class EventSink:
             self._tool_seq += 1
             row_id = f"{title}#{self._tool_seq}"
             self._open.setdefault(title, []).append(row_id)
-        else:
+        elif _CLOSES_ROW(event, status):
+            # FIFO, not LIFO: in the concurrent path hermes emits every
+            # `tool.started` before dispatching any of them, then every
+            # `tool.completed` from one post-execution loop in submission
+            # order -- so the oldest open row is the one completing.
             waiting = self._open.get(title) or []
             row_id = waiting.pop(0) if waiting else f"{title}#0"
+        else:
+            # Some other event about a call already in flight. It must NOT
+            # consume the open row: doing so strands that row at "running" and
+            # opens a second one when the real completion arrives.
+            waiting = self._open.get(title) or []
+            row_id = waiting[0] if waiting else f"{title}#0"
 
         invocation = _invocation_text(preview, call_args)
         if invocation:
@@ -293,9 +326,12 @@ class EventSink:
         if info.get("is_error"):
             status = "failed"
 
-        if status != "running":
-            self._open.get(title, [])
+        if _CLOSES_ROW(event, status):
+            # The row is closed: drop the invocation it was holding, and the
+            # empty waiting list once the last call for this tool has paired.
             self._invocation.pop(row_id, None)
+            if not self._open.get(title):
+                self._open.pop(title, None)
 
         # hermes' own measurement, sent as its OWN field. It used to be the
         # fallback VALUE of `detail`, so a completed tool showed a box

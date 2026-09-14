@@ -313,3 +313,46 @@ def test_the_true_length_is_sent_so_the_client_can_say_what_was_cut():
     assert isinstance(rows[1]["detailFull"], int)
     assert len(rows[1]["detail"]) <= 4000
     assert rows[1]["detailFull"] > len(rows[1]["detail"])
+
+
+def test_an_unknown_event_kind_does_not_steal_an_open_row():
+    """A row is closed by a POSITIVE condition, not by "anything not running".
+
+    hermes already names `tool.failed` on the consuming side, and a delegate
+    toolset brings `subagent.start`/`subagent.complete` through this same
+    callback. Under "not running" any of them consumed the open row id, so the
+    real completion found nothing, opened a SECOND row, and the first was
+    stranded at "running" forever.
+
+    Ablation: close the row on `status != "running"` and the ids diverge."""
+    rows = _tool_events([
+        (("tool.started", "terminal", "sleep 1", {"command": "sleep 1"}), {}),
+        (("tool.progress", "terminal", None, None), {}),
+        (("tool.completed", "terminal", None, None),
+         {"result": '{"output": "done", "exit_code": 0}'}),
+    ])
+    assert rows[0]["id"] == rows[-1]["id"], "the completion opened a new row"
+    assert "sleep 1" in rows[-1]["detail"], "the invocation was lost with the row"
+
+
+def test_a_result_shape_json_cannot_encode_is_still_shown():
+    """An exception here does not fail the turn -- hermes wraps each callback --
+    it silently LOSES the row, which is harder to notice. `_invocation_text`
+    already guarded its own dump; this one did not."""
+    rows = _tool_events([
+        (("tool.started", "odd", "go", {"a": 1}), {}),
+        (("tool.completed", "odd", None, None), {"result": {"when": {1, 2}}}),
+    ])
+    assert len(rows) == 2
+    assert rows[1]["detail"], "an unencodable result must still say something"
+
+
+def test_metadata_passed_as_a_dict_beside_the_event_keeps_the_tool_name():
+    """`tool("tool.started", {...})` -- event positional, metadata as a dict.
+    Gating the merge on an empty event lost the name for this shape, which the
+    pre-positional code handled."""
+    rows = _tool_events([
+        (("tool.started", {"name": "terminal", "status": "running"}), {}),
+    ])
+    assert rows[0]["title"] == "terminal"
+    assert rows[0]["status"] == "running"

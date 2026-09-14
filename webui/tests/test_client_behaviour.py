@@ -359,3 +359,20 @@ def test_the_client_reads_the_key_the_history_route_actually_returns():
         "returns no other key, so the transcript would paint empty"
     )
     assert "j.history" not in call, "app.js still reads the key the route never sends"
+
+
+def test_a_failed_tool_shows_its_reason_without_a_click():
+    """The row said "failed" and the reason was one click away in a collapsed
+    box -- so the screenshot that reported this bug showed a failure with no
+    cause. A failure opens itself; a reader's own choice still wins.
+
+    Skipped rather than failed without node: this pins client behaviour, and a
+    missing runtime is not a broken client.
+    """
+    import shutil, subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    script = Path(__file__).parent / "js" / "tool_detail_visibility.mjs"
+    r = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-400:]
