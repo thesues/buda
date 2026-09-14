@@ -334,15 +334,24 @@ spec:
 # backend must live in the Ingress's own namespace, so the Service would have to
 # move too, and a Service cannot select pods in another namespace.
 #
-# Deliberately unauthenticated (decided 2026-09-04). The `hermes-webui-auth`
-# secret is not created, so AUTH_USER is empty and the app serves every path
-# without a check — see the AUTH_USER note further down. The mechanism stays in
-# place: create that secret and restart to turn Basic auth on later.
+# Deliberately unauthenticated (decided 2026-09-04, reaffirmed 2026-09-14 after
+# the scope below widened). The `hermes-webui-auth` secret is not created, so
+# AUTH_USER is empty and the app serves every path without a check — see the
+# AUTH_USER note further down. The mechanism stays in place: create that secret
+# and restart to turn Basic auth on later.
 #
 # What that means concretely, so nobody has to rediscover it: anyone who can
 # reach this host can read every session in the sidebar, start turns against
 # FreeToken, and query the corpus. There is no TLS either — the APIG serves this
 # rule on port 80.
+#
+# Re-read that list before assuming it is the same one it was. Tool rows used to
+# carry a name and a duration; since the transcript started showing what a tool
+# was CALLED with and what it ANSWERED, a reader of `/api/chat/stream` or
+# `/api/session/history` also watches `terminal` commands and their output, and
+# whatever `file` was pointed at, live. The toolsets are listed above. Nothing
+# here is logged server-side, and hermes persisted these results all along — the
+# change is who can watch them arrive.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
