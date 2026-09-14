@@ -276,3 +276,52 @@ def test_status_advertises_the_endpoints_the_client_can_pick(app_server):
     assert body["defaultEndpoint"] == "dsv4"
     assert {e["key"]: e["maxConcurrent"] for e in body["endpoints"]} == {"dsv4": 1, "vision": 1}
     assert body["mcp"]["name"] == "memory"
+
+
+# ── deleting a session ──────────────────────────────────────────────────────
+
+
+class FakeDb:
+    """The slice of SessionDB the delete route touches."""
+
+    def __init__(self, deleted=True, error=None):
+        self.deleted = deleted
+        self.error = error
+        self.calls = []
+
+    def delete_session(self, sid, sessions_dir=None):
+        self.calls.append((sid, sessions_dir))
+        if self.error:
+            raise self.error
+        return self.deleted
+
+
+def test_delete_runs_in_process_against_session_db(app_server, monkeypatch):
+    """The delete must reach `SessionDB.delete_session` — the same method the
+    CLI subprocess ran — with the sessions dir, and report ok."""
+    base, _, state = app_server
+    fake = FakeDb(deleted=True)
+    monkeypatch.setattr(ha, "_Db", type("_Db", (), {"get": staticmethod(lambda: fake)}))
+    code, body = _post(base, "/api/session/delete", {"sessionId": "s-old"})
+    assert (code, body["ok"]) == (200, True)
+    assert fake.calls and fake.calls[0][0] == "s-old"
+    assert fake.calls[0][1] is not None   # transcripts dir passed through
+
+
+def test_delete_is_idempotent_when_the_row_is_already_gone(app_server, monkeypatch):
+    """An already-deleted id must read as success — a second tab racing the
+    first's delete is the normal case, and the old CLI exited 0 on it."""
+    base, _, state = app_server
+    monkeypatch.setattr(ha, "_Db", type("_Db", (), {"get": staticmethod(lambda: FakeDb(deleted=False))}))
+    code, body = _post(base, "/api/session/delete", {"sessionId": "s-old"})
+    assert (code, body["ok"], body["found"]) == (200, True, False)
+
+
+def test_delete_refuses_a_session_that_is_mid_reply(app_server, monkeypatch):
+    """A turn writing into a deleted row is corruption the reader cannot see."""
+    base, mgr, state = app_server
+    monkeypatch.setattr(type(mgr), "running", lambda self: {"s-old": "stream-x"})
+    monkeypatch.setattr(ha, "_Db", type("_Db", (), {"get": staticmethod(lambda: FakeDb())}))
+    code, body = _post(base, "/api/session/delete", {"sessionId": "s-old"})
+    assert code == 409
+    assert "先停止再删除" in body["error"]

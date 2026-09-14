@@ -19,7 +19,7 @@ Two contracts worth restating because they are easy to break silently:
 from __future__ import annotations
 
 import logging
-import os
+import json
 from pathlib import Path
 
 from http_shell import App, Request, Response, Streaming, json_response
@@ -184,21 +184,28 @@ def build_app(
 
     @app.route("POST", "/api/session/delete")
     def _delete(req: Request) -> Response:
-        """Delete a conversation, through hermes' own CLI.
+        """Delete a conversation, through hermes' own `SessionDB.delete_session`.
 
-        Not by touching the store directly. `hermes_session_api.py` says why in
-        its docstring and it is the reason that bridge is read-only: a session
-        lives in more than one table and the CLI is the thing that knows which
-        — including the FTS index, which a hand-rolled DELETE would leave
-        pointing at rows that no longer exist.
+        In-process, not via the `hermes sessions delete` CLI in a subprocess.
+        The subprocess cost ~1.2 s — most of it importing the hermes package
+        into a fresh interpreter — and ran the SAME method at the end:
+        `hermes_cli.main` does exactly
+        `SessionDB().delete_session(sid, sessions_dir=get_hermes_home()/"sessions")`.
+        This process already holds a `SessionDB` (`_Db.get()`) inside hermes'
+        own interpreter, so the call is the same code with none of the
+        shipping.
+
+        Not a hand-rolled DELETE — the reason the CLI was consulted originally.
+        A session spans several tables and on-disk transcript files; the method
+        orphans child sessions, deletes messages and the row, removes the
+        files, and the `messages_fts_*` sqlite triggers keep the search index
+        consistent no matter who issues the DELETE.
 
         POST, not DELETE-with-a-path-id: the router matches `(method, path)`
         exactly and has no parameter support, so `/api/session/<id>` can never
         be a route here. The client used to send exactly that and swallow the
         404, which is why deleting appeared to work and the row came back.
         """
-        import subprocess  # noqa: PLC0415 -- not on the import path of a turn
-
         sid = (req.json().get("sessionId") or "").strip()
         if not sid:
             return json_response({"error": "sessionId is required"}, status=400)
@@ -210,19 +217,19 @@ def build_app(
                 {"error": "这个会话正在回复中，先停止再删除"}, status=409,
             )
         try:
-            r = subprocess.run(
-                [os.environ.get("HERMES_BIN", "hermes"), "sessions", "delete", sid, "--yes"],
-                capture_output=True, text=True, timeout=30,
+            from hermes_agent import _Db, hermes_home
+
+            deleted = _Db.get().delete_session(
+                sid, sessions_dir=hermes_home() / "sessions"
             )
-        except Exception as e:  # noqa: BLE001
-            log.exception("could not run hermes sessions delete")
-            return json_response({"error": f"删除失败: {e}"}, status=503)
-        if r.returncode != 0:
-            detail = (r.stderr or r.stdout or "").strip()[:300]
-            log.warning("hermes sessions delete %s failed: %s", sid, detail)
-            return json_response({"error": detail or "hermes 拒绝了删除"}, status=502)
+        except Exception as e:  # noqa: BLE001 -- a failed delete must answer, not 500
+            log.exception("could not delete session %s", sid)
+            return json_response({"error": f"删除失败: {e}"}, status=502)
+        # Idempotent, like the CLI it replaced: `hermes sessions delete` on an
+        # already-gone id printed "not found" and exited 0. A second tab's
+        # delete racing the first's must read as success — the goal is achieved.
         last_session.pop(req.client_id, None)
-        return json_response({"ok": True, "deleted": sid})
+        return json_response({"ok": True, "deleted": sid, "found": bool(deleted)})
 
     # ── approvals ──────────────────────────────────────────────────────────
     #
